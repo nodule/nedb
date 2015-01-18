@@ -152,6 +152,56 @@
             "title": "Database",
             "type": "Datastore"
           },
+          "options": {
+            "title": "Options",
+            "type": "object",
+            "properties": {
+              "fieldName": {
+                "title": "Fieldname",
+                "description": "name of the field to index. Use the dot notation to index a field in a nested document.",
+                "type": "string"
+              },
+              "unique": {
+                "title": "Unique",
+                "description": "Enforce field uniqueness. Note that a unique index will raise an error if you try to index two documents for which the field is not defined.",
+                "type": "boolean",
+                "default": false
+              },
+              "sparse": {
+                "title": "Sparse",
+                "description": "Don't index documents for which the field is not defined. Use this option along with `unique` if you want to accept multiple documents for which it is not defined.",
+                "type": "boolean",
+                "default": false
+              }
+            }
+          }
+        },
+        "output": {
+          "db": {
+            "title": "Database",
+            "type": "Datastore"
+          },
+          "error": {
+            "title": "Error",
+            "type": "Error"
+          }
+        }
+      },
+      "phrases": {
+        "active": "Creating index"
+      },
+      "description": "Create index",
+      "ns": "nedb",
+      "name": "ensureIndex",
+      "fn": "output = function() {\n  input.db.ensureIndex(input.options,\n    function(err) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({db: input.db});\n    }\n  });\n};\n"
+    },
+    {
+      "ports": {
+        "input": {
+          "db": {
+            "title": "Database",
+            "type": "Datastore"
+          },
           "in": {
             "title": "Document",
             "type": "object",
@@ -243,6 +293,143 @@
       "ns": "nedb",
       "name": "insert",
       "fn": "on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n"
+    },
+    {
+      "ports": {
+        "input": {
+          "db": {
+            "title": "Database",
+            "type": "Datastore"
+          },
+          "query": {
+            "title": "Query",
+            "type": "object"
+          },
+          "options": {
+            "title": "Options",
+            "type": "object",
+            "properties": {
+              "multi": {
+                "title": "Multi",
+                "description": "allows the removal of multiple documents if set to true",
+                "type": "boolean",
+                "default": false
+              }
+            }
+          }
+        },
+        "output": {
+          "out": {
+            "title": "New Document",
+            "type": "object"
+          },
+          "numRemoved": {
+            "title": "Removed",
+            "type": "number"
+          },
+          "error": {
+            "title": "Error",
+            "type": "Error"
+          }
+        }
+      },
+      "phrases": {
+        "active": "Removing document(s)"
+      },
+      "description": "Remove documents from database",
+      "ns": "nedb",
+      "name": "remove",
+      "fn": "output = function() {\n  input.db.remove(input.query, input.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numRemoved: numRemoved});\n    }\n  });\n};\n"
+    },
+    {
+      "ports": {
+        "input": {
+          "db": {
+            "title": "Database",
+            "type": "Datastore"
+          },
+          "fieldName": {
+            "title": "Fieldname",
+            "description": "name of the field",
+            "type": "string"
+          }
+        },
+        "output": {
+          "db": {
+            "title": "Database",
+            "type": "Datastore"
+          },
+          "error": {
+            "title": "Error",
+            "type": "Error"
+          }
+        }
+      },
+      "phrases": {
+        "active": "Removing index"
+      },
+      "description": "Removing index",
+      "ns": "nedb",
+      "name": "removeIndex",
+      "fn": "output = function() {\n  input.db.removeIndex(input.fieldName,\n    function(err) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({db: input.db});\n    }\n  });\n};\n"
+    },
+    {
+      "ports": {
+        "input": {
+          "db": {
+            "title": "Database",
+            "type": "Datastore"
+          },
+          "query": {
+            "title": "Query",
+            "type": "object"
+          },
+          "update": {
+            "title": "Query",
+            "description": "specifies how the documents should be modified. It is either a new document or a set of modifiers",
+            "type": "object"
+          },
+          "options": {
+            "title": "Options",
+            "type": "object",
+            "properties": {
+              "multi": {
+                "title": "Multi",
+                "description": "allows the modification of several documents if set to true",
+                "type": "boolean",
+                "default": false
+              },
+              "upsert": {
+                "title": "Upsert",
+                "description": "if you want to insert a new document corresponding to the update rules if your query doesn't match anything. If your update is a simple object with no modifiers, it is the inserted document. In the other case, the query is stripped from all operator recursively, and the update is applied to it.",
+                "type": "boolean",
+                "default": false
+              }
+            }
+          }
+        },
+        "output": {
+          "out": {
+            "title": "New Document",
+            "type": "object"
+          },
+          "numReplaced": {
+            "title": "Replaced",
+            "type": "number"
+          },
+          "error": {
+            "title": "Error",
+            "type": "Error"
+          }
+        }
+      },
+      "phrases": {
+        "active": "Updating document(s)"
+      },
+      "description": "Update documents within the database",
+      "ns": "nedb",
+      "name": "update",
+      "fn": "output = function() {\n  input.db.update(input.query, input.update, input.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numReplaced: numReplaced});\n    }\n  });\n};\n"
     }
   ],
   "twigs": []

@@ -1,0 +1,31 @@
+{
+  "name": "removeIndex",
+  "ns": "nedb",
+  "description": "Removing index",
+  "phrases": {
+    "active": "Removing index"
+  },
+  "ports": {
+    "input": {
+      "db": {
+        "title": "Database",
+        "type": "Datastore"
+      },
+      "fieldName": {
+        "title": "Fieldname",
+        "description": "name of the field",
+        "type": "string"
+      }
+    },
+    "output": {
+      "db": {
+        "title": "Database",
+        "type": "Datastore"
+      },
+      "error": {
+        "title": "Error",
+        "type": "Error"
+      }
+    }
+  }
+}
