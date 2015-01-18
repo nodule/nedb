@@ -1,0 +1,32 @@
+{
+  "name": "count",
+  "ns": "nedb",
+  "description": "Count documents within the database",
+  "async": true,
+  "phrases": {
+    "active": "Counting document(s)"
+  },
+  "ports": {
+    "input": {
+      "db": {
+        "title": "Database",
+        "type": "Datastore"
+      },
+      "in": {
+        "title": "Document",
+        "type": "object",
+        "async": true
+      }
+    },
+    "output": {
+      "out": {
+        "title": "Count",
+        "type": "integer"
+      },
+      "error": {
+        "title": "Error",
+        "type": "Error"
+      }
+    }
+  }
+}
