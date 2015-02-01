@@ -1,0 +1,32 @@
+title: Test database
+
+Database(nedb/datastore)
+Insert(nedb/insert)
+Update(nedb/update)
+Remove(nedb/remove)
+Find(nedb/find)
+Count(nedb/count)
+Log(console/log)
+Complete(console/log)
+
+# Bug should throw no such port..
+# {} -> @in Database
+{} -> @options Database
+
+"complete!" -> @msg Complete
+
+Database db -> db Insert
+Database db -> db Find
+
+Database error -> msg Log
+Database :complete -> :start Complete
+
+{
+  "uname": "rhalff",
+  "first": "Rob",
+  "last": "Halff"
+} -> in Insert
+
+"rhalff" -> [uname] in Find
+
+Find out -> msg Log
