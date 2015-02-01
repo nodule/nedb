@@ -1,4 +1,7 @@
 title: Test database
+ns: nedb
+name: test
+id: TestDataBase
 
 Database(nedb/datastore)
 Insert(nedb/insert)
@@ -11,7 +14,7 @@ Complete(console/log)
 
 # Bug should throw no such port..
 # {} -> @in Database
-{} -> @options Database
+#{} -> options Database
 
 "complete!" -> @msg Complete
 
@@ -19,6 +22,7 @@ Database db -> db Insert
 Database db -> db Find
 
 Database error -> msg Log
+Database db -> msg Log
 Database :complete -> :start Complete
 
 {

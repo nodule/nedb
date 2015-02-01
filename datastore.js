@@ -15,6 +15,7 @@ module.exports = {
       options: {
         title: "Options",
         type: "object",
+        required: false,
         properties: {
           filename: {
             type: "string",
