@@ -15,7 +15,7 @@
     "test": "chit -r"
   },
   "dependencies": {
-    "nedb": "^1.1.1"
+    "nedb": "rhalff/nedb"
   },
   "devDependencies": {
     "chit": "0.x.x",
