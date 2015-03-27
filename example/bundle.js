@@ -3140,6 +3140,7 @@ function Actor() {
   this.iips = {};
   this.view = [];
   this.status = undefined;
+  this.identifier = 'actor:main';
 
   // default to own id, map can overwrite
   this.id = uuid();
@@ -3584,7 +3585,7 @@ Actor.prototype.push = function() {
         this.sendIIP(iip, '');
       }
       else {
-        console.log(node.identifier, ' not startable');
+        debug('%s: `%s` not startable', this.identifier, node.identifier);
       }
     }
   }
@@ -3940,6 +3941,9 @@ Actor.prototype.__input = function(link, p) {
 
   var targetNode = this.getNode(link.target.id);
 
+  // give owner ship to targetNode
+  p.setOwner(targetNode);
+
   var ret = targetNode.fill(link.target, p);
 
   // breakpoint
@@ -3949,26 +3953,39 @@ Actor.prototype.__input = function(link, p) {
     // set node in error state and output error to ioManager
     targetNode.error(ret);
 
+    p.release(targetNode);
+    p.setOwner(link);
+
     debug('%s: reject %s', this.identifier, ret);
     self.ioHandler.reject(ret, link, p);
 
   }
   else if (ret === false) {
 
+    p.release(targetNode);
+    p.setOwner(link);
+
     // something should unlock.
     // having this reject unlock it is too much free form.
-
-    debug('%s: soft reject re-queue', this.identifier);
+    debug(
+      '%s: `%s` soft reject re-queue',
+      this.identifier,
+      targetNode.identifier
+    );
     // `soft reject`
     self.ioHandler.reject(ret, link, p);
 
   }
   else {
-    // would like to unlock all
 
     // unlock *all* queues targeting this node.
     // the IOHandler can do this.
-    debug('%s: unlock all queues', this.identifier);
+    debug(
+      '%s: unlock all queues for `%s`',
+      this.identifier,
+      targetNode.identifier
+    );
+
     self.unlockConnections(targetNode);
 
     self.ioHandler.accept(link, p);
@@ -4396,7 +4413,12 @@ Actor.prototype.sendIIPs = function(iips) {
 
     self.ioHandler.emit('send', link);
 
-    var p = new Packet(JSON.parse(JSON.stringify(link.data)));
+    // Packet owned by the link
+    var p = new Packet(
+      link,
+      JSON.parse(JSON.stringify(link.data)),
+      self.getNode(link.target.id).getPortType(link.target.port)
+    );
 
     // a bit too direct, ioHandler should do this..
     self.ioHandler.queueManager.queue(link.ioid, p);
@@ -4459,7 +4481,12 @@ Actor.prototype.sendIIP = function(target, data) {
 
   this.ioHandler.emit('send', xLink);
 
-  var p = new Packet(JSON.parse(JSON.stringify(xLink.data)));
+  var p = new Packet(
+    xLink,
+    JSON.parse(JSON.stringify(xLink.data)),
+    // target port type
+    this.getNode(xLink.target.id).getPortType(xLink.target.port)
+  );
 
   this.ioHandler.queueManager.queue(xLink.ioid, p);
 
@@ -4934,7 +4961,7 @@ Actor.prototype.hasParent = function() {
 
 module.exports = Actor;
 
-},{"../lib/context/defaultProvider":20,"../lib/io/mapHandler":23,"../lib/multisort":25,"../lib/process/defaultManager":32,"./connector":19,"./flow":21,"./link":24,"./node":26,"./node/polymer":28,"./packet":29,"./run":34,"./validate":38,"chix-loader":46,"debug":47,"events":11,"util":16,"uuid":59}],19:[function(require,module,exports){
+},{"../lib/context/defaultProvider":20,"../lib/io/mapHandler":23,"../lib/multisort":25,"../lib/process/defaultManager":32,"./connector":19,"./flow":21,"./link":24,"./node":26,"./node/polymer":28,"./packet":29,"./run":34,"./validate":38,"chix-loader":48,"debug":49,"events":11,"util":16,"uuid":62}],19:[function(require,module,exports){
 'use strict';
 
 var util    = require('util');
@@ -5355,6 +5382,14 @@ Flow.prototype.setContextProperty = function(port, data) {
 
 };
 
+Flow.prototype.getPortType = function(port) {
+  if (port === ':start') {
+    return 'any';
+  }
+  var portDef = this.getPortDefinition(port, 'input');
+  this.getNode(portDef.nodeId).getPortType(portDef.name);
+};
+
 Flow.prototype.clearContextProperty = function(port) {
 
   var portDef = this.getPortDefinition(port, 'input');
@@ -5439,13 +5474,19 @@ Flow.prototype.error = function(node, err) {
 
 Flow.prototype.fill = function(target, p) {
 
+  var node;
+
   debug('%s:%s fill', this.identifier, target.port);
 
   if (target.action && !this.isAction()) {
 
     // NOTE: action does not take fork into account?
     // test this later. it should be in the context of the currentActor.
-    return this.action(target.action).fill(target, p);
+
+    node = this.action(target.action);
+    p.release(this);
+    p.setOwner(node);
+    node.fill(target, p);
 
   }
   else {
@@ -5469,12 +5510,13 @@ Flow.prototype.fill = function(target, p) {
       // delegate this to the node this port belongs to.
       var portDef = this.getPortDefinition(target.port, 'input');
 
-      var node = this.getNode(portDef.nodeId);
+      node = this.getNode(portDef.nodeId);
 
       if (!this.linkMap.hasOwnProperty(target.wire.id)) {
         throw Error('link not found within linkMap');
       }
-
+      p.release(this);
+      p.setOwner(node);
       var err = node.fill(this.linkMap[target.wire.id].target, p);
 
       if (util.isError(err)) {
@@ -5584,7 +5626,7 @@ Flow.prototype.getPortDefinition = function(port, type) {
         port,
         this.ns,
         this.name,
-        Object.keys(this.ports.input).toString()
+        Object.keys(this.ports[type]).toString()
       )
     );
   }
@@ -5698,6 +5740,7 @@ Flow.prototype.plug = function(target) {
 
     if (target.port === ':start') {
       this.addPort('input', ':start', {
+        name: ':start',
         type: 'any'
       });
     }
@@ -6016,8 +6059,13 @@ Flow.prototype.listenForOutput = function() {
     return function internalPortHandlerFlow(data) {
       if (internalPort === data.port) {
 
+        var p = data.out;
+
+        // take ownership
+        p.setOwner(self);
+
         debug('%s:%s output', self.identifier, port);
-        self.sendPortOutput(port, data.out);
+        self.sendPortOutput(port, p);
 
         // there is no real way to say a graph has executed.
         // So just consider each output as an execution.
@@ -6197,7 +6245,11 @@ Flow.prototype.isStartable = function() {
 };
 
 Flow.prototype.event = function(port, output) {
-  var p = new Packet(output);
+  var p = new Packet(
+    this,
+    output,
+    'object' // always object
+  );
   this.sendPortOutput(port, p);
 };
 
@@ -6216,6 +6268,9 @@ Flow.prototype.sendPortOutput = function(port, p) {
   if (this.isAction()) {
     out.action = self.action;
   }
+
+  // give up ownership
+  p.release(this);
 
   this.emit('output', out);
 
@@ -6369,6 +6424,7 @@ Flow.prototype.expose = function(input, output) {
         /////// setup callbacks
         this.on('output', function output(data) {
           if (data.node.id === self.id && cb.hasOwnProperty(data.port)) {
+            // TODO: does not take ownership into account
             cb[data.port](data.out);
           }
         });
@@ -6430,7 +6486,7 @@ Flow.prototype.hasParent = function() {
 
 module.exports = Flow;
 
-},{"./ConnectionMap":17,"./actor":18,"./link":24,"./packet":29,"./validate":38,"debug":47,"util":16}],22:[function(require,module,exports){
+},{"./ConnectionMap":17,"./actor":18,"./link":24,"./packet":29,"./validate":38,"debug":49,"util":16}],22:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -6439,20 +6495,24 @@ var util = require('util');
  *
  * Handles the index
  *
+ * TODO: packet is still needed, because index is set
+ *
  * @param {Link} link
+ * @param {Data} data
  * @param {Packet} p
  * @api public
  */
-module.exports = function handleIndex(link, p) {
+module.exports = function handleIndex(link, data, p) {
   // TODO: data should be better defined and a typed object
   var index = link.source.get('index');
   if (/^\d+/.test(index)) {
     // numeric
-    if (Array.isArray(p.data)) {
-      if (index < p.data.length) {
+    if (Array.isArray(data)) {
+      if (index < data.length) {
         // new remember index.
-        p.index = index;
-        return p.data[index];
+        p.point(link, index);
+        //p.index = index;
+        //return data[index];
       }
       else {
         throw new Error(
@@ -6474,15 +6534,16 @@ module.exports = function handleIndex(link, p) {
     }
   }
   else {
-    if (typeof p.data === 'object') {
-      if (p.data.hasOwnProperty(index)) {
+    if (typeof data === 'object') {
+      if (data.hasOwnProperty(index)) {
         // new remember index.
-        p.index = index;
-        return p.data[index];
+        p.point(link, index);
+        //p.index = index;
+        //return data[index];
       }
       else {
         // maybe do not fail hard and just send to the error port.
-        console.log(p.data);
+        console.log(p);
         throw new Error(
           util.format(
             'Property `%s` not found on object output port `%s`',
@@ -6514,19 +6575,6 @@ var handleIndex = require('./indexHandler');
 var isPlainObject = require('is-plain-object');
 var DefaultQueueManager = require('../queue/defaultManager');
 var debug = require('debug')('chix:io');
-
-function cloneData(p, type) {
-  /* function type does not mean the data itself is directly
-   * a function, it can also be a plain object holding
-   * functions. so what is specified is leading.
-   */
-  if (type === 'function') {
-    return;
-  }
-  if (typeof p.data === 'object' && isPlainObject(p.data)) {
-    p.data = JSON.parse(JSON.stringify(p.data));
-  }
-}
 
 /**
  *
@@ -6847,6 +6895,11 @@ IoMapHandler.prototype.receiveFromQueue = function(ioid, p) {
  *
  */
 IoMapHandler.prototype.send = function(link, p) {
+
+  if (!(p instanceof Packet)) {
+    throw Error('send expects a packet');
+  }
+
   if (link.source.has('pointer')) { // is just a boolean
     debug('%s: handling pointer', link.ioid);
     var identifier;
@@ -6921,30 +6974,30 @@ IoMapHandler.prototype.__sendData = function(link, p) {
   if (this._shutdown) {
     // TODO:: probably does not both have to be dropped
     // during __sendData *and* during output
+    p.release(link);
     this.drop(p, link);
   }
   else {
     var data;
     if (link.target.has('cyclic') &&
-      Array.isArray(p.data) // second time it's not an array anymore
+      Array.isArray(p.read(link)) // second time it's not an array anymore
     ) {
       debug('%s: cycling', link.ioid);
       // grouping
       // The counter part will be 'collect'
       var g = this.CHI.group();
-      if (p.data.length === 0) {
+      if (p.read(link).length === 0) {
         return false;
       }
-      // make a copy otherwise if output goes to several ports
-      // it will receive a popped version.
-      //
-      // Ok, this has to be removed and source ports should set as cyclic.
-      // Not target ports.
-      data = JSON.parse(JSON.stringify(p.data));
+      data = JSON.parse(JSON.stringify(p.read(link)));
       var i;
       for (i = 0; i < data.length; i++) {
         // create new packet
-        var newp = new Packet(data[i]);
+        var newp = new Packet(
+          link,
+          data[i],
+          typeof data[i] // not sure if this will always work.
+        );
         // this is a copy taking place..
         newp.set('chi', p.chi ? JSON.parse(JSON.stringify(p.chi)) : {});
         g.item(newp.chi);
@@ -6954,43 +7007,31 @@ IoMapHandler.prototype.__sendData = function(link, p) {
       g.done();
       return; // RETURN
     }
-    var cp = p; // current packet
-    // too bad cannot check the receiver type.
-    // TODO: maybe have p.type() so the packet can tell it's content type.
-    // plain object is a bit harder though would have to introduce
-    // PLAIN_OBJECT type or something
-    // The packet itself should tell what it is,
-    // not checking p.data externally like this.
-    /*
-    if (typeof cp.data === 'object' && isPlainObject(cp.data)) {
-      cp.data = JSON.parse(JSON.stringify(cp.data));
-    }
-    */
-    cloneData(cp, 'function');
+    var cp; // current packet
+
+    // clone should not be needed, this is done elsewhere.
+    // cp is also not needed
+    // this.cloneData(link, cp, 'function');
     // TODO: not sure if index should stay within the packet.
-    if (link.source.has('index') && !cp.hasOwnProperty('index')) {
-      //if (link.source.has('index')) {
-      // above already cloned if possible.
-      // what is not cloned is CHI, so could cause a problem..
-      cp.chi = JSON.parse(JSON.stringify(cp.chi));
-      cp = p.clone(false); // important!
-      if (undefined === cp.data[link.source.get('index')]) {
-        // this is allowed now for async array ports.
-        // the component will only send one index at a time.
-        // this is useful for routing.
-        // maybe only enable this with a certain setting on the port later on.
-        debug('%s: INDEX UNDEFINED %s', link.ioid, link.source, cp.data);
-        // does this stop the loop, because it should not.
+    if (link.source.has('index') && !p.hasOwnProperty('index')) {
+      // already done during clone
+      //cp.chi = JSON.parse(JSON.stringify(cp.chi));
+      cp = p.clone(link); // important!
+      if (undefined === cp.read(link)[link.source.get('index')]) {
+        debug('%s: INDEX UNDEFINED %s', link.ioid, link.source, cp.read(link));
         return; // nop
       }
       else {
-        cp.data = handleIndex(link, cp);
+        handleIndex(link, cp.read(link), cp);
+        //cp.write(link, handleIndex(link, cp.read(link), cp));
       }
+    } else {
+      cp = p;
     }
     // TODO: probably just remove this emit. (chix-runtime is using it)
     this.emit('data', {
       link: link,
-      data: cp.data // only emit the data
+      data: cp.read(link)// only emit the data
     });
 
     debug('%s: writing packet', link.ioid);
@@ -7075,41 +7116,69 @@ IoMapHandler.prototype.__monitor = function(eventType, pid, cb, how) {
 //  this.receive(dat.node, dat.port, dat.out, dat.action);
 IoMapHandler.prototype.receive = function(source, port, p, action) {
   var i;
-  // If the output of this node has any target nodes
-  if (this.targetMap.hasOwnProperty(source.pid)) {
-    // If there are any target nodes defined
-    if (this.targetMap[source.pid].length) {
-      // Iterate those targets
-      for (i = 0; i < this.targetMap[source.pid].length; i++) {
-        // Process this link
-        var xlink = this.targetMap[source.pid][i];
-        // If the link is about this source port
-        if (port === xlink.source.port) {
-          // did this output came from an action
-          // if so, is it an action we are listening for.
-          if (!action || xlink.source.action === action) {
-            if (xlink.source.get('collect')) {
-              debug('%s: collecting packets', xlink.ioid);
-              this.CHI.collect(xlink, p);
-              continue; // will be handled by event
-            }
-            //var noQueue = xlink.target.has('noqueue');
-            var noQueue = false;
-            this.emit('send', xlink);
-            // queue must always be used otherwise persist
-            // will not work..
-            if (noQueue) {
-              // must be sure, really no queue, also not after input.
-              this.send(xlink, p);
-            }
-            else {
-              debug('%s: queueing', xlink.ioid);
-              this.queueManager.queue(xlink.ioid, p);
+  var match = 0;
+
+  if (p.hasOwner()) {
+    // node should have released packet.
+    throw Error('Refusing to received owned packet');
+  } else {
+    // If the output of this node has any target nodes
+    if (this.targetMap.hasOwnProperty(source.pid)) {
+      // If there are any target nodes defined
+      if (this.targetMap[source.pid].length) {
+        // Iterate those targets
+        var length = this.targetMap[source.pid].length;
+        for (i = 0; i < length; i++) {
+          // Process this link
+          var xlink = this.targetMap[source.pid][i];
+          // If the link is about this source port
+          if (port === xlink.source.port) {
+            match++;
+            // did this output came from an action
+            // if so, is it an action we are listening for.
+            if (!action || xlink.source.action === action) {
+              if (xlink.source.get('collect')) {
+                debug('%s: collecting packets', xlink.ioid);
+                this.CHI.collect(xlink, p);
+                continue; // will be handled by event
+              }
+              //var noQueue = xlink.target.has('noqueue');
+              var noQueue = false;
+              this.emit('send', xlink);
+
+              p.setOwner(xlink);
+
+              // queue must always be used otherwise persist
+              // will not work..
+              if (noQueue) {
+                // must be sure, really no queue, also not after input.
+                this.send(xlink, p);
+              }
+              else {
+                debug('%s: queueing', xlink.ioid);
+                this.queueManager.queue(xlink.ioid, p);
+              }
+
+              if (i + 1 < length) {
+                p = p.clone(xlink);
+                p.release(xlink);
+              }
             }
           }
         }
       }
     }
+
+    if (port === 'error' && match === 0) {
+      throw Error(
+        util.format(
+          'Unhandled port error for %s: %s',
+          source.id,
+          p.dump()
+        )
+      );
+    }
+
   }
 };
 
@@ -7200,9 +7269,24 @@ IoMapHandler.prototype.drop = function(packet, origin) {
   this.emit('drop', packet);
 };
 
+/*
+IoMapHandler.prototype.cloneData = function(link, p, type) {
+  if (type === 'function') {
+    return;
+  }
+  if (typeof p.read(link) === 'object' && isPlainObject(p.read(link))) {
+    p.write(link,
+      JSON.parse(
+        JSON.stringify(p.read(link))
+      )
+    );
+  }
+};
+*/
+
 module.exports = IoMapHandler;
 
-},{"../packet":29,"../queue/defaultManager":33,"./indexHandler":22,"chix-chi":41,"debug":47,"events":11,"is-plain-object":52,"util":16,"uuid":59}],24:[function(require,module,exports){
+},{"../packet":29,"../queue/defaultManager":33,"./indexHandler":22,"chix-chi":41,"debug":49,"events":11,"is-plain-object":54,"util":16,"uuid":62}],24:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -7309,6 +7393,9 @@ Link.prototype.setTarget = function(targetId, port, settings, action) {
 Link.prototype.write = function(p) {
 
   this.writes++;
+
+  // loose ownership
+  p.release(this);
 
   // just re-emit
   this.emit('data', p);
@@ -7439,7 +7526,7 @@ Link.prototype.toJSON = function() {
 
 module.exports = Link;
 
-},{"./connector":19,"./setting":37,"./validate":38,"util":16,"uuid":59}],25:[function(require,module,exports){
+},{"./connector":19,"./setting":37,"./validate":38,"util":16,"uuid":62}],25:[function(require,module,exports){
 'use strict';
 
 /**
@@ -7590,6 +7677,10 @@ function xNode(id, node, identifier, CHI) {
   this.type = 'node';
 
   this.state = {};
+
+  this.persist = {};
+
+  this.transit = {};
 
   // remember def for .compile()
   this.def = node;
@@ -7783,12 +7874,19 @@ xNode.prototype.start = function() {
 };
 
 xNode.prototype.hasData = function(port) {
-  return undefined !== this.input[port];
+  //return undefined !== this.input[port].data;
+  //return undefined !== this.input[port];
+  return this.input.hasOwnProperty(port);
 };
 
 xNode.prototype.fill = function(target, data, settings) {
 
-  var p = data instanceof Packet ? data : new Packet(data);
+  var p;
+  if (data instanceof Packet) {
+    p = data;
+  } else {
+    p = new Packet(this, data, this.getPortType(target.port || target));
+  }
 
   // allow for simple api
   if (typeof target === 'string') {
@@ -7800,6 +7898,11 @@ xNode.prototype.fill = function(target, data, settings) {
       target.set('persist', true);
     }
     this.plug(target);
+  }
+
+  // better call it pointer
+  if (target.has('mask')) {
+    p.point(this, target.get('mask'));
   }
 
   var ret = this._receive(target, p);
@@ -7830,13 +7933,46 @@ xNode.prototype.fill = function(target, data, settings) {
  */
 xNode.prototype.$setContextProperty = function(port, data) {
   debug('%s:%s set context', this.identifier, port);
-  this.context[port] = data;
+  var p;
+  if (data instanceof Packet) {
+    p = data;
+  } else {
+    p = new Packet(this, data, this.getPortType(port));
+  }
+  this.context[port] = p;
+};
+
+
+// TODO: Array format is not used anymore I think.
+xNode.prototype.getPortType = function(port) {
+  var i;
+  var obj;
+  var type;
+  if (Array.isArray(port)) {
+    obj = this.ports.input;
+    for (i = 0 ; i < port.length; i++) {
+      if (i === 0) {
+        obj = obj[port[i]];
+      } else {
+        obj = obj.properties[port[i]];
+      }
+    }
+    type = obj.type;
+  } else {
+    type = this.ports.input[port].type;
+  }
+  if (type) {
+    return type;
+  } else {
+    throw Error('Unable to determine type for ' + port);
+  }
 };
 
 xNode.prototype.clearContextProperty = function(port) {
 
   debug('%s:%s clear context', this.identifier, port);
 
+  // drop packet?
   delete this.context[port];
 
   this.event(':contextClear', {
@@ -7897,7 +8033,7 @@ xNode.prototype.__start = function() {
     }
   }
 
-  this.nodebox.input = this.input;
+  this.nodebox.set('input', this.unwrapPackets(this.input));
 
   // difference in notation, TODO: explain these constructions.
   // done before compile.
@@ -8304,13 +8440,18 @@ xNode.prototype._runPortBox = function(port) {
     node: this.export()
   });
 
-  sb.set('data', this.input[port]);
+  sb.set('data', this.input[port].read(this));
   sb.set('x', this.chi);
   sb.set('state', this.state);
   // sb.set('source', source); is not used I hope
-  sb.set('input', this.input); // add all (sync) input.
+
+  sb.set('input', this.unwrapPackets(this.input));
+  // add all (sync) input.
 
   this.setStatus('running');
+
+  // remember last one for cloneing
+  this.transit[port] = this.input[port];
 
   var ret = sb.run(this);
 
@@ -8340,9 +8481,8 @@ xNode.prototype._runPortBox = function(port) {
     return false;
   }
 
-  // todo portbox itself should probably also
-  // maintain it's runcount, this one is cumulative
   this.runCount++;
+  this.ports.input[port].runCount++;
 
   debug('%s:%s() executed', this.identifier, port);
 
@@ -8434,21 +8574,7 @@ xNode.prototype._fillPort = function(target, p) {
 
   var res;
 
-  // this is too early, defaults do not get filled this way.
-  if (this.ports.input[target.port].async === true &&
-    !this._allConnectedSyncFilled()) {
-
-    this.event(':portReject', {
-      node: this.export(),
-      port: target.port,
-      data: p
-    });
-
-    // do not accept
-    return false;
-  }
-
-  if (undefined === p.data) {
+  if (undefined === p.read(this)) {
     return Error('data may not be `undefined`');
   }
 
@@ -8456,20 +8582,36 @@ xNode.prototype._fillPort = function(target, p) {
   //this.handlePortSettings(target.port);
 
   // PACKET WRITE, TEST THIS
-  p.data = this._handleFunctionType(target.port, p.data);
+  // this is not good, it's too early.
+  p.write(this, this._handleFunctionType(target.port, p.read(this)));
 
-  res = this._validateInput(target.port, p.data);
+  res = this._validateInput(target.port, p.read(this));
 
   if (util.isError(res)) {
-
     return res;
-
   }
   else {
 
-    // todo: this logic must be externalized.
-    // node doesn't know about persist
-    if (!target.has('persist')) {
+    if (target.has('persist')) {
+      // do array index thing here also.
+      //this.persist[target.port] = p.data;
+      this.persist[target.port] = p;
+      return true;
+    } else {
+      // this is too early, defaults do not get filled this way.
+      if (this.ports.input[target.port].async === true &&
+        !this._allConnectedSyncFilled()) {
+
+        this.event(':portReject', {
+          node: this.export(),
+          port: target.port,
+          data: p
+        });
+
+        // do not accept
+        console.log('early block');
+        return false;
+      }
 
       try {
 
@@ -8537,7 +8679,7 @@ xNode.prototype._fillPort = function(target, p) {
 
     // set input port data
     // this could be changed to still contain the Packet.
-    this._fillInputPort(target.port, p.data);
+    this._fillInputPort(target.port, p);
 
     /**
      * Port Fill Event.
@@ -8576,14 +8718,14 @@ xNode.prototype._fillPort = function(target, p) {
 /**
  *
  * @param {string} port
- * @param {Mixed} value
+ * @param {Packet} p
  * @private
  */
-xNode.prototype._fillInputPort = function(port, value) {
+xNode.prototype._fillInputPort = function(port, p) {
 
   debug('%s:%s fill', this.identifier, port);
 
-  this.input[port] = value;
+  this.input[port] = p;
 
   // increment fill counter
   this.ports.input[port].fills++;
@@ -8687,11 +8829,9 @@ xNode.prototype._readyOrNot = function() {
     }
 
     // Check context/defaults etc. and fill it
-    var ret = portFiller.fill(
-      this.ports.input,
-      this.input,
-      this.context
-    );
+    // should only fill defaults for async ports..
+    // *if* the async port is not connected.
+    var ret = portFiller.fill(this);
 
     // TODO: if all are async, just skip all the above
     // async must be as free flow as possible.
@@ -8723,7 +8863,9 @@ xNode.prototype._readyOrNot = function() {
             // persistent async will have input etc.
             if ((this.ports.input[port].async ||
               this.ports.input[port].fn) &&
-              this.input[port] !== undefined) {
+              // need to check packet or?
+              this.input.hasOwnProperty(port)) {
+              //this.input[port] !== undefined) {
 
               ret = this._runPortBox(port);
 
@@ -8828,7 +8970,8 @@ xNode.prototype.freeInput = function() {
     port = this.inPorts[i];
 
     // TODO: don't call freeInput in the first place if undefined
-    if (this.input[port] !== undefined) {
+    //if (this.input[port] !== undefined) {
+    if (this.input.hasOwnProperty(port)) {
       this.freePort(port);
       freed.push(port);
     }
@@ -8845,7 +8988,7 @@ xNode.prototype.clearInput = function(port) {
 };
 
 xNode.prototype.freePort = function(port) {
-
+/*
   var persist = this.getPortOption('input', port, 'persist');
   if (persist) {
     // persist, chi, hmz, seeze to exist.
@@ -8854,39 +8997,51 @@ xNode.prototype.freePort = function(port) {
     debug('%s:%s persisting', this.identifier, port);
 
     // indexes are persisted per index.
+    // store inside persit
     if (Array.isArray(persist)) {
+      // TODO: means object is not supported..
+      this.persist[port] = [];
       for (var k in this.input[port]) {
         if (persist.indexOf(k) === -1) {
-          debug('%s:%s[%s] persisting', this.identifier, port, k);
+          //debug('%s:%s[%s] persisting', this.identifier, port, k);
           // remove
-          delete this.input[port][k];
+          //delete this.input[port][k];
+        } else {
+          debug('%s:%s[%s] persisting', this.identifier, port, k);
+          this.perists[port][k] = this.input[port][k];
         }
+        delete this.input[port][k];
       }
+    } else {
+
+      this.persist[port] = this.input[port];
+      delete this.input[port];
+
     }
-
   }
-  else {
+*/
+  //else {
 
-    // this also removes context and default..
-    this.clearInput(port);
+  // this also removes context and default..
+  this.clearInput(port);
 
-    debug('%s:%s :freePort event', this.identifier, port);
-    this.event(':freePort', {
-      node: this.export(),
-      link: this._activeConnections[port], // can be undefined, ok
-      port: port
-    });
+  debug('%s:%s :freePort event', this.identifier, port);
+  this.event(':freePort', {
+    node: this.export(),
+    link: this._activeConnections[port], // can be undefined, ok
+    port: port
+  });
 
-    this.emit('freePort', {
-      node: this.export(),
-      link: this._activeConnections[port],
-      port: port
-    });
+  this.emit('freePort', {
+    node: this.export(),
+    link: this._activeConnections[port],
+    port: port
+  });
 
-    // delete reference to active connection (if there was one)
-    // delete this._activeConnections[port];
-    this._activeConnections[port] = null;
-  }
+  // delete reference to active connection (if there was one)
+  // delete this._activeConnections[port];
+  this._activeConnections[port] = null;
+  //}
 
 };
 
@@ -8900,8 +9055,11 @@ xNode.prototype.freePort = function(port) {
  */
 xNode.prototype.allConnectedFilled = function() {
   for (var port in this.openPorts) {
-    if (this.input[port] === undefined) {
-      return Node.ALL_CONNECTED_NOT_FILLED;
+    if (this.openPorts.hasOwnProperty(port)) {
+      if (!this.input.hasOwnProperty(port)) {
+      //if (this.input[port] === undefined) {
+        return xNode.ALL_CONNECTED_NOT_FILLED;
+      }
     }
   }
   return true;
@@ -8923,16 +9081,22 @@ xNode.prototype._allConnectedSyncFilled = function() {
     if (!this.ports.input[port].async ||
       !this.ports.input[port].fn) {
 
-      if (this.ports.input[port].indexed) {
-        if (/object/i.test(this.ports.input[port].type)) {
-          return this._objectPortIsFilled(port);
+      // should be better index check perhaps
+      if (!this.persist.hasOwnProperty(port)) {
+
+        if (this.ports.input[port].indexed) {
+          if (/object/i.test(this.ports.input[port].type)) {
+            return this._objectPortIsFilled(port);
+          }
+          else {
+            return this._arrayPortIsFilled(port);
+          }
         }
-        else {
-          return this._arrayPortIsFilled(port);
+        //else if (this.input[port] === undefined) {
+        else if (!this.input.hasOwnProperty(port)) {
+          return xNode.SYNC_NOT_FILLED;
         }
-      }
-      else if (this.input[port] === undefined) {
-        return xNode.SYNC_NOT_FILLED;
+
       }
     }
   }
@@ -8968,8 +9132,10 @@ xNode.prototype._initStartPort = function() {
     debug('%s:%s initialized', this.identifier, ':start');
     this.addPort('input', ':start', {
       type: 'any',
+      name: ':start',
       rejects: 0,
-      fills: 0
+      fills: 0,
+      runCount: 0
     });
   }
 };
@@ -9125,9 +9291,17 @@ xNode.prototype.reset = function() {
 
 };
 
+xNode.prototype.unwrapPackets = function(input) {
+  var self = this;
+  return Object.keys(input).reduce(function(obj, k) {
+    obj[k] = input[k].read(self);
+    return obj;
+  }, {});
+};
+
 module.exports = xNode;
 
-},{"./connector":19,"./node/interface":27,"./packet":29,"./port":30,"./port/filler":31,"./sandbox/node":35,"./sandbox/port":36,"debug":47,"util":16}],27:[function(require,module,exports){
+},{"./connector":19,"./node/interface":27,"./packet":29,"./port":30,"./port/filler":31,"./sandbox/node":35,"./sandbox/port":36,"debug":49,"util":16}],27:[function(require,module,exports){
 'use strict';
 
 /* jshint -W040 */
@@ -9278,6 +9452,7 @@ function INode(id, node, identifier, CHI) {
   // Always add complete port, :start port will be added
   // dynamicaly
   this.ports.output[':complete'] = {
+    name: ':complete',
     type: 'any'
   };
 
@@ -9286,6 +9461,7 @@ function INode(id, node, identifier, CHI) {
   for (key in this.ports.input) {
     if (this.ports.input.hasOwnProperty(key)) {
       this.ports.input[key].fills = 0;
+      this.ports.input[key].runCount = 0;
       this.ports.input[key].rejects = 0;
     }
   }
@@ -9744,10 +9920,15 @@ INode.prototype._handleArrayPort = function(target, p) {
     // is never really filled...
     // look at that, will cause dangling data.
     if (!this.input[target.port]) {
-      this.input[target.port] = [];
+      // becomes a new packet
+      this.input[target.port] = new Packet(
+        this,
+        [],
+        'array'
+      );
     }
 
-    if (typeof this.input[target.port][target.get('index')] !== 'undefined') {
+    if (this.input[target.port].read(this)[target.get('index')] !== undefined) {
       // input not available, it will be queued.
       // (queue manager also stores [])
       return Port.INDEX_NOT_AVAILABLE;
@@ -9759,22 +9940,25 @@ INode.prototype._handleArrayPort = function(target, p) {
         port: target.port,
         index: target.get('index')
       });
-
-      this.input[target.port][target.get('index')] = p.data;
+      // merge chi
+      this.CHI.merge(this.input[target.port].chi, p.chi, false);
+      this.input[target.port].read(this)[target.get('index')] = p.read(this);
+      // drop packet..
     }
 
     // it should at least be our length
     if (this._arrayPortIsFilled(target.port)) {
 
       // packet writing, CHECK THIS.
-      p.data = this.input[target.port]; // the array we've created.
+      // p.data = this.input[target.port]; // the array we've created.
 
       // Unmark the port as being indexed
       delete this.ports.input[target.port].indexed;
 
       // ok, above all return true or false
       // this one is either returning true or an error.
-      return this._fillPort(target, p);
+      //return this._fillPort(target, p);
+      return this._fillPort(target, this.input[target.port]);
 
     }
     else {
@@ -9820,7 +10004,11 @@ INode.prototype._handleObjectPort = function(target, p) {
 
     // Initialize empty object
     if (!this.input[target.port]) {
-      this.input[target.port] = {};
+      this.input[target.port] = new Packet(
+        this,
+        {},
+        'object'
+      );
     }
 
     // input not available, it will be queued.
@@ -9837,7 +10025,8 @@ INode.prototype._handleObjectPort = function(target, p) {
       });
 
       // define the key
-      this.input[target.port][target.get('index')] = p.data;
+      this.CHI.merge(this.input[target.port].chi, p.chi, false);
+      this.input[target.port].read(this)[target.get('index')] = p.read(this);
     }
 
     // it should at least be our length
@@ -9851,12 +10040,13 @@ INode.prototype._handleObjectPort = function(target, p) {
     if (this._objectPortIsFilled(target.port)) {
 
       // PACKET WRITING CHECK THIS.
-      p.data = this.input[target.port];
+      // p.data = this.input[target.port];
 
       // Unmark the port as being indexed
       delete this.ports.input[target.port].indexed;
 
-      return this._fillPort(target, p);
+      //return this._fillPort(target, p);
+      return this._fillPort(target, this.input[target.port]);
 
     }
     else {
@@ -9885,24 +10075,25 @@ INode.prototype._handleObjectPort = function(target, p) {
 INode.prototype._arrayPortIsFilled = function(port) {
 
   // Not even initialized
-  if (typeof this.input[port] === undefined) {
+  //if (typeof this.input[port] === undefined) {
+  if (!this.input.hasOwnProperty(port)) {
     return false;
   }
 
-  if (this.input[port].length < this._connections[port].length) {
+  if (this.input[port].read(this).length < this._connections[port].length) {
     return false;
   }
 
   // Make sure we do not have undefined (unfulfilled ports)
   // (Should not really happen)
-  for (var i = 0; i < this.input[port].length; i++) {
-    if (this.input[port][i] === undefined) {
+  for (var i = 0; i < this.input[port].read(this).length; i++) {
+    if (this.input[port].read(this)[i] === undefined) {
       return false;
     }
   }
 
   // Extra check for weird condition
-  if (this.input[port].length > this._connections[port].length) {
+  if (this.input[port].read(this).length > this._connections[port].length) {
 
     this.error(util.format(
       '%s: Array length out-of-bounds for port',
@@ -9926,25 +10117,29 @@ INode.prototype._arrayPortIsFilled = function(port) {
 INode.prototype._objectPortIsFilled = function(port) {
 
   // Not even initialized
-  if (typeof this.input[port] === undefined) {
+  //if (typeof this.input[port] === undefined) {
+  if (!this.input.hasOwnProperty(port)) {
     return false;
   }
 
   // Not all connections have provided input yet
-  if (Object.keys(this.input[port]).length < this._connections[port].length) {
+  if (Object.keys(this.input[port].read(this)).length <
+    this._connections[port].length) {
     return false;
   }
 
   // Make sure we do not have undefined (unfulfilled ports)
   // (Should not really happen)
   for (var key in this.input[port]) {
-    if (this.input[port][key] === undefined) {
+    //if (this.input[port][key] === undefined) {
+    if (this.input[port].read(this)[key] === undefined) {
       return false;
     }
   }
 
   // Extra check for weird condition
-  if (Object.keys(this.input[port]).length > this._connections[port].length) {
+  if (Object.keys(this.input[port].read(this)).length >
+    this._connections[port].length) {
 
     this.error(util.format(
       '%s: Object keys length out-of-bounds for port `%s`',
@@ -9968,6 +10163,8 @@ INode.prototype._objectPortIsFilled = function(port) {
  */
 INode.prototype._validateInput = function(port, data) {
 
+  var type;
+
   if (!this.ports.input.hasOwnProperty(port)) {
 
     var msg = Error(util.format('no such port: **%s**', port));
@@ -9975,10 +10172,11 @@ INode.prototype._validateInput = function(port, data) {
     return Error(msg);
   }
 
-  if (!validate.data(this.ports.input[port].type, data)) {
+  type = this.getPortType(port);
+
+  if (!validate.data(type, data)) {
 
     // TODO: emit these errors, with error constants
-    var expected = this.ports.input[port].type;
     var real = Object.prototype.toString.call(data).match(/\s(\w+)/)[1];
 
     if (data && typeof data === 'object' &&
@@ -9994,7 +10192,7 @@ INode.prototype._validateInput = function(port, data) {
 
     return Error(util.format(
       'Expected `%s` got `%s` on port `%s`',
-      expected, real, port));
+      type, real, port));
   }
 
   /**
@@ -10047,10 +10245,11 @@ INode.prototype.sendPortOutput = function(port, output, chi) {
         this.outputCount++;
       }
 
-      // so basically all output is a new packet.
-      // with chi sustained or enriched.
-      var p = new Packet(output);
+      var p = this.wrapPacket(port, output);
       p.set('chi', chi);
+
+      // loose the ownership
+      p.release(this);
 
       debug('%s:%s output', this.identifier, port);
 
@@ -10213,27 +10412,36 @@ INode.prototype.setContextProperty = function(port, data) {
     this.initStartPort();
   }
 
-  var res = this._validateInput(port, data);
+  if (this.portExists('input', port)) {
 
-  if (util.isError(res)) {
+    var res = this._validateInput(port, data);
 
-    this.event(':error', {
-      node: this.export(),
-      msg: Error('setContextProperty: ' + res.message)
-    });
+    if (util.isError(res)) {
+
+      this.event(':error', {
+        node: this.export(),
+        msg: Error('setContextProperty: ' + res.message)
+      });
+
+    }
+    else {
+
+      data = this._handleFunctionType(port, data);
+
+      this.$setContextProperty(port, data);
+
+      this.event(':contextUpdate', {
+        node: this,
+        port: port,
+        data: data
+      });
+
+    }
 
   }
   else {
 
-    data = this._handleFunctionType(port, data);
-
-    this.$setContextProperty(port, data);
-
-    this.event(':contextUpdate', {
-      node: this,
-      port: port,
-      data: data
-    });
+    throw Error('No such input port: ' + port);
 
   }
 };
@@ -10452,7 +10660,7 @@ INode.prototype.inputPortAvailable = function(target) {
     }
 
     // only available if [] is not already filled.
-    if (this.input[target.port][target.get('index')] !== undefined) {
+    if (this.input[target.port].read(this)[target.get('index')] !== undefined) {
       return Port.INDEX_NOT_AVAILABLE;
     }
 
@@ -10694,9 +10902,157 @@ INode.prototype.getConnections = function() {
   return this._connections;
 };
 
+INode.prototype.determineOutputType = function(port, output, origType) {
+  var type;
+  // preferably should be used and set, maybe enforce this.
+  if (this.ports.output[port].type) {
+    return this.ports.output[port].type;
+  }
+
+  type = typeof output;
+
+  if (type !== 'object') {
+    return type;
+  }
+
+  // do not modify type, keep packet type as is
+  return origType;
+
+};
+
+// TODO: many checks only have to be determined one time.
+INode.prototype.pickPacket = function(port) {
+  if (this.input.hasOwnProperty(port)) {
+    return this.input[port];
+  } else if (this.transit.hasOwnProperty(port)) {
+    // clone
+    var c = this.transit[port].clone(this);
+    c.c--; // adjust
+    return c;
+  } else {
+    return new Packet(this, null, this.ports.input[port].type);
+    //throw Error('Unable to determine source packet');
+  }
+};
+
+INode.prototype.wrapPacket = function(port, output)  {
+  var p;
+
+  if (port[0] === ':') {
+    return new Packet(
+      this,
+      output,
+      'string'
+    );
+  }
+
+  // check 1:1 (:start && :complete) are ignored
+  var ins = Object.keys(this.ports.input).filter(function(a) {
+    return a[0] !== ':';
+  });
+  var outs = Object.keys(this.ports.output).filter(function(a) {
+    return a[0] !== ':';
+  });
+
+  if (outs.length === 1 && ins.length === 1) {
+    // assume we are doing the same packet.
+    p = this.pickPacket(ins[0]);
+    if (p) {
+      p.write(
+        this,
+        output,
+        this.determineOutputType(
+          port,
+          output,
+          p.type
+        )
+      );
+
+      this.freePort(ins[0]);
+
+    } else {
+      throw Error(
+        util.format(
+          '%s: Cannot determine packet for port `%s`, `%s` is empty',
+          this.identifier,
+          port,
+          ins[0]
+        )
+      );
+    }
+  } else if (port === 'out') {
+    if (this.ports.input.hasOwnProperty('in')) {
+      p = this.pickPacket('in');
+      if (p) {
+        p.write(
+          this,
+          output,
+          this.determineOutputType(
+            port,
+            output,
+            p.type
+          )
+        );
+        this.freePort('in');
+      } else {
+        console.log(this.export());
+        throw Error(
+          util.format(
+            '%s: Cannot determine packet for port `out`',
+            this.identifier
+          )
+        );
+      }
+    } else {
+      // failing silently, no packet flow match
+      debug(
+        '%s: Unable to find corresponding `in` port for port `out`',
+        this.identifier
+      );
+    }
+  } else if (this.inPorts.indexOf(port) >= 0) {
+    // same port name context/context
+    p = this.pickPacket(port);
+    if (p) {
+      p.write(
+        this,
+        output,
+        this.determineOutputType(
+          port,
+          output,
+          p.type
+        )
+      );
+      this.freePort(port);
+    } else {
+      throw Error(
+        util.format(
+          '%s: Cannot determine packet for outport `%s`',
+          this.identifier,
+          port
+        )
+      );
+    }
+  } else {
+    // TODO: test for ports.input.out = ['out1', 'out2']
+  }
+  if (!p) {
+    p = new Packet(
+      this,
+      output,
+      this.determineOutputType(
+        port,
+        output,
+        'any' // if all else fails
+      )
+    );
+  }
+  return p;
+};
+
 module.exports = INode;
 
-},{"../ConnectionMap":17,"../packet":29,"../port":30,"../validate":38,"chix-chi":41,"debug":47,"events":11,"util":16}],28:[function(require,module,exports){
+},{"../ConnectionMap":17,"../packet":29,"../port":30,"../validate":38,"chix-chi":41,"debug":49,"events":11,"util":16}],28:[function(require,module,exports){
 'use strict';
 
 /* global document */
@@ -10894,33 +11250,58 @@ module.exports = PolymerNode;
 },{"../packet":29,"./interface":27,"util":16}],29:[function(require,module,exports){
 'use strict';
 
+var JsonPointer = require('json-ptr');
+
 /**
  *
- * A packet wraps the data.
+ * A Packet wraps the data.
  *
- * Enabling tracking and adding metadata
+ * The packet is always owned by one owner at a time.
  *
- * Filters are not really creating new packets.
- * But modify the data.
- *
- * Maybe use getters and setters?
+ * In order to read or write a packet, the owner must identify
+ * itself first, by sending itself als a reference as first argument
+ * to any of the methods.
  *
  * var p = new Packet(data);
- *
- * drop(p);
  *
  * Packet containing it's own map of source & target.
  * Could be possible, only what will happen on split.
  *
  */
 var nr = 10000000000;
-function Packet(data, n, c) {
 
-  this.data = data;
+// temp to debug copy problem
+function Container(data) {
+  this['.'] = data;
+}
+function Packet(owner, data, type, n, c) {
+
+  this.owner = owner;
+  this.trail = [];
+  this.typeTrail = [];
+
+  if (type === undefined) {
+    throw Error('type not specified');
+  }
+
+  this.type = type;
+
+  // err ok, string must be assigned to? or {".": "string"}
+  // which means base is /. instead of ''
+  this.__data = data instanceof Container ? data : new Container(data);
   this.chi = {};
   this.nr = n ? n : nr++;
   this.c = c ? c : 0; // clone version
-  this.owner = undefined;
+  this.pointer = JsonPointer.create('/.');
+
+  Object.defineProperty(this, 'data', {
+     get: function() {
+       throw Error('data property should not be accessed');
+     },
+     set: function() {
+       throw Error('data property should not be written to');
+     }
+  });
 
   // probably too much info for a basic packet.
   // this.created_at =
@@ -10928,12 +11309,44 @@ function Packet(data, n, c) {
 
 }
 
-Packet.prototype.read = function() {
-  return this.data;
+/**
+ *
+ * Pointer is a JSON Pointer.
+ *
+ * If the pointer does not start with a slash
+ * the pointer will be (forward) relative to the current position
+ * If the pointer is empty the pointer will be to the root.
+ *
+ * @param owner
+ * @param pointer JSON Pointer
+ */
+Packet.prototype.point = function(owner, pointer) {
+  if (this.isOwner(owner)) {
+    if (pointer === undefined || pointer === '') {
+      this.pointer = JsonPointer.create('/.');
+    } else if (pointer[0] === '/') {
+      this.pointer = JsonPointer.create('/.' + pointer);
+    } else {
+      this.pointer = JsonPointer.create(
+        this.pointer.pointer + '/' + pointer
+      );
+    }
+  }
 };
 
-Packet.prototype.write = function(data) {
-  this.data = data;
+Packet.prototype.read = function(owner) {
+  if (this.isOwner(owner)) {
+    return this.pointer.get(this.__data);
+  }
+};
+
+Packet.prototype.write = function(owner, data, type) {
+  if (this.isOwner(owner)) {
+    this.pointer.set(this.__data, data);
+    if (type) {
+      this.type = type;
+    }
+  }
 };
 
 // clone can only take place on plain object data.
@@ -10947,20 +11360,77 @@ Packet.prototype.write = function(data) {
  *
  * To enable this set cloneData to true.
  *
+ * @param {Object} owner Owner of the packet
  * @param {Boolean} cloneData Whether or not to clone the data.
  */
-Packet.prototype.clone = function(cloneData) {
-  var p = new Packet(
-    cloneData === undefined ?
-    JSON.parse(JSON.stringify(this.data)) :
-    this.data,
-    this.nr,
-    ++this.c
-  );
-  p.set('chi', JSON.parse(JSON.stringify(this.chi)));
-  return p;
+Packet.prototype.clone = function(owner) {
+  if (this.isOwner(owner)) {
+    var p = new Packet(owner,
+      null,
+      null,
+      this.nr,
+      ++this.c
+    );
+    if (!this.type) {
+      throw Error('Refusing to clone substance of unkown type');
+    }
+    // TODO: make sure String Object are always lowercase.
+    // I think they are..
+    if (this.type === 'function' || /[A-Z]/.test(this.type)) {
+      // do not clone, ownership will throw if things go wrong
+      // gah, this is hard.
+      var d = this.__data;
+      p.__data = d;
+    } else {
+      p.__data = JSON.parse(JSON.stringify(this.__data));
+    }
+    p.type = this.type;
+    p.pointer = JsonPointer.create(this.pointer.pointer);
+    p.set('chi', JSON.parse(JSON.stringify(this.chi)));
+    return p;
+  }
 };
 
+Packet.prototype.setType = function(owner, type) {
+  if (this.isOwner(owner)) {
+    this.typeTrail.push(this.type);
+    this.type = type;
+  }
+};
+
+Packet.prototype.release = function(owner) {
+  if (this.isOwner(owner)) {
+    this.trail.push(owner);
+    this.owner = undefined;
+  }
+};
+
+Packet.prototype.setOwner = function(newOwner) {
+  if (this.owner === undefined) {
+    this.owner = newOwner;
+  } else {
+    throw Error('Refusing to overwrite owner');
+  }
+};
+
+Packet.prototype.hasOwner = function() {
+  return this.owner !== undefined;
+};
+
+Packet.prototype.isOwner = function(owner) {
+  if (owner === this.owner) {
+    return true;
+  } else {
+    console.log(owner, this.owner);
+    throw Error('Packet is not owned by this instance.');
+  }
+};
+
+Packet.prototype.dump = function() {
+  return JSON.stringify(this, null, 2);
+};
+
+// Are these used?
 Packet.prototype.set = function(prop, val) {
   this[prop] = val;
 };
@@ -10979,7 +11449,7 @@ Packet.prototype.has = function(prop) {
 
 module.exports = Packet;
 
-},{}],30:[function(require,module,exports){
+},{"json-ptr":60}],30:[function(require,module,exports){
 'use strict';
 
 /**
@@ -11211,25 +11681,54 @@ module.exports = Port;
 
 var Port = require('../port');
 var util = require('util');
+var Packet = require('../packet');
 
 var portFill;
 
 module.exports = portFill = exports;
 
-exports.fill = function(ports, input, context) {
+/***
+ *  Packet
+ * - fill with persist, done
+ * - fill with context, done
+ * - fill with defaults
+ *  Object:
+ *  - enrich with defaults
+ *
+ * defaults -> context
+ * defaults -> persist
+ * defaults -> input
+ *
+ * @param {Node} node The node
+ * @param {Object} ports Input port definitions
+ * @param {Object} input Current input
+ * @param {Object} context Context
+ * @param {Object} persist Input to be persisted
+ **/
+exports.fill = function(node) {
 
   var ret;
 
+  var ports = node.ports.input;
+  // For every non-connceted port fill the defaults
   for (var port in ports) {
     if (ports.hasOwnProperty(port)) {
-      ret = portFill.defaulter(
-        port,
-        ports,
-        input,
-        context
-      );
-      if (util.isError(ret)) {
-        return ret;
+      if (node.portHasConnections(port) &&
+        !node.persist.hasOwnProperty(port)) {
+        // mainly to not fill async ports with connects
+        // but do have defaults
+        // nop
+      } else {
+
+        // seems the return is not correct no more also.
+        ret = portFill.defaulter(
+          node,
+          port,
+          []
+        );
+        if (util.isError(ret)) {
+          return ret;
+        }
       }
     }
   }
@@ -11238,118 +11737,172 @@ exports.fill = function(ports, input, context) {
 
 };
 
-exports.check = function(obj, key, input, context, persist) {
-  var ret;
-
-  if (obj[key].properties) { //
-    var init;
-
-    if (!input[key]) {
-      input[key] = {};
-      init = true;
-    }
-
-    for (var k in obj[key].properties) {
-      if (obj[key].properties.hasOwnProperty(k)) {
-
-        ret = !portFill.check(
-          obj[key].properties,
-          k,
-          input[key],
-          context ? context[key] : {},
-          persist ? persist[key] : {}
-        );
-
-        if (!ret) {
-
-          // use this again, just return the value
-          // this will have checked the nested schema definitions.
-          // return ret;
-          /*
-                  throw new Error([
-                    this.identifier + ': Cannot determine input for property:',
-                    key + '[' + k + ']'
-                  ].join(' '));
-          */
-        }
-      }
-    }
-
-    if (!Object.keys(input[key]).length && init) {
-      // remove empty object again
-      delete input[key]; // er ref will not work probably.
-    }
-
-    // not sure, but at least should be true.
-    return Port.FILLED;
-
-  }
-  else {
-
-    // check whether input was defined for this port
-    if (!input.hasOwnProperty(key)) {
-      // if there is context, use that.
-      if (context && context.hasOwnProperty(key)) {
-        input[key] = context[key];
-        return Port.CONTEXT_SET;
-        // check the existance of default (a value of null is also valid)
-      }
-      else if (persist && persist.hasOwnProperty(key)) {
-        input[key] = persist[key];
-        return Port.PERSISTED_SET;
-      }
-      else if (obj[key].hasOwnProperty('default')) {
-        input[key] = obj[key].default;
-        return Port.DEFAULT_SET;
-      }
-      else if (obj[key].required === false) {
-        // filled but empty let the node handle it.
-        input[key] = null;
-        return Port.NOT_REQUIRED;
-      }
-      else {
-        return Port.NOT_FILLED;
-      }
-
-    }
-    else {
-      return Port.FILLED;
-    }
-
-  }
-};
-
 // also fill the defaults one level deep..
 /**
  *
  * @param {string} port
  * @private
  */
-exports.defaulter = function(port, ports, input, context) {
+exports.defaulter = function(node, port, path) {
+
   if (!portFill.check(
-      ports,
+      node,
+      node.ports.input,
       port,
-      input,
-      context
-    ) && !ports[port].async) {
+      node.input,
+      node.context,
+      node.persist,
+      path
+    ) && !node.ports.input[port].async) {
 
     if (port[0] !== ':') {
       return Port.SYNC_PORTS_UNFULFILLED;
       /*
-            // fail hard
-            return Error(util.format(
-              '%s: Cannot determine input for port `%s`',
-              this.identifier,
-              port
-            ));
+        // fail hard
+        return Error(util.format(
+          '%s: Cannot determine input for port `%s`',
+          node.identifier,
+          port
+        ));
       */
-
     }
-
   }
 };
 
-},{"../port":30,"util":16}],32:[function(require,module,exports){
+/***
+ *
+ * Fills properties with defaults
+ *
+ * Note how context and persist make no sense here...
+ * It's already filled.
+ *
+ * @param node Node
+ * @param {Object} def Current object schema
+ * @param {Object} input the input to be filled
+ * @param {Object} context Current level context
+ * @param {Object} persist Current level persist
+ * @param {String} port The port
+ */
+exports.checkProperties = function(node, def, input, port) {
+  var ret;
+  for (var prop in def.properties) {
+    if (def.properties.hasOwnProperty(prop)) {
+      var property =  def.properties[prop];
+        // check the existance of default (a value of null is also valid)
+      if (!input.hasOwnProperty(prop)) {
+        if (property.hasOwnProperty('default')) {
+          input[prop] = property.default;
+        } else if (property.required === false) {
+          // filled with packet, but the value is undefined.
+          // input[key] = null; // undefined not possible at this level.
+          input[prop] = undefined; // undefined not possible at this level.
+        } else {
+
+          if (property.type === 'object') {
+            if (property.hasOwnProperty('properties')) {
+              if (!input.hasOwnProperty(prop)) {
+                // always fill with empty object?
+                input[prop] = {};
+              }
+              return this.checkProperties(node, property, input[prop], port);
+            }
+          }
+          // fail check
+          // return or throw?
+          // return throw Error(util.format(
+          throw Error(util.format(
+            '%s: Cannot determine input for port `%s`',
+            node.identifier,
+            port
+          ));
+        }
+      }
+    }
+  }
+};
+
+// first level
+/**
+ *
+ * @param node Node
+ * @param {Object} def Current object schema
+ * @param {String} port Port
+ * @param {Object} input the input to be filled
+ * @param {Object} context Current level context
+ * @param {Object} persist Current level persist
+ */
+exports.check = function(node, def, port, input, context, persist) {
+
+  var ret;
+
+  // check whether input was defined for this port
+  if (!input.hasOwnProperty(port)) {
+
+    // This will not really work for persisted indexes
+    // or at least it should check whether the array is full after
+    // this fill
+    ret = Port.NOT_FILLED;
+    if (persist && persist.hasOwnProperty(port)) {
+      input[port] = persist[port].clone(node);
+      ret = Port.PERSISTED_SET;
+    } else if (context && context.hasOwnProperty(port)) {
+      // if there is context, use that.
+      input[port] = context[port].clone(node);
+      ret = Port.CONTEXT_SET;
+      // check the existance of default (a value of null is also valid)
+    } else if (def[port].hasOwnProperty('default')) {
+      input[port] = new Packet(
+        node,
+        def[port].default,
+        node.getPortType(port)
+      );
+      ret = Port.DEFAULT_SET;
+    } else if (def[port].required === false) {
+      // filled with packet, but the value is undefined.
+      input[port] = new Packet(
+        node,
+        undefined,
+        node.getPortType(port)
+      );
+      ret = Port.NOT_REQUIRED;
+    }
+
+    // if it's an object, fill in defaults
+    if (def[port].properties) { //
+      var init;
+      var obj = {};
+
+      // initialize packet on the first level
+      if (!input[port]) {
+        init = true;
+        input[port] = new Packet(node, obj, 'object');
+      } else {
+        obj = input[port].read(node) || {};
+      }
+
+      portFill.checkProperties(node, def[port], obj, port);
+
+      // TODO: check ret value correctness
+      if (!Object.keys(obj).length && init) {
+        // remove empty packet again
+        delete input[port];
+        ret = Port.NOT_FILLED;
+      } else {
+        ret = Port.FILLED;
+      }
+
+    }
+
+    return ret;
+
+  }
+  else {
+    return Port.FILLED;
+  }
+
+};
+
+},{"../packet":29,"../port":30,"util":16}],32:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -11670,7 +12223,7 @@ ProcessManager.prototype.filterBy = function(prop, value) {
 module.exports = ProcessManager;
 
 }).call(this,require("uojqOp"))
-},{"events":11,"uojqOp":14,"util":16,"uuid":59}],33:[function(require,module,exports){
+},{"events":11,"uojqOp":14,"util":16,"uuid":62}],33:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -12031,7 +12584,7 @@ QueueManager.prototype.getQueues = function() {
 
 module.exports = QueueManager;
 
-},{"debug":47,"util":16}],34:[function(require,module,exports){
+},{"debug":49,"util":16}],34:[function(require,module,exports){
 'use strict';
 
 var DefaultContextProvider = require('./context/defaultProvider');
@@ -12345,7 +12898,7 @@ NodeBox.prototype.run = function(bind) {
 module.exports = NodeBox;
 
 }).call(this,require("uojqOp"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"iobox":51,"path":13,"uojqOp":14,"util":16}],36:[function(require,module,exports){
+},{"iobox":53,"path":13,"uojqOp":14,"util":16}],36:[function(require,module,exports){
 'use strict';
 
 var NodeBox = require('./node');
@@ -12682,7 +13235,7 @@ module.exports = {
   nodeDefinitions: _checkIds
 };
 
-},{"../schemas/link.json":60,"../schemas/map.json":61,"../schemas/node.json":62,"instance-of":50,"is-plain-object":52,"json-gate":55}],"chix-flow":[function(require,module,exports){
+},{"../schemas/link.json":63,"../schemas/map.json":64,"../schemas/node.json":65,"instance-of":52,"is-plain-object":54,"json-gate":57}],"chix-flow":[function(require,module,exports){
 module.exports=require('jXAsbI');
 },{}],"jXAsbI":[function(require,module,exports){
 'use strict';
@@ -12709,7 +13262,7 @@ module.exports = {
   }
 };
 
-},{"./lib/actor":18,"./lib/flow":21,"./lib/link":24,"./lib/node":26,"./lib/validate":38,"./schemas/map.json":61,"./schemas/node.json":62,"./schemas/stage.json":63}],41:[function(require,module,exports){
+},{"./lib/actor":18,"./lib/flow":21,"./lib/link":24,"./lib/node":26,"./lib/validate":38,"./schemas/map.json":64,"./schemas/node.json":65,"./schemas/stage.json":66}],41:[function(require,module,exports){
 'use strict';
 
 var util         = require('util');
@@ -13127,7 +13680,7 @@ Group.prototype.gid = function() {
 
 module.exports = Group;
 
-},{"events":11,"util":16,"uuid":59}],43:[function(require,module,exports){
+},{"events":11,"util":16,"uuid":47}],43:[function(require,module,exports){
 'use strict';
 
 var uuid = require('uuid').v4;
@@ -13189,7 +13742,7 @@ PortPointer.prototype.add = function(port) {
 
 module.exports = PortPointer;
 
-},{"uuid":59}],44:[function(require,module,exports){
+},{"uuid":47}],44:[function(require,module,exports){
 'use strict';
 
 ////
@@ -13347,6 +13900,226 @@ Store.prototype.isEmpty = function() {
 module.exports = Store;
 
 },{}],46:[function(require,module,exports){
+(function (global){
+
+var rng;
+
+if (global.crypto && crypto.getRandomValues) {
+  // WHATWG crypto-based RNG - http://wiki.whatwg.org/wiki/Crypto
+  // Moderately fast, high quality
+  var _rnds8 = new Uint8Array(16);
+  rng = function whatwgRNG() {
+    crypto.getRandomValues(_rnds8);
+    return _rnds8;
+  };
+}
+
+if (!rng) {
+  // Math.random()-based (RNG)
+  //
+  // If all else fails, use Math.random().  It's fast, but is of unspecified
+  // quality.
+  var  _rnds = new Array(16);
+  rng = function() {
+    for (var i = 0, r; i < 16; i++) {
+      if ((i & 0x03) === 0) r = Math.random() * 0x100000000;
+      _rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
+    }
+
+    return _rnds;
+  };
+}
+
+module.exports = rng;
+
+
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],47:[function(require,module,exports){
+//     uuid.js
+//
+//     Copyright (c) 2010-2012 Robert Kieffer
+//     MIT License - http://opensource.org/licenses/mit-license.php
+
+// Unique ID creation requires a high quality random # generator.  We feature
+// detect to determine the best RNG source, normalizing to a function that
+// returns 128-bits of randomness, since that's what's usually required
+var _rng = require('./rng');
+
+// Maps for number <-> hex string conversion
+var _byteToHex = [];
+var _hexToByte = {};
+for (var i = 0; i < 256; i++) {
+  _byteToHex[i] = (i + 0x100).toString(16).substr(1);
+  _hexToByte[_byteToHex[i]] = i;
+}
+
+// **`parse()` - Parse a UUID into it's component bytes**
+function parse(s, buf, offset) {
+  var i = (buf && offset) || 0, ii = 0;
+
+  buf = buf || [];
+  s.toLowerCase().replace(/[0-9a-f]{2}/g, function(oct) {
+    if (ii < 16) { // Don't overflow!
+      buf[i + ii++] = _hexToByte[oct];
+    }
+  });
+
+  // Zero out remaining bytes if string was short
+  while (ii < 16) {
+    buf[i + ii++] = 0;
+  }
+
+  return buf;
+}
+
+// **`unparse()` - Convert UUID byte array (ala parse()) into a string**
+function unparse(buf, offset) {
+  var i = offset || 0, bth = _byteToHex;
+  return  bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]];
+}
+
+// **`v1()` - Generate time-based UUID**
+//
+// Inspired by https://github.com/LiosK/UUID.js
+// and http://docs.python.org/library/uuid.html
+
+// random #'s we need to init node and clockseq
+var _seedBytes = _rng();
+
+// Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
+var _nodeId = [
+  _seedBytes[0] | 0x01,
+  _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
+];
+
+// Per 4.2.2, randomize (14 bit) clockseq
+var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
+
+// Previous uuid creation time
+var _lastMSecs = 0, _lastNSecs = 0;
+
+// See https://github.com/broofa/node-uuid for API details
+function v1(options, buf, offset) {
+  var i = buf && offset || 0;
+  var b = buf || [];
+
+  options = options || {};
+
+  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
+
+  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
+  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
+  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
+  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
+  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
+
+  // Per 4.2.1.2, use count of uuid's generated during the current clock
+  // cycle to simulate higher resolution clock
+  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
+
+  // Time since last uuid creation (in msecs)
+  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
+
+  // Per 4.2.1.2, Bump clockseq on clock regression
+  if (dt < 0 && options.clockseq === undefined) {
+    clockseq = clockseq + 1 & 0x3fff;
+  }
+
+  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
+  // time interval
+  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
+    nsecs = 0;
+  }
+
+  // Per 4.2.1.2 Throw error if too many uuids are requested
+  if (nsecs >= 10000) {
+    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
+  }
+
+  _lastMSecs = msecs;
+  _lastNSecs = nsecs;
+  _clockseq = clockseq;
+
+  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
+  msecs += 12219292800000;
+
+  // `time_low`
+  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
+  b[i++] = tl >>> 24 & 0xff;
+  b[i++] = tl >>> 16 & 0xff;
+  b[i++] = tl >>> 8 & 0xff;
+  b[i++] = tl & 0xff;
+
+  // `time_mid`
+  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
+  b[i++] = tmh >>> 8 & 0xff;
+  b[i++] = tmh & 0xff;
+
+  // `time_high_and_version`
+  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
+  b[i++] = tmh >>> 16 & 0xff;
+
+  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
+  b[i++] = clockseq >>> 8 | 0x80;
+
+  // `clock_seq_low`
+  b[i++] = clockseq & 0xff;
+
+  // `node`
+  var node = options.node || _nodeId;
+  for (var n = 0; n < 6; n++) {
+    b[i + n] = node[n];
+  }
+
+  return buf ? buf : unparse(b);
+}
+
+// **`v4()` - Generate random UUID**
+
+// See https://github.com/broofa/node-uuid for API details
+function v4(options, buf, offset) {
+  // Deprecated - 'format' argument, as supported in v1.2
+  var i = buf && offset || 0;
+
+  if (typeof(options) == 'string') {
+    buf = options == 'binary' ? new Array(16) : null;
+    options = null;
+  }
+  options = options || {};
+
+  var rnds = options.random || (options.rng || _rng)();
+
+  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
+  rnds[6] = (rnds[6] & 0x0f) | 0x40;
+  rnds[8] = (rnds[8] & 0x3f) | 0x80;
+
+  // Copy bytes to buffer, if provided
+  if (buf) {
+    for (var ii = 0; ii < 16; ii++) {
+      buf[i + ii] = rnds[ii];
+    }
+  }
+
+  return buf || unparse(rnds);
+}
+
+// Export public API
+var uuid = v4;
+uuid.v1 = v1;
+uuid.v4 = v4;
+uuid.parse = parse;
+uuid.unparse = unparse;
+
+module.exports = uuid;
+
+},{"./rng":46}],48:[function(require,module,exports){
 'use strict';
 
 var EventEmitter = require('events').EventEmitter;
@@ -13383,7 +14156,7 @@ function Loader() {
    *    }
    *
    *  }
-   *
+   *G
    * }
    *
    */
@@ -14046,7 +14819,7 @@ Loader.prototype.getNodeDefinitions = function(provider) {
 
 module.exports = Loader;
 
-},{"events":11,"util":16}],47:[function(require,module,exports){
+},{"events":11,"util":16}],49:[function(require,module,exports){
 
 /**
  * This is the web browser implementation of `debug()`.
@@ -14060,17 +14833,6 @@ exports.formatArgs = formatArgs;
 exports.save = save;
 exports.load = load;
 exports.useColors = useColors;
-
-/**
- * Use chrome.storage.local if we are in an app
- */
-
-var storage;
-
-if (typeof chrome !== 'undefined' && typeof chrome.storage !== 'undefined')
-  storage = chrome.storage.local;
-else
-  storage = window.localStorage;
 
 /**
  * Colors.
@@ -14161,10 +14923,10 @@ function formatArgs() {
  */
 
 function log() {
-  // this hackery is required for IE8/9, where
-  // the `console.log` function doesn't have 'apply'
-  return 'object' === typeof console
-    && console.log
+  // This hackery is required for IE8,
+  // where the `console.log` function doesn't have 'apply'
+  return 'object' == typeof console
+    && 'function' == typeof console.log
     && Function.prototype.apply.call(console.log, console, arguments);
 }
 
@@ -14178,9 +14940,9 @@ function log() {
 function save(namespaces) {
   try {
     if (null == namespaces) {
-      storage.removeItem('debug');
+      localStorage.removeItem('debug');
     } else {
-      storage.debug = namespaces;
+      localStorage.debug = namespaces;
     }
   } catch(e) {}
 }
@@ -14195,7 +14957,7 @@ function save(namespaces) {
 function load() {
   var r;
   try {
-    r = storage.debug;
+    r = localStorage.debug;
   } catch(e) {}
   return r;
 }
@@ -14206,7 +14968,7 @@ function load() {
 
 exports.enable(load());
 
-},{"./debug":48}],48:[function(require,module,exports){
+},{"./debug":50}],50:[function(require,module,exports){
 
 /**
  * This is the common logic for both the Node.js and web browser
@@ -14405,7 +15167,7 @@ function coerce(val) {
   return val;
 }
 
-},{"ms":49}],49:[function(require,module,exports){
+},{"ms":51}],51:[function(require,module,exports){
 /**
  * Helpers.
  */
@@ -14518,7 +15280,7 @@ function plural(ms, n, name) {
   return Math.ceil(ms / n) + ' ' + name + 's';
 }
 
-},{}],50:[function(require,module,exports){
+},{}],52:[function(require,module,exports){
 module.exports = function InstanceOf(obj, type) {
   if(obj === null) return false;
   if(type === 'array') type = 'Array';
@@ -14533,7 +15295,7 @@ module.exports = function InstanceOf(obj, type) {
   }
 };
 
-},{}],51:[function(require,module,exports){
+},{}],53:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -14810,7 +15572,7 @@ IOBox.prototype.run = function (bind) {
 
 module.exports = IOBox;
 
-},{"events":11,"util":16}],52:[function(require,module,exports){
+},{"events":11,"util":16}],54:[function(require,module,exports){
 /*!
  * is-plain-object <https://github.com/jonschlinkert/is-plain-object>
  *
@@ -14823,7 +15585,7 @@ module.exports = IOBox;
 module.exports = function isPlainObject(o) {
   return !!o && typeof o === 'object' && o.constructor === Object;
 };
-},{}],53:[function(require,module,exports){
+},{}],55:[function(require,module,exports){
 exports.getType = function (obj) {
 	switch (Object.prototype.toString.call(obj)) {
 		case '[object String]':
@@ -14924,7 +15686,7 @@ exports.deepEquals = function (obj1, obj2) {
 	}
 };
 
-},{}],54:[function(require,module,exports){
+},{}],56:[function(require,module,exports){
 var RE_0_TO_100 = '([1-9]?[0-9]|100)';
 var RE_0_TO_255 = '([1-9]?[0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])';
 
@@ -15020,7 +15782,7 @@ var formats = {
 
 exports.formats = formats;
 
-},{}],55:[function(require,module,exports){
+},{}],57:[function(require,module,exports){
 var validateSchema = require('./valid-schema'),
 	validateObject = require('./valid-object');
 
@@ -15037,7 +15799,7 @@ module.exports.createSchema = function (schema) {
 	return new Schema(schema);
 }
 
-},{"./valid-object":56,"./valid-schema":57}],56:[function(require,module,exports){
+},{"./valid-object":58,"./valid-schema":59}],58:[function(require,module,exports){
 var formats = require('./formats').formats;
 var common = require('./common'),
 	getType = common.getType,
@@ -15422,7 +16184,7 @@ module.exports = function(obj, schema, done) {
 	}
 };
 
-},{"./common":53,"./formats":54}],57:[function(require,module,exports){
+},{"./common":55,"./formats":56}],59:[function(require,module,exports){
 var formats = require('./formats').formats;
 var common = require('./common'),
 	getType = common.getType,
@@ -15704,227 +16466,321 @@ module.exports = function(schema) {
 	validateSchema(schema, []);
 };
 
-},{"./common":53,"./formats":54,"./valid-object":56}],58:[function(require,module,exports){
+},{"./common":55,"./formats":56,"./valid-object":58}],60:[function(require,module,exports){
 (function (global){
+/* jshint laxbreak: true, laxcomma: true*/
+/* global global, window */
 
-var rng;
+(function (undefined) {
+	"use strict";
 
-if (global.crypto && crypto.getRandomValues) {
-  // WHATWG crypto-based RNG - http://wiki.whatwg.org/wiki/Crypto
-  // Moderately fast, high quality
-  var _rnds8 = new Uint8Array(16);
-  rng = function whatwgRNG() {
-    crypto.getRandomValues(_rnds8);
-    return _rnds8;
-  };
-}
+	var $scope
+	, conflict, conflictResolution = [];
+	if (typeof global === 'object' && global) {
+		$scope = global;
+		conflict = global.JsonPointer;
+	} else if (typeof window !== 'undefined') {
+		$scope = window;
+		conflict = window.JsonPointer;
+	} else {
+		$scope = {};
+	}
+	if (conflict) {
+		conflictResolution.push(
+			function () {
+				if ($scope.JsonPointer === JsonPointer) {
+					$scope.JsonPointer = conflict;
+					conflict = undefined;
+				}
+			});
+	}
 
-if (!rng) {
-  // Math.random()-based (RNG)
-  //
-  // If all else fails, use Math.random().  It's fast, but is of unspecified
-  // quality.
-  var  _rnds = new Array(16);
-  rng = function() {
-    for (var i = 0, r; i < 16; i++) {
-      if ((i & 0x03) === 0) r = Math.random() * 0x100000000;
-      _rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
-    }
+	function decodePointer(ptr) {
+		if (typeof ptr !== 'string') { throw new TypeError('Invalid type: JSON Pointers are represented as strings.'); }
+		if (ptr.length === 0) { return []; }
+		if (ptr[0] !== '/') { throw new ReferenceError('Invalid JSON Pointer syntax. Non-empty pointer must begin with a solidus `/`.'); }
+		var path = ptr.substring(1).split('/')
+		, i = -1
+		, len = path.length
+		;
+		while (++i < len) {
+			path[i] = path[i].replace('~1', '/').replace('~0', '~');
+		}
+		return path;
+	}
 
-    return _rnds;
-  };
-}
+	function encodePointer(path) {
+		if (path && !Array.isArray(path)) { throw new TypeError('Invalid type: path must be an array of segments.'); }
+		if (path.length === 0) { return ''; }
+		var res = []
+		, i = -1
+		, len = path.length
+		;
+		while (++i < len) {
+			if (typeof path[i] === 'string') {
+				res.push(path[i].replace('~', '~0').replace('/', '~1'));
+			} else {
+				res.push(path[i]);
+			}
+		}
+		return "/".concat(res.join('/'));
+	}
 
-module.exports = rng;
+	function decodeUriFragmentIdentifier(ptr) {
+		if (typeof ptr !== 'string') { throw new TypeError('Invalid type: JSON Pointers are represented as strings.'); }
+		if (ptr.length === 0 || ptr[0] !== '#') { throw new ReferenceError('Invalid JSON Pointer syntax; URI fragment idetifiers must begin with a hash.'); }
+		if (ptr.length === 1) { return []; }
+		if (ptr[1] !== '/') { throw new ReferenceError('Invalid JSON Pointer syntax.'); }
+		var path = ptr.substring(2).split('/')
+		, i = -1
+		, len = path.length
+		;
+		while (++i < len) {
+			path[i] = decodeURIComponent(path[i]).replace('~1', '/').replace('~0', '~');
+		}
+		return path;
+	}
 
+	function encodeUriFragmentIdentifier(path) {
+		if (path && !Array.isArray(path)) { throw new TypeError('Invalid type: path must be an array of segments.'); }
+		if (path.length === 0) { return '#'; }
+		var res = []
+		, i = -1
+		, len = path.length
+		;
+		while (++i < len) {
+			var segment = '' + path[i];
+			res.push(encodeURIComponent(segment.replace('~', '~0').replace('/', '~1')));
+		}
+		return "#/".concat(res.join('/'));
+	}
+
+	function toArrayIndexReference(arr, idx) {
+		var len = idx.length
+		, cursor = 0
+		;
+		if (len === 0 || len > 1 && idx[0] === '0')  { return -1; }
+		if (len === 1 && idx[0] === '-') { return arr.length; }
+
+		while (++cursor < len) {
+			if (idx[cursor] < '0' || idx[cursor] > '9') { return -1; }
+		}
+		return parseInt(idx, 10);
+	}
+
+	function list(obj, observe, path, key, stack, ptrs) {
+		var i, len;
+		path = path || [];
+		var currentPath = path.slice(0);
+		if (typeof key !== 'undefined') {
+			currentPath.push(key);
+		}
+		var type = typeof obj;
+		if (type === 'undefined') {
+			return; // should only happen at the top level.
+		} else {
+			var ptr = encodeUriFragmentIdentifier(currentPath);
+			if (type === 'object' && obj !== null) {
+				stack = stack || [];
+				ptrs = ptrs || [];
+				var circ = stack.indexOf(obj);
+				if (circ < 0) {
+					stack.push(obj);
+					ptrs.push(ptr);
+					observe({
+						fragmentId: ptr,
+						value: obj
+					});
+					if (Array.isArray(obj)) {
+						i = -1;
+						len = obj.length;
+						while (++i < len) {
+							list(obj[i], observe, currentPath, i, stack, ptrs);
+						}
+					} else {
+						var props = Object.getOwnPropertyNames(obj);
+						i = -1;
+						len = props.length;
+						while (++i < len) {
+							list(obj[props[i]], observe, currentPath, props[i], stack, ptrs);
+						}
+					}
+					stack.length = stack.length - 1;
+					ptrs.length = ptrs.length - 1;
+				} else {
+					observe({
+						fragmentId: ptr,
+						value: { '$ref': ptrs[circ] },
+						circular: true
+					});
+				}
+			} else {
+				observe({
+					fragmentId: ptr,
+					value: obj
+				});
+			}
+		}
+	}
+
+	function get(obj, path) {
+		if (typeof obj !== 'undefined') {
+			var it = obj
+			, len = path.length
+			, cursor = -1
+			, step, p;
+			if (len) {
+				while (++cursor < len && it) {
+					step = path[cursor];
+					if (Array.isArray(it)) {
+						if (isNaN(step)) {
+							return;
+						}
+						p = toArrayIndexReference(it, step);
+						if (it.length > p) {
+							it = it[p];
+						} else {
+							return;
+						}
+					} else {
+						it = it[step];
+					}
+				}
+				return it;
+			} else {
+				return obj;
+			}
+		}
+	}
+
+	function set(obj, val, path, enc) {
+		if (path.length === 0) { throw new Error("Cannot set the root object; assign it directly."); }
+		if (typeof obj !== 'undefined') {
+			var it = obj
+			, len = path.length
+			, end = path.length - 1
+			, cursor = -1
+			, step, p, rem;
+			if (len) {
+				while (++cursor < len) {
+					step = path[cursor];
+					if (Array.isArray(it)) {
+						p = toArrayIndexReference(it, step);
+						if (it.length > p) {
+							if (cursor === end) {
+								rem = it[p];
+								it[p] = val;
+								return rem;
+							}
+							it = it[p];
+						} else if (it.length === p) {
+							it.push(val);
+							return undefined;
+						} else {
+							throw new ReferenceError("Not found: "
+								.concat(enc(path.slice(0, cursor + 1), true), '.'));
+						}
+					} else {
+						if (cursor === end) {
+							rem = it[step];
+							it[step] = val;
+							return rem;
+						}
+						it = it[step];
+						if (typeof it === 'undefined') {
+							throw new ReferenceError("Not found: "
+								.concat(enc(path.slice(0, cursor + 1), true), '.'));
+						}
+					}
+				}
+				if (cursor === len) {
+					return it;
+				}
+			} else {
+				return it;
+			}
+		}
+	}
+
+	function JsonPointer(ptr) {
+		this.encode = (ptr.length > 0 && ptr[0] === '#') ? encodeUriFragmentIdentifier : encodePointer;
+		if (Array.isArray(ptr)) {
+			this.path = ptr;
+		} else {
+			var decode = (ptr.length > 0 && ptr[0] === '#') ? decodeUriFragmentIdentifier : decodePointer;
+			this.path = decode(ptr);
+		}
+	}
+
+	Object.defineProperty(JsonPointer.prototype, 'pointer', {
+		enumerable: true,
+		get: function () { return encodePointer(this.path); }
+	});
+
+	Object.defineProperty(JsonPointer.prototype, 'uriFragmentIdentifier', {
+		enumerable: true,
+		get: function () { return encodeUriFragmentIdentifier(this.path); }
+	});
+
+	JsonPointer.prototype.get = function (obj) {
+		return get(obj, this.path);
+	};
+
+	JsonPointer.prototype.set = function (obj, val) {
+		return set(obj, val, this.path, this.encode);
+	};
+
+	JsonPointer.prototype.toString = function () {
+		return this.pointer;
+	};
+
+	JsonPointer.create = function (ptr) { return new JsonPointer(ptr); };
+	JsonPointer.get = function (obj, ptr) {
+		var decode = (ptr.length > 0 && ptr[0] === '#') ? decodeUriFragmentIdentifier : decodePointer;
+		return get(obj, decode(ptr));
+	};
+	JsonPointer.set = function (obj, ptr, val) {
+		var encode = (ptr.length > 0 && ptr[0] === '#') ? encodeUriFragmentIdentifier : encodePointer;
+		var decode = (ptr.length > 0 && ptr[0] === '#') ? decodeUriFragmentIdentifier : decodePointer;
+
+		return set(obj, val, decode(ptr), encode);
+	};
+	JsonPointer.list = function (obj, observe) {
+		var res = [];
+		observe = observe || function (observation) {
+			res.push(observation);
+		};
+		list(obj, observe);
+		if (res.length) {
+			return res;
+		}
+	};
+	JsonPointer.decodePointer = decodePointer;
+	JsonPointer.encodePointer = encodePointer;
+	JsonPointer.decodeUriFragmentIdentifier = decodeUriFragmentIdentifier;
+	JsonPointer.encodeUriFragmentIdentifier = encodeUriFragmentIdentifier;
+
+	JsonPointer.noConflict = function () {
+		if (conflictResolution) {
+			conflictResolution.forEach(function (it) { it(); });
+			conflictResolution = null;
+		}
+		return JsonPointer;
+	};
+
+	if (typeof module !== 'undefined' && module && typeof exports === 'object' && exports && module.exports === exports) {
+		module.exports = JsonPointer; // nodejs
+	} else {
+		$scope.JsonPointer = JsonPointer; // other... browser?
+	}
+}());
 
 }).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],59:[function(require,module,exports){
-//     uuid.js
-//
-//     Copyright (c) 2010-2012 Robert Kieffer
-//     MIT License - http://opensource.org/licenses/mit-license.php
-
-// Unique ID creation requires a high quality random # generator.  We feature
-// detect to determine the best RNG source, normalizing to a function that
-// returns 128-bits of randomness, since that's what's usually required
-var _rng = require('./rng');
-
-// Maps for number <-> hex string conversion
-var _byteToHex = [];
-var _hexToByte = {};
-for (var i = 0; i < 256; i++) {
-  _byteToHex[i] = (i + 0x100).toString(16).substr(1);
-  _hexToByte[_byteToHex[i]] = i;
-}
-
-// **`parse()` - Parse a UUID into it's component bytes**
-function parse(s, buf, offset) {
-  var i = (buf && offset) || 0, ii = 0;
-
-  buf = buf || [];
-  s.toLowerCase().replace(/[0-9a-f]{2}/g, function(oct) {
-    if (ii < 16) { // Don't overflow!
-      buf[i + ii++] = _hexToByte[oct];
-    }
-  });
-
-  // Zero out remaining bytes if string was short
-  while (ii < 16) {
-    buf[i + ii++] = 0;
-  }
-
-  return buf;
-}
-
-// **`unparse()` - Convert UUID byte array (ala parse()) into a string**
-function unparse(buf, offset) {
-  var i = offset || 0, bth = _byteToHex;
-  return  bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]];
-}
-
-// **`v1()` - Generate time-based UUID**
-//
-// Inspired by https://github.com/LiosK/UUID.js
-// and http://docs.python.org/library/uuid.html
-
-// random #'s we need to init node and clockseq
-var _seedBytes = _rng();
-
-// Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
-var _nodeId = [
-  _seedBytes[0] | 0x01,
-  _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
-];
-
-// Per 4.2.2, randomize (14 bit) clockseq
-var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
-
-// Previous uuid creation time
-var _lastMSecs = 0, _lastNSecs = 0;
-
-// See https://github.com/broofa/node-uuid for API details
-function v1(options, buf, offset) {
-  var i = buf && offset || 0;
-  var b = buf || [];
-
-  options = options || {};
-
-  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
-
-  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
-  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
-  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
-  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
-  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
-
-  // Per 4.2.1.2, use count of uuid's generated during the current clock
-  // cycle to simulate higher resolution clock
-  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
-
-  // Time since last uuid creation (in msecs)
-  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
-
-  // Per 4.2.1.2, Bump clockseq on clock regression
-  if (dt < 0 && options.clockseq === undefined) {
-    clockseq = clockseq + 1 & 0x3fff;
-  }
-
-  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
-  // time interval
-  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
-    nsecs = 0;
-  }
-
-  // Per 4.2.1.2 Throw error if too many uuids are requested
-  if (nsecs >= 10000) {
-    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
-  }
-
-  _lastMSecs = msecs;
-  _lastNSecs = nsecs;
-  _clockseq = clockseq;
-
-  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
-  msecs += 12219292800000;
-
-  // `time_low`
-  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
-  b[i++] = tl >>> 24 & 0xff;
-  b[i++] = tl >>> 16 & 0xff;
-  b[i++] = tl >>> 8 & 0xff;
-  b[i++] = tl & 0xff;
-
-  // `time_mid`
-  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
-  b[i++] = tmh >>> 8 & 0xff;
-  b[i++] = tmh & 0xff;
-
-  // `time_high_and_version`
-  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
-  b[i++] = tmh >>> 16 & 0xff;
-
-  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
-  b[i++] = clockseq >>> 8 | 0x80;
-
-  // `clock_seq_low`
-  b[i++] = clockseq & 0xff;
-
-  // `node`
-  var node = options.node || _nodeId;
-  for (var n = 0; n < 6; n++) {
-    b[i + n] = node[n];
-  }
-
-  return buf ? buf : unparse(b);
-}
-
-// **`v4()` - Generate random UUID**
-
-// See https://github.com/broofa/node-uuid for API details
-function v4(options, buf, offset) {
-  // Deprecated - 'format' argument, as supported in v1.2
-  var i = buf && offset || 0;
-
-  if (typeof(options) == 'string') {
-    buf = options == 'binary' ? new Array(16) : null;
-    options = null;
-  }
-  options = options || {};
-
-  var rnds = options.random || (options.rng || _rng)();
-
-  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
-  rnds[6] = (rnds[6] & 0x0f) | 0x40;
-  rnds[8] = (rnds[8] & 0x3f) | 0x80;
-
-  // Copy bytes to buffer, if provided
-  if (buf) {
-    for (var ii = 0; ii < 16; ii++) {
-      buf[i + ii] = rnds[ii];
-    }
-  }
-
-  return buf || unparse(rnds);
-}
-
-// Export public API
-var uuid = v4;
-uuid.v1 = v1;
-uuid.v4 = v4;
-uuid.parse = parse;
-uuid.unparse = unparse;
-
-module.exports = uuid;
-
-},{"./rng":58}],60:[function(require,module,exports){
+},{}],61:[function(require,module,exports){
+module.exports=require(46)
+},{}],62:[function(require,module,exports){
+module.exports=require(47)
+},{"./rng":61}],63:[function(require,module,exports){
 module.exports={
   "type": "object",
   "title": "Chiχ Link",
@@ -16001,7 +16857,7 @@ module.exports={
   "additionalProperties": false
 }
 
-},{}],61:[function(require,module,exports){
+},{}],64:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Map",
@@ -16153,7 +17009,7 @@ module.exports={
   "additionalProperties": false
 }
 
-},{}],62:[function(require,module,exports){
+},{}],65:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Nodes",
@@ -16234,7 +17090,7 @@ module.exports={
   "additionalProperties": false
 }
 
-},{}],63:[function(require,module,exports){
+},{}],66:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Stage",
@@ -16330,236 +17186,14 @@ module.exports={
   }
 }
 
-},{}],64:[function(require,module,exports){
-'use strict';
-
-/**
- *
- * Ok, this should be a general listener interface.
- *
- * One who will use it is the Actor.
- * But I want to be able to do the same for e.g. Loader.
- *
- * They will all be in chix-monitor-*
- *
- * npmlog =  Listener(instance, options);
- *
- * The return is just in case you want to do other stuff.
- *
- * e.g. fbpx wants to add this to npmlog:
- *
- * Logger.level = program.verbose ? 'verbose' : program.debug;
- *
- */
-// function NpmLogActorMonitor(actor, opts) {
-module.exports = function NpmLogActorMonitor(Logger, actor) {
-
-   // TODO: just make an NpmLogIOMonitor.
-   var ioHandler = actor.ioHandler;
-
-   actor.on('removeLink', function(event) {
-     Logger.debug(
-       event.node ? event.node.identifier : 'Some Actor',
-       'removed link'
-     );
-   });
-
-   // Ok emiting each and every output I don't like for the IOHandler.
-   // but whatever can change it later.
-   ioHandler.on('output', function(data) {
-
-     // I don't like this data.out.port thing vs data.port
-     switch(data.port) {
-
-        case ':plug':
-         Logger.debug(
-           data.node.identifier,
-           'port %s plugged (%d)',
-           data.out.read().port,
-           data.out.read().connections);
-        break;
-
-        case ':unplug':
-         Logger.debug(
-           data.node.identifier,
-           'port %s unplugged (%d)',
-           data.out.read().port,
-           data.out.read().connections);
-        break;
-
-        case ':portFill':
-         Logger.info(
-           data.node.identifier,
-           'port %s filled with data',
-           data.out.read().port);
-        break;
-
-        case ':contextUpdate':
-         Logger.info(
-           data.node.identifier,
-           'port %s filled with context',
-           data.out.read().port);
-        break;
-
-        case ':inputValidated':
-          Logger.debug(data.node.identifier, 'input validated');
-        break;
-
-        case ':start':
-          Logger.info(data.node.identifier, 'START');
-        break;
-
-        case ':freePort':
-          Logger.debug(data.node.identifier, 'free port %s', data.out.read().port);
-        break;
-
-/*
-       case ':queue':
-         Logger.debug(
-           data.node,
-           'queue: %s',
-           data.port
-         );
-       break;
-*/
-
-       case ':openPort':
-         Logger.info(
-           data.node.identifier,
-           'opened port %s (%d)',
-           data.out.read().port,
-           data.out.read().connections
-           );
-       break;
-
-       case ':closePort':
-         Logger.info(
-           data.node.identifier,
-           'closed port %s',
-           data.out.read().port
-           );
-       break;
-
-       case ':index':
-         Logger.info(
-           data.node.identifier,
-           '[%s] set on port `%s`',
-           data.out.read().index,
-           data.out.read().port
-           );
-       break;
-
-       case ':nodeComplete':
-         // console.log('nodeComplete', data);
-         Logger.info(data.node.identifier, 'completed');
-       break;
-
-       case ':portReject':
-         Logger.debug(
-           data.node.identifier,
-           'rejected input on port %s',
-           data.out.read().port
-         );
-       break;
-
-       case ':inputRequired':
-         Logger.error(
-           data.node.identifier,
-           'input required on port %s',
-           data.out.read().port);
-       break;
-
-       case ':error':
-         Logger.error(
-           data.node.identifier,
-           data.out.read().msg
-         );
-       break;
-
-       case ':nodeTimeout':
-         Logger.error(
-           data.node.identifier,
-           'node timeout'
-         );
-       break;
-
-       case ':executed':
-         Logger.info(
-           data.node.identifier,
-           'EXECUTED'
-         );
-       break;
-
-       case ':inputTimeout':
-         Logger.info(
-           data.node.identifier,
-           'input timeout, got %s need %s',
-           Object.keys(data.node.input).join(', '),
-           data.node.openPorts.join(', '));
-       break;
-
-       default:
-         // TODO: if the above misses a system port it will be reported
-         //       as default normal output.
-         Logger.info(data.node.identifier, 'output on port %s', data.port);
-       break;
-
-     }
-
-   });
-
-   return Logger;
-
-};
-
-},{}],65:[function(require,module,exports){
-'use strict';
-
-/**
- *
- * NpmLog monitor for the Loader
- *
- */
-module.exports = function NpmLogLoaderMonitor(Logger, loader) {
-
-  loader.on('loadUrl', function(data) {
-    Logger.info( 'loadUrl', data.url);
-  });
-
-  loader.on('loadFile', function(data) {
-    Logger.info( 'loadFile', data.path);
-  });
-
-  loader.on('loadCache', function(data) {
-    Logger.debug( 'cache', 'loaded cache file %s', data.file);
-  });
-
-  loader.on('purgeCache', function(data) {
-    Logger.debug( 'cache', 'purged cache file %s', data.file);
-  });
-
-  loader.on('writeCache', function(data) {
-    Logger.debug( 'cache', 'wrote cache file %s', data.file);
-  });
-
-  return Logger;
-
-};
-
-},{}],"chix-monitor-npmlog":[function(require,module,exports){
-module.exports=require('HNG52E');
-},{}],"HNG52E":[function(require,module,exports){
-exports.Actor = require('./lib/actor');
-exports.Loader = require('./lib/loader');
-
-},{"./lib/actor":64,"./lib/loader":65}],"nedb":[function(require,module,exports){
+},{}],"nedb":[function(require,module,exports){
 module.exports=require('Uy5zDT');
 },{}],"Uy5zDT":[function(require,module,exports){
 var Datastore = require('./lib/datastore');
 
 module.exports = Datastore;
 
-},{"./lib/datastore":72}],70:[function(require,module,exports){
+},{"./lib/datastore":71}],69:[function(require,module,exports){
 /**
  * Manage access to data, be it to find, update or remove it
  */
@@ -16746,7 +17380,7 @@ Cursor.prototype.exec = function () {
 // Interface
 module.exports = Cursor;
 
-},{"./model":75,"underscore":84}],71:[function(require,module,exports){
+},{"./model":74,"underscore":83}],70:[function(require,module,exports){
 var crypto = require('crypto')
   , fs = require('fs')
   ;
@@ -16771,7 +17405,7 @@ function uid (len) {
 module.exports.uid = uid;
 
 
-},{"crypto":6,"fs":1}],72:[function(require,module,exports){
+},{"crypto":6,"fs":1}],71:[function(require,module,exports){
 var customUtils = require('./customUtils')
   , model = require('./model')
   , async = require('async')
@@ -17392,7 +18026,7 @@ Datastore.prototype.remove = function () {
 
 module.exports = Datastore;
 
-},{"./cursor":70,"./customUtils":71,"./executor":73,"./indexes":74,"./model":75,"./persistence":76,"async":78,"underscore":84,"util":16}],73:[function(require,module,exports){
+},{"./cursor":69,"./customUtils":70,"./executor":72,"./indexes":73,"./model":74,"./persistence":75,"async":77,"underscore":83,"util":16}],72:[function(require,module,exports){
 (function (process){
 /**
  * Responsible for sequentially executing actions on the database
@@ -17473,7 +18107,7 @@ Executor.prototype.processBuffer = function () {
 module.exports = Executor;
 
 }).call(this,require("uojqOp"))
-},{"async":78,"uojqOp":14}],74:[function(require,module,exports){
+},{"async":77,"uojqOp":14}],73:[function(require,module,exports){
 var BinarySearchTree = require('binary-search-tree').AVLTree
   , model = require('./model')
   , _ = require('underscore')
@@ -17769,7 +18403,7 @@ Index.prototype.getAll = function () {
 // Interface
 module.exports = Index;
 
-},{"./model":75,"binary-search-tree":79,"underscore":84,"util":16}],75:[function(require,module,exports){
+},{"./model":74,"binary-search-tree":78,"underscore":83,"util":16}],74:[function(require,module,exports){
 /**
  * Handle models (i.e. docs)
  * Serialization/deserialization
@@ -18532,7 +19166,7 @@ module.exports.match = match;
 module.exports.areThingsEqual = areThingsEqual;
 module.exports.compareThings = compareThings;
 
-},{"underscore":84,"util":16}],76:[function(require,module,exports){
+},{"underscore":83,"util":16}],75:[function(require,module,exports){
 (function (process){
 /**
  * Handle every persistence-related task
@@ -18903,7 +19537,7 @@ Persistence.prototype.loadDatabase = function (cb) {
 module.exports = Persistence;
 
 }).call(this,require("uojqOp"))
-},{"./customUtils":71,"./indexes":74,"./model":75,"./storage":77,"async":78,"path":13,"uojqOp":14}],77:[function(require,module,exports){
+},{"./customUtils":70,"./indexes":73,"./model":74,"./storage":76,"async":77,"path":13,"uojqOp":14}],76:[function(require,module,exports){
 /**
  * Way data is stored for this database
  * For a Node.js/Node Webkit database it's the file system
@@ -18920,7 +19554,7 @@ var fs = require('fs')
 module.exports = fs;
 module.exports.mkdirp = mkdirp;
 
-},{"fs":1,"mkdirp":83}],78:[function(require,module,exports){
+},{"fs":1,"mkdirp":82}],77:[function(require,module,exports){
 (function (process){
 /*global setImmediate: false, setTimeout: false, console: false */
 (function () {
@@ -19882,11 +20516,11 @@ module.exports.mkdirp = mkdirp;
 }());
 
 }).call(this,require("uojqOp"))
-},{"uojqOp":14}],79:[function(require,module,exports){
+},{"uojqOp":14}],78:[function(require,module,exports){
 module.exports.BinarySearchTree = require('./lib/bst');
 module.exports.AVLTree = require('./lib/avltree');
 
-},{"./lib/avltree":80,"./lib/bst":81}],80:[function(require,module,exports){
+},{"./lib/avltree":79,"./lib/bst":80}],79:[function(require,module,exports){
 /**
  * Self-balancing binary search tree using the AVL implementation
  */
@@ -20343,7 +20977,7 @@ AVLTree.prototype.delete = function (key, value) {
 // Interface
 module.exports = AVLTree;
 
-},{"./bst":81,"./customUtils":82,"underscore":84,"util":16}],81:[function(require,module,exports){
+},{"./bst":80,"./customUtils":81,"underscore":83,"util":16}],80:[function(require,module,exports){
 /**
  * Simple binary search tree
  */
@@ -20888,7 +21522,7 @@ BinarySearchTree.prototype.prettyPrint = function (printData, spacing) {
 // Interface
 module.exports = BinarySearchTree;
 
-},{"./customUtils":82}],82:[function(require,module,exports){
+},{"./customUtils":81}],81:[function(require,module,exports){
 /**
  * Return an array with the numbers from 0 to n-1, in a random order
  */
@@ -20928,7 +21562,7 @@ function defaultCheckValueEquality (a, b) {
 }
 module.exports.defaultCheckValueEquality = defaultCheckValueEquality;
 
-},{}],83:[function(require,module,exports){
+},{}],82:[function(require,module,exports){
 (function (process){
 var path = require('path');
 var fs = require('fs');
@@ -21014,7 +21648,7 @@ mkdirP.sync = function sync (p, mode, made) {
 };
 
 }).call(this,require("uojqOp"))
-},{"fs":1,"path":13,"uojqOp":14}],84:[function(require,module,exports){
+},{"fs":1,"path":13,"uojqOp":14}],83:[function(require,module,exports){
 //     Underscore.js 1.4.4
 //     http://underscorejs.org
 //     (c) 2009-2013 Jeremy Ashkenas, DocumentCloud Inc.
@@ -22250,7 +22884,7 @@ var Loader = function() {
   // will be replaced with the json.
   this.dependencies = {"npm":{"nedb":"latest"}};
   //this.nodes = ;
-  this.nodeDefinitions = {"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"nedb":{"datastore":{"_id":"54bb1b39fa15e75e679fd1a4","name":"datastore","ns":"nedb","description":"Nedb Datastore","phrases":{"active":"Creating datastore"},"dependencies":{"npm":{"nedb":"latest"}},"ports":{"input":{"options":{"title":"Options","type":"object","properties":{"filename":{"type":"string","description":"path to the file where the data is persisted. If left blank, the datastore is automatically considered in-memory only. It cannot end with a ~ which is used in the temporary files NeDB uses to perform crash-safe writes","required":false},"inMemoryOnly":{"Title":"In Memory only","type":"boolean","description":"In Memory Only","default":false},"onload":{"title":"Onload","type":"function","description":"if you use autoloading, this is the handler called after the loadDatabase. It takes one error argument. If you use autoloading without specifying this handler, and an error happens during load, an error will be thrown.","required":false},"afterSerialization":{"title":"After serialization","type":"function","description":"hook you can use to transform data after it was serialized and before it is written to disk. Can be used for example to encrypt data before writing database to disk. This function takes a string as parameter (one line of an NeDB data file) and outputs the transformed string, which must absolutely not contain a \n character (or data will be lost)","required":false},"beforeDeserialization":{"title":"Before Deserialization","type":"function","description":"reverse of afterSerialization. Make sure to include both and not just one or you risk data loss. For the same reason, make sure both functions are inverses of one another. Some failsafe mechanisms are in place to prevent data loss if you misuse the serialization hooks: NeDB checks that never one is declared without the other, and checks that they are reverse of one another by testing on random strings of various lengths. In addition, if too much data is detected as corrupt, NeDB will refuse to start as it could mean you're not using the deserialization hook corresponding to the serialization hook used before (see below)","required":false},"corruptAlertThreshold":{"type":"number","description":"between 0 and 1, defaults to 10%. NeDB will refuse to start if more than this percentage of the datafile is corrupt. 0 means you don't tolerate any corruption, 1 means you don't care","minValue":0,"maxValue":1,"required":false}}}},"output":{"db":{"title":"Database","type":"Datastore"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  var db = new nedb(input.options);\n  console.log('LOAD DATABASE'); db.loadDatabase(function(err) {\n  console.log('LOADED!', err);   if (err) {\n      output({error: err});\n    } else {\n      output({db: db});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}","title":"Database"},"insert":{"_id":"54bb1b39fa15e75e679fd1a5","name":"insert","ns":"nedb","description":"Insert a document into the database","async":true,"phrases":{"active":"Inserting document"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}","title":"Insert"},"update":{"_id":"54bb2588fa15e75e679fd1a9","name":"update","ns":"nedb","description":"Update documents within the database","phrases":{"active":"Updating document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"update":{"title":"Query","description":"specifies how the documents should be modified. It is either a new document or a set of modifiers","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the modification of several documents if set to true","type":"boolean","default":false},"upsert":{"title":"Upsert","description":"if you want to insert a new document corresponding to the update rules if your query doesn't match anything. If your update is a simple object with no modifiers, it is the inserted document. In the other case, the query is stripped from all operator recursively, and the update is applied to it.","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numReplaced":{"title":"Replaced","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.update(input.query, input.update, input.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numReplaced: numReplaced});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}","title":"Update"},"remove":{"_id":"54bb2588fa15e75e679fd1a7","name":"remove","ns":"nedb","description":"Remove documents from database","phrases":{"active":"Removing document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the removal of multiple documents if set to true","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numRemoved":{"title":"Removed","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.remove(input.query, input.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numRemoved: numRemoved});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}","title":"Remove"},"find":{"_id":"54bb1b39fa15e75e679fd1a2","name":"find","ns":"nedb","description":"Find documents within the database","async":true,"phrases":{"active":"Finding document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.find(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}","title":"Find"},"count":{"_id":"54bb1b39fa15e75e679fd1a1","name":"count","ns":"nedb","description":"Count documents within the database","async":true,"phrases":{"active":"Counting document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"Count","type":"integer"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.count(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}","title":"Count"}},"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}","title":"Complete"}}}};
+  this.nodeDefinitions = {"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"nedb":{"datastore":{"_id":"54bb1b39fa15e75e679fd1a4","name":"datastore","ns":"nedb","description":"Nedb Datastore","phrases":{"active":"Creating datastore"},"dependencies":{"npm":{"nedb":"latest"}},"ports":{"input":{"options":{"title":"Options","type":"object","required":false,"properties":{"filename":{"type":"string","description":"path to the file where the data is persisted. If left blank, the datastore is automatically considered in-memory only. It cannot end with a ~ which is used in the temporary files NeDB uses to perform crash-safe writes","required":false},"inMemoryOnly":{"Title":"In Memory only","type":"boolean","description":"In Memory Only","default":false},"onload":{"title":"Onload","type":"function","description":"if you use autoloading, this is the handler called after the loadDatabase. It takes one error argument. If you use autoloading without specifying this handler, and an error happens during load, an error will be thrown.","required":false},"afterSerialization":{"title":"After serialization","type":"function","description":"hook you can use to transform data after it was serialized and before it is written to disk. Can be used for example to encrypt data before writing database to disk. This function takes a string as parameter (one line of an NeDB data file) and outputs the transformed string, which must absolutely not contain a \n character (or data will be lost)","required":false},"beforeDeserialization":{"title":"Before Deserialization","type":"function","description":"reverse of afterSerialization. Make sure to include both and not just one or you risk data loss. For the same reason, make sure both functions are inverses of one another. Some failsafe mechanisms are in place to prevent data loss if you misuse the serialization hooks: NeDB checks that never one is declared without the other, and checks that they are reverse of one another by testing on random strings of various lengths. In addition, if too much data is detected as corrupt, NeDB will refuse to start as it could mean you're not using the deserialization hook corresponding to the serialization hook used before (see below)","required":false},"corruptAlertThreshold":{"type":"number","description":"between 0 and 1, defaults to 10%. NeDB will refuse to start if more than this percentage of the datafile is corrupt. 0 means you don't tolerate any corruption, 1 means you don't care","minValue":0,"maxValue":1,"required":false}}}},"output":{"db":{"title":"Database","type":"Datastore"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  var db = new nedb(input.options);\n  db.loadDatabase(function(err) {\n if (err) {\n      db({error: err});\n    } else {\n  cb({db: db});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"insert":{"_id":"54bb1b39fa15e75e679fd1a5","name":"insert","ns":"nedb","description":"Insert a document into the database","async":true,"phrases":{"active":"Inserting document"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"update":{"_id":"54bb2588fa15e75e679fd1a9","name":"update","ns":"nedb","description":"Update documents within the database","phrases":{"active":"Updating document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"update":{"title":"Query","description":"specifies how the documents should be modified. It is either a new document or a set of modifiers","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the modification of several documents if set to true","type":"boolean","default":false},"upsert":{"title":"Upsert","description":"if you want to insert a new document corresponding to the update rules if your query doesn't match anything. If your update is a simple object with no modifiers, it is the inserted document. In the other case, the query is stripped from all operator recursively, and the update is applied to it.","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numReplaced":{"title":"Replaced","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.update(input.query, input.update, input.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numReplaced: numReplaced});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"remove":{"_id":"54bb2588fa15e75e679fd1a7","name":"remove","ns":"nedb","description":"Remove documents from database","phrases":{"active":"Removing document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the removal of multiple documents if set to true","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numRemoved":{"title":"Removed","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.remove(input.query, input.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numRemoved: numRemoved});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"find":{"_id":"54bb1b39fa15e75e679fd1a2","name":"find","ns":"nedb","description":"Find documents within the database","async":true,"phrases":{"active":"Finding document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.find(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"count":{"_id":"54bb1b39fa15e75e679fd1a1","name":"count","ns":"nedb","description":"Count documents within the database","async":true,"phrases":{"active":"Counting document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"Count","type":"integer"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.count(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}}};
 
 };
 
@@ -22283,18 +22917,16 @@ Loader.prototype.getNodeDefinition = function(node, map) {
 var Flow = require('chix-flow').Flow;
 var loader = new Loader();
 
-var map = {"type":"flow","nodes":[{"id":"Database","title":"Database","ns":"nedb","name":"datastore"},{"id":"Insert","title":"Insert","ns":"nedb","name":"insert"},{"id":"Update","title":"Update","ns":"nedb","name":"update"},{"id":"Remove","title":"Remove","ns":"nedb","name":"remove"},{"id":"Find","title":"Find","ns":"nedb","name":"find"},{"id":"Count","title":"Count","ns":"nedb","name":"count"},{"id":"Log","title":"Log","ns":"console","name":"log"},{"id":"Complete","title":"Complete","ns":"console","name":"log","context":{"msg":"complete!"}}],"links":[{"source":{"id":"Database","port":"db"},"target":{"id":"Insert","port":"db"},"metadata":{"title":"Database db -> db Insert"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Find","port":"db"},"metadata":{"title":"Database db -> db Find"}},{"source":{"id":"Database","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Database error -> msg Log"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Database db -> msg Log"}},{"source":{"id":"Database","port":":complete"},"target":{"id":"Complete","port":":start"},"metadata":{"title":"Database :complete -> :start Complete"}},{"source":{"id":"Find","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find out -> msg Log"}}],"title":"Test database","ns":"nedb","name":"test","id":"TestDataBase","providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}};
+var map = {"type":"flow","nodes":[{"id":"Database","title":"Database","ns":"nedb","name":"datastore"},{"id":"Insert","title":"Insert","ns":"nedb","name":"insert"},{"id":"Update","title":"Update","ns":"nedb","name":"update"},{"id":"Remove","title":"Remove","ns":"nedb","name":"remove"},{"id":"Find","title":"Find","ns":"nedb","name":"find"},{"id":"Count","title":"Count","ns":"nedb","name":"count"},{"id":"Log","title":"Log","ns":"console","name":"log"},{"id":"Complete","title":"Complete","ns":"console","name":"log","context":{"msg":"complete!"}}],"links":[{"source":{"id":"Database","port":"db"},"target":{"id":"Insert","port":"db"},"metadata":{"title":"Database db -> db Insert"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Find","port":"db"},"metadata":{"title":"Database db -> db Find"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Count","port":"db"},"metadata":{"title":"Database db -> db Count"}},{"source":{"id":"Database","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Database error -> msg Log"}},{"source":{"id":"Insert","port":"out"},"target":{"id":"Find","port":":start"},"metadata":{"title":"Insert out -> :start Find"}},{"source":{"id":"Insert","port":"out"},"target":{"id":"Count","port":":start"},"metadata":{"title":"Insert out -> :start Count"}},{"source":{"id":"Find","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find out -> msg Log"}},{"source":{"id":"Count","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Count out -> msg Log"}}],"title":"Test database","ns":"nedb","name":"test","id":"TestDataBase","providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}};
 
 var actor;
 window.Actor = actor = Flow.create(map, loader);
 
-var monitor = require('chix-monitor-npmlog').Actor;
-monitor(console, actor);
 
 function onDeviceReady() {
 actor.run();
 actor.push();
-actor.sendIIPs([{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Insert","port":"in"},"metadata":{"title":"Test database :iip -> in Insert"},"data":{"uname":"rhalff","first":"Rob","last":"Halff"}},{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Find","port":"in","setting":{"index":"uname"}},"metadata":{"title":"Test database :iip -> in Find"},"data":"rhalff"}]);
+actor.sendIIPs([{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Insert","port":"in"},"metadata":{"title":"Test database :iip -> in Insert"},"data":{"uname":"rhalff","first":"Rob","last":"Halff"}},{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Find","port":"in","setting":{"index":"uname"}},"metadata":{"title":"Test database :iip -> in Find"},"data":"rhalff"},{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Count","port":"in"},"metadata":{"title":"Test database :iip -> in Count"},"data":{}}]);
 
 };
 
@@ -22308,4 +22940,4 @@ if (navigator.userAgent.match(/(iPhone|iPod|iPad|Android|BlackBerry|IEMobile)/))
 // as long as this module is loaded.
 module.exports = actor;
 
-},{"chix-flow":"jXAsbI","chix-monitor-npmlog":"HNG52E"}]},{},["CY9rzU"])
+},{"chix-flow":"jXAsbI"}]},{},["CY9rzU"])

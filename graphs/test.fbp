@@ -20,10 +20,9 @@ Complete(console/log)
 
 Database db -> db Insert
 Database db -> db Find
+Database db -> db Count
 
 Database error -> msg Log
-Database db -> msg Log
-Database :complete -> :start Complete
 
 {
   "uname": "rhalff",
@@ -33,4 +32,10 @@ Database :complete -> :start Complete
 
 "rhalff" -> [uname] in Find
 
+{} -> in Count
+
+Insert out -> :start Find
+Insert out -> :start Count
+
 Find out -> msg Log
+Count out -> msg Log
