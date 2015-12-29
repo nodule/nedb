@@ -2,9 +2,9 @@ output = function() {
   var db = new nedb(input.options);
   db.loadDatabase(function(err) {
     if (err) {
-      output({error: err});
+      cb({error: err});
     } else {
-      output({db: db});
+      cb({db: db});
     }
   });
 };
