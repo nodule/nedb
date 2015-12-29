@@ -7,7 +7,7 @@
     "url": "https://github.com/nodule/nedb.git"
   },
   "dependencies": {
-    "nedb": "^1.1.1"
+    "nedb": "rhalff/nedb"
   },
   "nodes": [
     {
@@ -148,7 +148,7 @@
       "description": "Nedb Datastore",
       "ns": "nedb",
       "name": "datastore",
-      "fn": "output = function() {\n  var db = new nedb(input.options);\n  db.loadDatabase(function(err) {\n    if (err) {\n      output({error: err});\n    } else {\n      output({db: db});\n    }\n  });\n};\n"
+      "fn": "output = function() {\n  var db = new nedb(input.options);\n  db.loadDatabase(function(err) {\n    if (err) {\n      cb({error: err});\n    } else {\n      cb({db: db});\n    }\n  });\n};\n"
     },
     {
       "ports": {

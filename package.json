@@ -19,8 +19,9 @@
   },
   "devDependencies": {
     "chit": "0.x.x",
-    "chix-flow": "^0.12.0",
-    "chix-monitor-npmlog": "0.0.5"
+    "chix-flow": "^0.12.2",
+    "chix-monitor-npmlog": "0.0.5",
+    "dot-object": "^1.3.1"
   },
   "chix": {
     "name": "nedb",

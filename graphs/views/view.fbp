@@ -1,0 +1,42 @@
+title: DB View
+ns: views
+name: view
+
+Log(console/log)
+
+ButtonEl(dom/querySelector)
+ButtonClick(dom/addMouseEvent)
+ClearValue(dom/setValue)
+GetValue(dom/getValue)
+
+Item(object/set)
+InputEl(dom/querySelector)
+
+'' -> @in ClearValue
+InputEl selection -> ^element ClearValue
+
+'started' -> msg Log
+
+'input[type=button]' -> selector ButtonEl
+'input[type=text]' -> @selector InputEl
+
+# Take current input value and send it out as object
+
+InputEl selection -> element GetValue out -> in Item
+InputEl selection -> msg Log
+'uname' -> @path Item
+
+# should be :complete but does not work
+Item out -> :start ClearValue
+
+'click' -> @event ButtonClick
+ButtonEl selection -> element ButtonClick
+
+ButtonClick out -> :start InputEl
+
+Item out -> msg Log
+GetValue out -> msg Log
+
+ButtonClick out -> msg Log
+
+<- out Item

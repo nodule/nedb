@@ -1,1847 +1,4 @@
 require=(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
-
-},{}],2:[function(require,module,exports){
-/*!
- * The buffer module from node.js, for the browser.
- *
- * @author   Feross Aboukhadijeh <feross@feross.org> <http://feross.org>
- * @license  MIT
- */
-
-var base64 = require('base64-js')
-var ieee754 = require('ieee754')
-
-exports.Buffer = Buffer
-exports.SlowBuffer = Buffer
-exports.INSPECT_MAX_BYTES = 50
-Buffer.poolSize = 8192
-
-/**
- * If `Buffer._useTypedArrays`:
- *   === true    Use Uint8Array implementation (fastest)
- *   === false   Use Object implementation (compatible down to IE6)
- */
-Buffer._useTypedArrays = (function () {
-  // Detect if browser supports Typed Arrays. Supported browsers are IE 10+, Firefox 4+,
-  // Chrome 7+, Safari 5.1+, Opera 11.6+, iOS 4.2+. If the browser does not support adding
-  // properties to `Uint8Array` instances, then that's the same as no `Uint8Array` support
-  // because we need to be able to add all the node Buffer API methods. This is an issue
-  // in Firefox 4-29. Now fixed: https://bugzilla.mozilla.org/show_bug.cgi?id=695438
-  try {
-    var buf = new ArrayBuffer(0)
-    var arr = new Uint8Array(buf)
-    arr.foo = function () { return 42 }
-    return 42 === arr.foo() &&
-        typeof arr.subarray === 'function' // Chrome 9-10 lack `subarray`
-  } catch (e) {
-    return false
-  }
-})()
-
-/**
- * Class: Buffer
- * =============
- *
- * The Buffer constructor returns instances of `Uint8Array` that are augmented
- * with function properties for all the node `Buffer` API functions. We use
- * `Uint8Array` so that square bracket notation works as expected -- it returns
- * a single octet.
- *
- * By augmenting the instances, we can avoid modifying the `Uint8Array`
- * prototype.
- */
-function Buffer (subject, encoding, noZero) {
-  if (!(this instanceof Buffer))
-    return new Buffer(subject, encoding, noZero)
-
-  var type = typeof subject
-
-  // Workaround: node's base64 implementation allows for non-padded strings
-  // while base64-js does not.
-  if (encoding === 'base64' && type === 'string') {
-    subject = stringtrim(subject)
-    while (subject.length % 4 !== 0) {
-      subject = subject + '='
-    }
-  }
-
-  // Find the length
-  var length
-  if (type === 'number')
-    length = coerce(subject)
-  else if (type === 'string')
-    length = Buffer.byteLength(subject, encoding)
-  else if (type === 'object')
-    length = coerce(subject.length) // assume that object is array-like
-  else
-    throw new Error('First argument needs to be a number, array or string.')
-
-  var buf
-  if (Buffer._useTypedArrays) {
-    // Preferred: Return an augmented `Uint8Array` instance for best performance
-    buf = Buffer._augment(new Uint8Array(length))
-  } else {
-    // Fallback: Return THIS instance of Buffer (created by `new`)
-    buf = this
-    buf.length = length
-    buf._isBuffer = true
-  }
-
-  var i
-  if (Buffer._useTypedArrays && typeof subject.byteLength === 'number') {
-    // Speed optimization -- use set if we're copying from a typed array
-    buf._set(subject)
-  } else if (isArrayish(subject)) {
-    // Treat array-ish objects as a byte array
-    for (i = 0; i < length; i++) {
-      if (Buffer.isBuffer(subject))
-        buf[i] = subject.readUInt8(i)
-      else
-        buf[i] = subject[i]
-    }
-  } else if (type === 'string') {
-    buf.write(subject, 0, encoding)
-  } else if (type === 'number' && !Buffer._useTypedArrays && !noZero) {
-    for (i = 0; i < length; i++) {
-      buf[i] = 0
-    }
-  }
-
-  return buf
-}
-
-// STATIC METHODS
-// ==============
-
-Buffer.isEncoding = function (encoding) {
-  switch (String(encoding).toLowerCase()) {
-    case 'hex':
-    case 'utf8':
-    case 'utf-8':
-    case 'ascii':
-    case 'binary':
-    case 'base64':
-    case 'raw':
-    case 'ucs2':
-    case 'ucs-2':
-    case 'utf16le':
-    case 'utf-16le':
-      return true
-    default:
-      return false
-  }
-}
-
-Buffer.isBuffer = function (b) {
-  return !!(b !== null && b !== undefined && b._isBuffer)
-}
-
-Buffer.byteLength = function (str, encoding) {
-  var ret
-  str = str + ''
-  switch (encoding || 'utf8') {
-    case 'hex':
-      ret = str.length / 2
-      break
-    case 'utf8':
-    case 'utf-8':
-      ret = utf8ToBytes(str).length
-      break
-    case 'ascii':
-    case 'binary':
-    case 'raw':
-      ret = str.length
-      break
-    case 'base64':
-      ret = base64ToBytes(str).length
-      break
-    case 'ucs2':
-    case 'ucs-2':
-    case 'utf16le':
-    case 'utf-16le':
-      ret = str.length * 2
-      break
-    default:
-      throw new Error('Unknown encoding')
-  }
-  return ret
-}
-
-Buffer.concat = function (list, totalLength) {
-  assert(isArray(list), 'Usage: Buffer.concat(list, [totalLength])\n' +
-      'list should be an Array.')
-
-  if (list.length === 0) {
-    return new Buffer(0)
-  } else if (list.length === 1) {
-    return list[0]
-  }
-
-  var i
-  if (typeof totalLength !== 'number') {
-    totalLength = 0
-    for (i = 0; i < list.length; i++) {
-      totalLength += list[i].length
-    }
-  }
-
-  var buf = new Buffer(totalLength)
-  var pos = 0
-  for (i = 0; i < list.length; i++) {
-    var item = list[i]
-    item.copy(buf, pos)
-    pos += item.length
-  }
-  return buf
-}
-
-// BUFFER INSTANCE METHODS
-// =======================
-
-function _hexWrite (buf, string, offset, length) {
-  offset = Number(offset) || 0
-  var remaining = buf.length - offset
-  if (!length) {
-    length = remaining
-  } else {
-    length = Number(length)
-    if (length > remaining) {
-      length = remaining
-    }
-  }
-
-  // must be an even number of digits
-  var strLen = string.length
-  assert(strLen % 2 === 0, 'Invalid hex string')
-
-  if (length > strLen / 2) {
-    length = strLen / 2
-  }
-  for (var i = 0; i < length; i++) {
-    var byte = parseInt(string.substr(i * 2, 2), 16)
-    assert(!isNaN(byte), 'Invalid hex string')
-    buf[offset + i] = byte
-  }
-  Buffer._charsWritten = i * 2
-  return i
-}
-
-function _utf8Write (buf, string, offset, length) {
-  var charsWritten = Buffer._charsWritten =
-    blitBuffer(utf8ToBytes(string), buf, offset, length)
-  return charsWritten
-}
-
-function _asciiWrite (buf, string, offset, length) {
-  var charsWritten = Buffer._charsWritten =
-    blitBuffer(asciiToBytes(string), buf, offset, length)
-  return charsWritten
-}
-
-function _binaryWrite (buf, string, offset, length) {
-  return _asciiWrite(buf, string, offset, length)
-}
-
-function _base64Write (buf, string, offset, length) {
-  var charsWritten = Buffer._charsWritten =
-    blitBuffer(base64ToBytes(string), buf, offset, length)
-  return charsWritten
-}
-
-function _utf16leWrite (buf, string, offset, length) {
-  var charsWritten = Buffer._charsWritten =
-    blitBuffer(utf16leToBytes(string), buf, offset, length)
-  return charsWritten
-}
-
-Buffer.prototype.write = function (string, offset, length, encoding) {
-  // Support both (string, offset, length, encoding)
-  // and the legacy (string, encoding, offset, length)
-  if (isFinite(offset)) {
-    if (!isFinite(length)) {
-      encoding = length
-      length = undefined
-    }
-  } else {  // legacy
-    var swap = encoding
-    encoding = offset
-    offset = length
-    length = swap
-  }
-
-  offset = Number(offset) || 0
-  var remaining = this.length - offset
-  if (!length) {
-    length = remaining
-  } else {
-    length = Number(length)
-    if (length > remaining) {
-      length = remaining
-    }
-  }
-  encoding = String(encoding || 'utf8').toLowerCase()
-
-  var ret
-  switch (encoding) {
-    case 'hex':
-      ret = _hexWrite(this, string, offset, length)
-      break
-    case 'utf8':
-    case 'utf-8':
-      ret = _utf8Write(this, string, offset, length)
-      break
-    case 'ascii':
-      ret = _asciiWrite(this, string, offset, length)
-      break
-    case 'binary':
-      ret = _binaryWrite(this, string, offset, length)
-      break
-    case 'base64':
-      ret = _base64Write(this, string, offset, length)
-      break
-    case 'ucs2':
-    case 'ucs-2':
-    case 'utf16le':
-    case 'utf-16le':
-      ret = _utf16leWrite(this, string, offset, length)
-      break
-    default:
-      throw new Error('Unknown encoding')
-  }
-  return ret
-}
-
-Buffer.prototype.toString = function (encoding, start, end) {
-  var self = this
-
-  encoding = String(encoding || 'utf8').toLowerCase()
-  start = Number(start) || 0
-  end = (end !== undefined)
-    ? Number(end)
-    : end = self.length
-
-  // Fastpath empty strings
-  if (end === start)
-    return ''
-
-  var ret
-  switch (encoding) {
-    case 'hex':
-      ret = _hexSlice(self, start, end)
-      break
-    case 'utf8':
-    case 'utf-8':
-      ret = _utf8Slice(self, start, end)
-      break
-    case 'ascii':
-      ret = _asciiSlice(self, start, end)
-      break
-    case 'binary':
-      ret = _binarySlice(self, start, end)
-      break
-    case 'base64':
-      ret = _base64Slice(self, start, end)
-      break
-    case 'ucs2':
-    case 'ucs-2':
-    case 'utf16le':
-    case 'utf-16le':
-      ret = _utf16leSlice(self, start, end)
-      break
-    default:
-      throw new Error('Unknown encoding')
-  }
-  return ret
-}
-
-Buffer.prototype.toJSON = function () {
-  return {
-    type: 'Buffer',
-    data: Array.prototype.slice.call(this._arr || this, 0)
-  }
-}
-
-// copy(targetBuffer, targetStart=0, sourceStart=0, sourceEnd=buffer.length)
-Buffer.prototype.copy = function (target, target_start, start, end) {
-  var source = this
-
-  if (!start) start = 0
-  if (!end && end !== 0) end = this.length
-  if (!target_start) target_start = 0
-
-  // Copy 0 bytes; we're done
-  if (end === start) return
-  if (target.length === 0 || source.length === 0) return
-
-  // Fatal error conditions
-  assert(end >= start, 'sourceEnd < sourceStart')
-  assert(target_start >= 0 && target_start < target.length,
-      'targetStart out of bounds')
-  assert(start >= 0 && start < source.length, 'sourceStart out of bounds')
-  assert(end >= 0 && end <= source.length, 'sourceEnd out of bounds')
-
-  // Are we oob?
-  if (end > this.length)
-    end = this.length
-  if (target.length - target_start < end - start)
-    end = target.length - target_start + start
-
-  var len = end - start
-
-  if (len < 100 || !Buffer._useTypedArrays) {
-    for (var i = 0; i < len; i++)
-      target[i + target_start] = this[i + start]
-  } else {
-    target._set(this.subarray(start, start + len), target_start)
-  }
-}
-
-function _base64Slice (buf, start, end) {
-  if (start === 0 && end === buf.length) {
-    return base64.fromByteArray(buf)
-  } else {
-    return base64.fromByteArray(buf.slice(start, end))
-  }
-}
-
-function _utf8Slice (buf, start, end) {
-  var res = ''
-  var tmp = ''
-  end = Math.min(buf.length, end)
-
-  for (var i = start; i < end; i++) {
-    if (buf[i] <= 0x7F) {
-      res += decodeUtf8Char(tmp) + String.fromCharCode(buf[i])
-      tmp = ''
-    } else {
-      tmp += '%' + buf[i].toString(16)
-    }
-  }
-
-  return res + decodeUtf8Char(tmp)
-}
-
-function _asciiSlice (buf, start, end) {
-  var ret = ''
-  end = Math.min(buf.length, end)
-
-  for (var i = start; i < end; i++)
-    ret += String.fromCharCode(buf[i])
-  return ret
-}
-
-function _binarySlice (buf, start, end) {
-  return _asciiSlice(buf, start, end)
-}
-
-function _hexSlice (buf, start, end) {
-  var len = buf.length
-
-  if (!start || start < 0) start = 0
-  if (!end || end < 0 || end > len) end = len
-
-  var out = ''
-  for (var i = start; i < end; i++) {
-    out += toHex(buf[i])
-  }
-  return out
-}
-
-function _utf16leSlice (buf, start, end) {
-  var bytes = buf.slice(start, end)
-  var res = ''
-  for (var i = 0; i < bytes.length; i += 2) {
-    res += String.fromCharCode(bytes[i] + bytes[i+1] * 256)
-  }
-  return res
-}
-
-Buffer.prototype.slice = function (start, end) {
-  var len = this.length
-  start = clamp(start, len, 0)
-  end = clamp(end, len, len)
-
-  if (Buffer._useTypedArrays) {
-    return Buffer._augment(this.subarray(start, end))
-  } else {
-    var sliceLen = end - start
-    var newBuf = new Buffer(sliceLen, undefined, true)
-    for (var i = 0; i < sliceLen; i++) {
-      newBuf[i] = this[i + start]
-    }
-    return newBuf
-  }
-}
-
-// `get` will be removed in Node 0.13+
-Buffer.prototype.get = function (offset) {
-  console.log('.get() is deprecated. Access using array indexes instead.')
-  return this.readUInt8(offset)
-}
-
-// `set` will be removed in Node 0.13+
-Buffer.prototype.set = function (v, offset) {
-  console.log('.set() is deprecated. Access using array indexes instead.')
-  return this.writeUInt8(v, offset)
-}
-
-Buffer.prototype.readUInt8 = function (offset, noAssert) {
-  if (!noAssert) {
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset < this.length, 'Trying to read beyond buffer length')
-  }
-
-  if (offset >= this.length)
-    return
-
-  return this[offset]
-}
-
-function _readUInt16 (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 1 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  var val
-  if (littleEndian) {
-    val = buf[offset]
-    if (offset + 1 < len)
-      val |= buf[offset + 1] << 8
-  } else {
-    val = buf[offset] << 8
-    if (offset + 1 < len)
-      val |= buf[offset + 1]
-  }
-  return val
-}
-
-Buffer.prototype.readUInt16LE = function (offset, noAssert) {
-  return _readUInt16(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readUInt16BE = function (offset, noAssert) {
-  return _readUInt16(this, offset, false, noAssert)
-}
-
-function _readUInt32 (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  var val
-  if (littleEndian) {
-    if (offset + 2 < len)
-      val = buf[offset + 2] << 16
-    if (offset + 1 < len)
-      val |= buf[offset + 1] << 8
-    val |= buf[offset]
-    if (offset + 3 < len)
-      val = val + (buf[offset + 3] << 24 >>> 0)
-  } else {
-    if (offset + 1 < len)
-      val = buf[offset + 1] << 16
-    if (offset + 2 < len)
-      val |= buf[offset + 2] << 8
-    if (offset + 3 < len)
-      val |= buf[offset + 3]
-    val = val + (buf[offset] << 24 >>> 0)
-  }
-  return val
-}
-
-Buffer.prototype.readUInt32LE = function (offset, noAssert) {
-  return _readUInt32(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readUInt32BE = function (offset, noAssert) {
-  return _readUInt32(this, offset, false, noAssert)
-}
-
-Buffer.prototype.readInt8 = function (offset, noAssert) {
-  if (!noAssert) {
-    assert(offset !== undefined && offset !== null,
-        'missing offset')
-    assert(offset < this.length, 'Trying to read beyond buffer length')
-  }
-
-  if (offset >= this.length)
-    return
-
-  var neg = this[offset] & 0x80
-  if (neg)
-    return (0xff - this[offset] + 1) * -1
-  else
-    return this[offset]
-}
-
-function _readInt16 (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 1 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  var val = _readUInt16(buf, offset, littleEndian, true)
-  var neg = val & 0x8000
-  if (neg)
-    return (0xffff - val + 1) * -1
-  else
-    return val
-}
-
-Buffer.prototype.readInt16LE = function (offset, noAssert) {
-  return _readInt16(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readInt16BE = function (offset, noAssert) {
-  return _readInt16(this, offset, false, noAssert)
-}
-
-function _readInt32 (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  var val = _readUInt32(buf, offset, littleEndian, true)
-  var neg = val & 0x80000000
-  if (neg)
-    return (0xffffffff - val + 1) * -1
-  else
-    return val
-}
-
-Buffer.prototype.readInt32LE = function (offset, noAssert) {
-  return _readInt32(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readInt32BE = function (offset, noAssert) {
-  return _readInt32(this, offset, false, noAssert)
-}
-
-function _readFloat (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset + 3 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  return ieee754.read(buf, offset, littleEndian, 23, 4)
-}
-
-Buffer.prototype.readFloatLE = function (offset, noAssert) {
-  return _readFloat(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readFloatBE = function (offset, noAssert) {
-  return _readFloat(this, offset, false, noAssert)
-}
-
-function _readDouble (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset + 7 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  return ieee754.read(buf, offset, littleEndian, 52, 8)
-}
-
-Buffer.prototype.readDoubleLE = function (offset, noAssert) {
-  return _readDouble(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readDoubleBE = function (offset, noAssert) {
-  return _readDouble(this, offset, false, noAssert)
-}
-
-Buffer.prototype.writeUInt8 = function (value, offset, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset < this.length, 'trying to write beyond buffer length')
-    verifuint(value, 0xff)
-  }
-
-  if (offset >= this.length) return
-
-  this[offset] = value
-}
-
-function _writeUInt16 (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 1 < buf.length, 'trying to write beyond buffer length')
-    verifuint(value, 0xffff)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  for (var i = 0, j = Math.min(len - offset, 2); i < j; i++) {
-    buf[offset + i] =
-        (value & (0xff << (8 * (littleEndian ? i : 1 - i)))) >>>
-            (littleEndian ? i : 1 - i) * 8
-  }
-}
-
-Buffer.prototype.writeUInt16LE = function (value, offset, noAssert) {
-  _writeUInt16(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeUInt16BE = function (value, offset, noAssert) {
-  _writeUInt16(this, value, offset, false, noAssert)
-}
-
-function _writeUInt32 (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'trying to write beyond buffer length')
-    verifuint(value, 0xffffffff)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  for (var i = 0, j = Math.min(len - offset, 4); i < j; i++) {
-    buf[offset + i] =
-        (value >>> (littleEndian ? i : 3 - i) * 8) & 0xff
-  }
-}
-
-Buffer.prototype.writeUInt32LE = function (value, offset, noAssert) {
-  _writeUInt32(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeUInt32BE = function (value, offset, noAssert) {
-  _writeUInt32(this, value, offset, false, noAssert)
-}
-
-Buffer.prototype.writeInt8 = function (value, offset, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset < this.length, 'Trying to write beyond buffer length')
-    verifsint(value, 0x7f, -0x80)
-  }
-
-  if (offset >= this.length)
-    return
-
-  if (value >= 0)
-    this.writeUInt8(value, offset, noAssert)
-  else
-    this.writeUInt8(0xff + value + 1, offset, noAssert)
-}
-
-function _writeInt16 (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 1 < buf.length, 'Trying to write beyond buffer length')
-    verifsint(value, 0x7fff, -0x8000)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  if (value >= 0)
-    _writeUInt16(buf, value, offset, littleEndian, noAssert)
-  else
-    _writeUInt16(buf, 0xffff + value + 1, offset, littleEndian, noAssert)
-}
-
-Buffer.prototype.writeInt16LE = function (value, offset, noAssert) {
-  _writeInt16(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeInt16BE = function (value, offset, noAssert) {
-  _writeInt16(this, value, offset, false, noAssert)
-}
-
-function _writeInt32 (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'Trying to write beyond buffer length')
-    verifsint(value, 0x7fffffff, -0x80000000)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  if (value >= 0)
-    _writeUInt32(buf, value, offset, littleEndian, noAssert)
-  else
-    _writeUInt32(buf, 0xffffffff + value + 1, offset, littleEndian, noAssert)
-}
-
-Buffer.prototype.writeInt32LE = function (value, offset, noAssert) {
-  _writeInt32(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeInt32BE = function (value, offset, noAssert) {
-  _writeInt32(this, value, offset, false, noAssert)
-}
-
-function _writeFloat (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'Trying to write beyond buffer length')
-    verifIEEE754(value, 3.4028234663852886e+38, -3.4028234663852886e+38)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  ieee754.write(buf, value, offset, littleEndian, 23, 4)
-}
-
-Buffer.prototype.writeFloatLE = function (value, offset, noAssert) {
-  _writeFloat(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeFloatBE = function (value, offset, noAssert) {
-  _writeFloat(this, value, offset, false, noAssert)
-}
-
-function _writeDouble (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 7 < buf.length,
-        'Trying to write beyond buffer length')
-    verifIEEE754(value, 1.7976931348623157E+308, -1.7976931348623157E+308)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  ieee754.write(buf, value, offset, littleEndian, 52, 8)
-}
-
-Buffer.prototype.writeDoubleLE = function (value, offset, noAssert) {
-  _writeDouble(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeDoubleBE = function (value, offset, noAssert) {
-  _writeDouble(this, value, offset, false, noAssert)
-}
-
-// fill(value, start=0, end=buffer.length)
-Buffer.prototype.fill = function (value, start, end) {
-  if (!value) value = 0
-  if (!start) start = 0
-  if (!end) end = this.length
-
-  if (typeof value === 'string') {
-    value = value.charCodeAt(0)
-  }
-
-  assert(typeof value === 'number' && !isNaN(value), 'value is not a number')
-  assert(end >= start, 'end < start')
-
-  // Fill 0 bytes; we're done
-  if (end === start) return
-  if (this.length === 0) return
-
-  assert(start >= 0 && start < this.length, 'start out of bounds')
-  assert(end >= 0 && end <= this.length, 'end out of bounds')
-
-  for (var i = start; i < end; i++) {
-    this[i] = value
-  }
-}
-
-Buffer.prototype.inspect = function () {
-  var out = []
-  var len = this.length
-  for (var i = 0; i < len; i++) {
-    out[i] = toHex(this[i])
-    if (i === exports.INSPECT_MAX_BYTES) {
-      out[i + 1] = '...'
-      break
-    }
-  }
-  return '<Buffer ' + out.join(' ') + '>'
-}
-
-/**
- * Creates a new `ArrayBuffer` with the *copied* memory of the buffer instance.
- * Added in Node 0.12. Only available in browsers that support ArrayBuffer.
- */
-Buffer.prototype.toArrayBuffer = function () {
-  if (typeof Uint8Array !== 'undefined') {
-    if (Buffer._useTypedArrays) {
-      return (new Buffer(this)).buffer
-    } else {
-      var buf = new Uint8Array(this.length)
-      for (var i = 0, len = buf.length; i < len; i += 1)
-        buf[i] = this[i]
-      return buf.buffer
-    }
-  } else {
-    throw new Error('Buffer.toArrayBuffer not supported in this browser')
-  }
-}
-
-// HELPER FUNCTIONS
-// ================
-
-function stringtrim (str) {
-  if (str.trim) return str.trim()
-  return str.replace(/^\s+|\s+$/g, '')
-}
-
-var BP = Buffer.prototype
-
-/**
- * Augment a Uint8Array *instance* (not the Uint8Array class!) with Buffer methods
- */
-Buffer._augment = function (arr) {
-  arr._isBuffer = true
-
-  // save reference to original Uint8Array get/set methods before overwriting
-  arr._get = arr.get
-  arr._set = arr.set
-
-  // deprecated, will be removed in node 0.13+
-  arr.get = BP.get
-  arr.set = BP.set
-
-  arr.write = BP.write
-  arr.toString = BP.toString
-  arr.toLocaleString = BP.toString
-  arr.toJSON = BP.toJSON
-  arr.copy = BP.copy
-  arr.slice = BP.slice
-  arr.readUInt8 = BP.readUInt8
-  arr.readUInt16LE = BP.readUInt16LE
-  arr.readUInt16BE = BP.readUInt16BE
-  arr.readUInt32LE = BP.readUInt32LE
-  arr.readUInt32BE = BP.readUInt32BE
-  arr.readInt8 = BP.readInt8
-  arr.readInt16LE = BP.readInt16LE
-  arr.readInt16BE = BP.readInt16BE
-  arr.readInt32LE = BP.readInt32LE
-  arr.readInt32BE = BP.readInt32BE
-  arr.readFloatLE = BP.readFloatLE
-  arr.readFloatBE = BP.readFloatBE
-  arr.readDoubleLE = BP.readDoubleLE
-  arr.readDoubleBE = BP.readDoubleBE
-  arr.writeUInt8 = BP.writeUInt8
-  arr.writeUInt16LE = BP.writeUInt16LE
-  arr.writeUInt16BE = BP.writeUInt16BE
-  arr.writeUInt32LE = BP.writeUInt32LE
-  arr.writeUInt32BE = BP.writeUInt32BE
-  arr.writeInt8 = BP.writeInt8
-  arr.writeInt16LE = BP.writeInt16LE
-  arr.writeInt16BE = BP.writeInt16BE
-  arr.writeInt32LE = BP.writeInt32LE
-  arr.writeInt32BE = BP.writeInt32BE
-  arr.writeFloatLE = BP.writeFloatLE
-  arr.writeFloatBE = BP.writeFloatBE
-  arr.writeDoubleLE = BP.writeDoubleLE
-  arr.writeDoubleBE = BP.writeDoubleBE
-  arr.fill = BP.fill
-  arr.inspect = BP.inspect
-  arr.toArrayBuffer = BP.toArrayBuffer
-
-  return arr
-}
-
-// slice(start, end)
-function clamp (index, len, defaultValue) {
-  if (typeof index !== 'number') return defaultValue
-  index = ~~index;  // Coerce to integer.
-  if (index >= len) return len
-  if (index >= 0) return index
-  index += len
-  if (index >= 0) return index
-  return 0
-}
-
-function coerce (length) {
-  // Coerce length to a number (possibly NaN), round up
-  // in case it's fractional (e.g. 123.456) then do a
-  // double negate to coerce a NaN to 0. Easy, right?
-  length = ~~Math.ceil(+length)
-  return length < 0 ? 0 : length
-}
-
-function isArray (subject) {
-  return (Array.isArray || function (subject) {
-    return Object.prototype.toString.call(subject) === '[object Array]'
-  })(subject)
-}
-
-function isArrayish (subject) {
-  return isArray(subject) || Buffer.isBuffer(subject) ||
-      subject && typeof subject === 'object' &&
-      typeof subject.length === 'number'
-}
-
-function toHex (n) {
-  if (n < 16) return '0' + n.toString(16)
-  return n.toString(16)
-}
-
-function utf8ToBytes (str) {
-  var byteArray = []
-  for (var i = 0; i < str.length; i++) {
-    var b = str.charCodeAt(i)
-    if (b <= 0x7F)
-      byteArray.push(str.charCodeAt(i))
-    else {
-      var start = i
-      if (b >= 0xD800 && b <= 0xDFFF) i++
-      var h = encodeURIComponent(str.slice(start, i+1)).substr(1).split('%')
-      for (var j = 0; j < h.length; j++)
-        byteArray.push(parseInt(h[j], 16))
-    }
-  }
-  return byteArray
-}
-
-function asciiToBytes (str) {
-  var byteArray = []
-  for (var i = 0; i < str.length; i++) {
-    // Node's code seems to be doing this and not & 0x7F..
-    byteArray.push(str.charCodeAt(i) & 0xFF)
-  }
-  return byteArray
-}
-
-function utf16leToBytes (str) {
-  var c, hi, lo
-  var byteArray = []
-  for (var i = 0; i < str.length; i++) {
-    c = str.charCodeAt(i)
-    hi = c >> 8
-    lo = c % 256
-    byteArray.push(lo)
-    byteArray.push(hi)
-  }
-
-  return byteArray
-}
-
-function base64ToBytes (str) {
-  return base64.toByteArray(str)
-}
-
-function blitBuffer (src, dst, offset, length) {
-  var pos
-  for (var i = 0; i < length; i++) {
-    if ((i + offset >= dst.length) || (i >= src.length))
-      break
-    dst[i + offset] = src[i]
-  }
-  return i
-}
-
-function decodeUtf8Char (str) {
-  try {
-    return decodeURIComponent(str)
-  } catch (err) {
-    return String.fromCharCode(0xFFFD) // UTF 8 invalid char
-  }
-}
-
-/*
- * We have to make sure that the value is a valid integer. This means that it
- * is non-negative. It has no fractional component and that it does not
- * exceed the maximum allowed value.
- */
-function verifuint (value, max) {
-  assert(typeof value === 'number', 'cannot write a non-number as a number')
-  assert(value >= 0, 'specified a negative value for writing an unsigned value')
-  assert(value <= max, 'value is larger than maximum value for type')
-  assert(Math.floor(value) === value, 'value has a fractional component')
-}
-
-function verifsint (value, max, min) {
-  assert(typeof value === 'number', 'cannot write a non-number as a number')
-  assert(value <= max, 'value larger than maximum allowed value')
-  assert(value >= min, 'value smaller than minimum allowed value')
-  assert(Math.floor(value) === value, 'value has a fractional component')
-}
-
-function verifIEEE754 (value, max, min) {
-  assert(typeof value === 'number', 'cannot write a non-number as a number')
-  assert(value <= max, 'value larger than maximum allowed value')
-  assert(value >= min, 'value smaller than minimum allowed value')
-}
-
-function assert (test, message) {
-  if (!test) throw new Error(message || 'Failed assertion')
-}
-
-},{"base64-js":3,"ieee754":4}],3:[function(require,module,exports){
-var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-
-;(function (exports) {
-	'use strict';
-
-  var Arr = (typeof Uint8Array !== 'undefined')
-    ? Uint8Array
-    : Array
-
-	var PLUS   = '+'.charCodeAt(0)
-	var SLASH  = '/'.charCodeAt(0)
-	var NUMBER = '0'.charCodeAt(0)
-	var LOWER  = 'a'.charCodeAt(0)
-	var UPPER  = 'A'.charCodeAt(0)
-	var PLUS_URL_SAFE = '-'.charCodeAt(0)
-	var SLASH_URL_SAFE = '_'.charCodeAt(0)
-
-	function decode (elt) {
-		var code = elt.charCodeAt(0)
-		if (code === PLUS ||
-		    code === PLUS_URL_SAFE)
-			return 62 // '+'
-		if (code === SLASH ||
-		    code === SLASH_URL_SAFE)
-			return 63 // '/'
-		if (code < NUMBER)
-			return -1 //no match
-		if (code < NUMBER + 10)
-			return code - NUMBER + 26 + 26
-		if (code < UPPER + 26)
-			return code - UPPER
-		if (code < LOWER + 26)
-			return code - LOWER + 26
-	}
-
-	function b64ToByteArray (b64) {
-		var i, j, l, tmp, placeHolders, arr
-
-		if (b64.length % 4 > 0) {
-			throw new Error('Invalid string. Length must be a multiple of 4')
-		}
-
-		// the number of equal signs (place holders)
-		// if there are two placeholders, than the two characters before it
-		// represent one byte
-		// if there is only one, then the three characters before it represent 2 bytes
-		// this is just a cheap hack to not do indexOf twice
-		var len = b64.length
-		placeHolders = '=' === b64.charAt(len - 2) ? 2 : '=' === b64.charAt(len - 1) ? 1 : 0
-
-		// base64 is 4/3 + up to two characters of the original data
-		arr = new Arr(b64.length * 3 / 4 - placeHolders)
-
-		// if there are placeholders, only get up to the last complete 4 chars
-		l = placeHolders > 0 ? b64.length - 4 : b64.length
-
-		var L = 0
-
-		function push (v) {
-			arr[L++] = v
-		}
-
-		for (i = 0, j = 0; i < l; i += 4, j += 3) {
-			tmp = (decode(b64.charAt(i)) << 18) | (decode(b64.charAt(i + 1)) << 12) | (decode(b64.charAt(i + 2)) << 6) | decode(b64.charAt(i + 3))
-			push((tmp & 0xFF0000) >> 16)
-			push((tmp & 0xFF00) >> 8)
-			push(tmp & 0xFF)
-		}
-
-		if (placeHolders === 2) {
-			tmp = (decode(b64.charAt(i)) << 2) | (decode(b64.charAt(i + 1)) >> 4)
-			push(tmp & 0xFF)
-		} else if (placeHolders === 1) {
-			tmp = (decode(b64.charAt(i)) << 10) | (decode(b64.charAt(i + 1)) << 4) | (decode(b64.charAt(i + 2)) >> 2)
-			push((tmp >> 8) & 0xFF)
-			push(tmp & 0xFF)
-		}
-
-		return arr
-	}
-
-	function uint8ToBase64 (uint8) {
-		var i,
-			extraBytes = uint8.length % 3, // if we have 1 byte left, pad 2 bytes
-			output = "",
-			temp, length
-
-		function encode (num) {
-			return lookup.charAt(num)
-		}
-
-		function tripletToBase64 (num) {
-			return encode(num >> 18 & 0x3F) + encode(num >> 12 & 0x3F) + encode(num >> 6 & 0x3F) + encode(num & 0x3F)
-		}
-
-		// go through the array every three bytes, we'll deal with trailing stuff later
-		for (i = 0, length = uint8.length - extraBytes; i < length; i += 3) {
-			temp = (uint8[i] << 16) + (uint8[i + 1] << 8) + (uint8[i + 2])
-			output += tripletToBase64(temp)
-		}
-
-		// pad the end with zeros, but make sure to not forget the extra bytes
-		switch (extraBytes) {
-			case 1:
-				temp = uint8[uint8.length - 1]
-				output += encode(temp >> 2)
-				output += encode((temp << 4) & 0x3F)
-				output += '=='
-				break
-			case 2:
-				temp = (uint8[uint8.length - 2] << 8) + (uint8[uint8.length - 1])
-				output += encode(temp >> 10)
-				output += encode((temp >> 4) & 0x3F)
-				output += encode((temp << 2) & 0x3F)
-				output += '='
-				break
-		}
-
-		return output
-	}
-
-	exports.toByteArray = b64ToByteArray
-	exports.fromByteArray = uint8ToBase64
-}(typeof exports === 'undefined' ? (this.base64js = {}) : exports))
-
-},{}],4:[function(require,module,exports){
-exports.read = function(buffer, offset, isLE, mLen, nBytes) {
-  var e, m,
-      eLen = nBytes * 8 - mLen - 1,
-      eMax = (1 << eLen) - 1,
-      eBias = eMax >> 1,
-      nBits = -7,
-      i = isLE ? (nBytes - 1) : 0,
-      d = isLE ? -1 : 1,
-      s = buffer[offset + i];
-
-  i += d;
-
-  e = s & ((1 << (-nBits)) - 1);
-  s >>= (-nBits);
-  nBits += eLen;
-  for (; nBits > 0; e = e * 256 + buffer[offset + i], i += d, nBits -= 8);
-
-  m = e & ((1 << (-nBits)) - 1);
-  e >>= (-nBits);
-  nBits += mLen;
-  for (; nBits > 0; m = m * 256 + buffer[offset + i], i += d, nBits -= 8);
-
-  if (e === 0) {
-    e = 1 - eBias;
-  } else if (e === eMax) {
-    return m ? NaN : ((s ? -1 : 1) * Infinity);
-  } else {
-    m = m + Math.pow(2, mLen);
-    e = e - eBias;
-  }
-  return (s ? -1 : 1) * m * Math.pow(2, e - mLen);
-};
-
-exports.write = function(buffer, value, offset, isLE, mLen, nBytes) {
-  var e, m, c,
-      eLen = nBytes * 8 - mLen - 1,
-      eMax = (1 << eLen) - 1,
-      eBias = eMax >> 1,
-      rt = (mLen === 23 ? Math.pow(2, -24) - Math.pow(2, -77) : 0),
-      i = isLE ? 0 : (nBytes - 1),
-      d = isLE ? 1 : -1,
-      s = value < 0 || (value === 0 && 1 / value < 0) ? 1 : 0;
-
-  value = Math.abs(value);
-
-  if (isNaN(value) || value === Infinity) {
-    m = isNaN(value) ? 1 : 0;
-    e = eMax;
-  } else {
-    e = Math.floor(Math.log(value) / Math.LN2);
-    if (value * (c = Math.pow(2, -e)) < 1) {
-      e--;
-      c *= 2;
-    }
-    if (e + eBias >= 1) {
-      value += rt / c;
-    } else {
-      value += rt * Math.pow(2, 1 - eBias);
-    }
-    if (value * c >= 2) {
-      e++;
-      c /= 2;
-    }
-
-    if (e + eBias >= eMax) {
-      m = 0;
-      e = eMax;
-    } else if (e + eBias >= 1) {
-      m = (value * c - 1) * Math.pow(2, mLen);
-      e = e + eBias;
-    } else {
-      m = value * Math.pow(2, eBias - 1) * Math.pow(2, mLen);
-      e = 0;
-    }
-  }
-
-  for (; mLen >= 8; buffer[offset + i] = m & 0xff, i += d, m /= 256, mLen -= 8);
-
-  e = (e << mLen) | m;
-  eLen += mLen;
-  for (; eLen > 0; buffer[offset + i] = e & 0xff, i += d, e /= 256, eLen -= 8);
-
-  buffer[offset + i - d] |= s * 128;
-};
-
-},{}],5:[function(require,module,exports){
-var Buffer = require('buffer').Buffer;
-var intSize = 4;
-var zeroBuffer = new Buffer(intSize); zeroBuffer.fill(0);
-var chrsz = 8;
-
-function toArray(buf, bigEndian) {
-  if ((buf.length % intSize) !== 0) {
-    var len = buf.length + (intSize - (buf.length % intSize));
-    buf = Buffer.concat([buf, zeroBuffer], len);
-  }
-
-  var arr = [];
-  var fn = bigEndian ? buf.readInt32BE : buf.readInt32LE;
-  for (var i = 0; i < buf.length; i += intSize) {
-    arr.push(fn.call(buf, i));
-  }
-  return arr;
-}
-
-function toBuffer(arr, size, bigEndian) {
-  var buf = new Buffer(size);
-  var fn = bigEndian ? buf.writeInt32BE : buf.writeInt32LE;
-  for (var i = 0; i < arr.length; i++) {
-    fn.call(buf, arr[i], i * 4, true);
-  }
-  return buf;
-}
-
-function hash(buf, fn, hashSize, bigEndian) {
-  if (!Buffer.isBuffer(buf)) buf = new Buffer(buf);
-  var arr = fn(toArray(buf, bigEndian), buf.length * chrsz);
-  return toBuffer(arr, hashSize, bigEndian);
-}
-
-module.exports = { hash: hash };
-
-},{"buffer":2}],6:[function(require,module,exports){
-var Buffer = require('buffer').Buffer
-var sha = require('./sha')
-var sha256 = require('./sha256')
-var rng = require('./rng')
-var md5 = require('./md5')
-
-var algorithms = {
-  sha1: sha,
-  sha256: sha256,
-  md5: md5
-}
-
-var blocksize = 64
-var zeroBuffer = new Buffer(blocksize); zeroBuffer.fill(0)
-function hmac(fn, key, data) {
-  if(!Buffer.isBuffer(key)) key = new Buffer(key)
-  if(!Buffer.isBuffer(data)) data = new Buffer(data)
-
-  if(key.length > blocksize) {
-    key = fn(key)
-  } else if(key.length < blocksize) {
-    key = Buffer.concat([key, zeroBuffer], blocksize)
-  }
-
-  var ipad = new Buffer(blocksize), opad = new Buffer(blocksize)
-  for(var i = 0; i < blocksize; i++) {
-    ipad[i] = key[i] ^ 0x36
-    opad[i] = key[i] ^ 0x5C
-  }
-
-  var hash = fn(Buffer.concat([ipad, data]))
-  return fn(Buffer.concat([opad, hash]))
-}
-
-function hash(alg, key) {
-  alg = alg || 'sha1'
-  var fn = algorithms[alg]
-  var bufs = []
-  var length = 0
-  if(!fn) error('algorithm:', alg, 'is not yet supported')
-  return {
-    update: function (data) {
-      if(!Buffer.isBuffer(data)) data = new Buffer(data)
-        
-      bufs.push(data)
-      length += data.length
-      return this
-    },
-    digest: function (enc) {
-      var buf = Buffer.concat(bufs)
-      var r = key ? hmac(fn, key, buf) : fn(buf)
-      bufs = null
-      return enc ? r.toString(enc) : r
-    }
-  }
-}
-
-function error () {
-  var m = [].slice.call(arguments).join(' ')
-  throw new Error([
-    m,
-    'we accept pull requests',
-    'http://github.com/dominictarr/crypto-browserify'
-    ].join('\n'))
-}
-
-exports.createHash = function (alg) { return hash(alg) }
-exports.createHmac = function (alg, key) { return hash(alg, key) }
-exports.randomBytes = function(size, callback) {
-  if (callback && callback.call) {
-    try {
-      callback.call(this, undefined, new Buffer(rng(size)))
-    } catch (err) { callback(err) }
-  } else {
-    return new Buffer(rng(size))
-  }
-}
-
-function each(a, f) {
-  for(var i in a)
-    f(a[i], i)
-}
-
-// the least I can do is make error messages for the rest of the node.js/crypto api.
-each(['createCredentials'
-, 'createCipher'
-, 'createCipheriv'
-, 'createDecipher'
-, 'createDecipheriv'
-, 'createSign'
-, 'createVerify'
-, 'createDiffieHellman'
-, 'pbkdf2'], function (name) {
-  exports[name] = function () {
-    error('sorry,', name, 'is not implemented yet')
-  }
-})
-
-},{"./md5":7,"./rng":8,"./sha":9,"./sha256":10,"buffer":2}],7:[function(require,module,exports){
-/*
- * A JavaScript implementation of the RSA Data Security, Inc. MD5 Message
- * Digest Algorithm, as defined in RFC 1321.
- * Version 2.1 Copyright (C) Paul Johnston 1999 - 2002.
- * Other contributors: Greg Holt, Andrew Kepert, Ydnar, Lostinet
- * Distributed under the BSD License
- * See http://pajhome.org.uk/crypt/md5 for more info.
- */
-
-var helpers = require('./helpers');
-
-/*
- * Perform a simple self-test to see if the VM is working
- */
-function md5_vm_test()
-{
-  return hex_md5("abc") == "900150983cd24fb0d6963f7d28e17f72";
-}
-
-/*
- * Calculate the MD5 of an array of little-endian words, and a bit length
- */
-function core_md5(x, len)
-{
-  /* append padding */
-  x[len >> 5] |= 0x80 << ((len) % 32);
-  x[(((len + 64) >>> 9) << 4) + 14] = len;
-
-  var a =  1732584193;
-  var b = -271733879;
-  var c = -1732584194;
-  var d =  271733878;
-
-  for(var i = 0; i < x.length; i += 16)
-  {
-    var olda = a;
-    var oldb = b;
-    var oldc = c;
-    var oldd = d;
-
-    a = md5_ff(a, b, c, d, x[i+ 0], 7 , -680876936);
-    d = md5_ff(d, a, b, c, x[i+ 1], 12, -389564586);
-    c = md5_ff(c, d, a, b, x[i+ 2], 17,  606105819);
-    b = md5_ff(b, c, d, a, x[i+ 3], 22, -1044525330);
-    a = md5_ff(a, b, c, d, x[i+ 4], 7 , -176418897);
-    d = md5_ff(d, a, b, c, x[i+ 5], 12,  1200080426);
-    c = md5_ff(c, d, a, b, x[i+ 6], 17, -1473231341);
-    b = md5_ff(b, c, d, a, x[i+ 7], 22, -45705983);
-    a = md5_ff(a, b, c, d, x[i+ 8], 7 ,  1770035416);
-    d = md5_ff(d, a, b, c, x[i+ 9], 12, -1958414417);
-    c = md5_ff(c, d, a, b, x[i+10], 17, -42063);
-    b = md5_ff(b, c, d, a, x[i+11], 22, -1990404162);
-    a = md5_ff(a, b, c, d, x[i+12], 7 ,  1804603682);
-    d = md5_ff(d, a, b, c, x[i+13], 12, -40341101);
-    c = md5_ff(c, d, a, b, x[i+14], 17, -1502002290);
-    b = md5_ff(b, c, d, a, x[i+15], 22,  1236535329);
-
-    a = md5_gg(a, b, c, d, x[i+ 1], 5 , -165796510);
-    d = md5_gg(d, a, b, c, x[i+ 6], 9 , -1069501632);
-    c = md5_gg(c, d, a, b, x[i+11], 14,  643717713);
-    b = md5_gg(b, c, d, a, x[i+ 0], 20, -373897302);
-    a = md5_gg(a, b, c, d, x[i+ 5], 5 , -701558691);
-    d = md5_gg(d, a, b, c, x[i+10], 9 ,  38016083);
-    c = md5_gg(c, d, a, b, x[i+15], 14, -660478335);
-    b = md5_gg(b, c, d, a, x[i+ 4], 20, -405537848);
-    a = md5_gg(a, b, c, d, x[i+ 9], 5 ,  568446438);
-    d = md5_gg(d, a, b, c, x[i+14], 9 , -1019803690);
-    c = md5_gg(c, d, a, b, x[i+ 3], 14, -187363961);
-    b = md5_gg(b, c, d, a, x[i+ 8], 20,  1163531501);
-    a = md5_gg(a, b, c, d, x[i+13], 5 , -1444681467);
-    d = md5_gg(d, a, b, c, x[i+ 2], 9 , -51403784);
-    c = md5_gg(c, d, a, b, x[i+ 7], 14,  1735328473);
-    b = md5_gg(b, c, d, a, x[i+12], 20, -1926607734);
-
-    a = md5_hh(a, b, c, d, x[i+ 5], 4 , -378558);
-    d = md5_hh(d, a, b, c, x[i+ 8], 11, -2022574463);
-    c = md5_hh(c, d, a, b, x[i+11], 16,  1839030562);
-    b = md5_hh(b, c, d, a, x[i+14], 23, -35309556);
-    a = md5_hh(a, b, c, d, x[i+ 1], 4 , -1530992060);
-    d = md5_hh(d, a, b, c, x[i+ 4], 11,  1272893353);
-    c = md5_hh(c, d, a, b, x[i+ 7], 16, -155497632);
-    b = md5_hh(b, c, d, a, x[i+10], 23, -1094730640);
-    a = md5_hh(a, b, c, d, x[i+13], 4 ,  681279174);
-    d = md5_hh(d, a, b, c, x[i+ 0], 11, -358537222);
-    c = md5_hh(c, d, a, b, x[i+ 3], 16, -722521979);
-    b = md5_hh(b, c, d, a, x[i+ 6], 23,  76029189);
-    a = md5_hh(a, b, c, d, x[i+ 9], 4 , -640364487);
-    d = md5_hh(d, a, b, c, x[i+12], 11, -421815835);
-    c = md5_hh(c, d, a, b, x[i+15], 16,  530742520);
-    b = md5_hh(b, c, d, a, x[i+ 2], 23, -995338651);
-
-    a = md5_ii(a, b, c, d, x[i+ 0], 6 , -198630844);
-    d = md5_ii(d, a, b, c, x[i+ 7], 10,  1126891415);
-    c = md5_ii(c, d, a, b, x[i+14], 15, -1416354905);
-    b = md5_ii(b, c, d, a, x[i+ 5], 21, -57434055);
-    a = md5_ii(a, b, c, d, x[i+12], 6 ,  1700485571);
-    d = md5_ii(d, a, b, c, x[i+ 3], 10, -1894986606);
-    c = md5_ii(c, d, a, b, x[i+10], 15, -1051523);
-    b = md5_ii(b, c, d, a, x[i+ 1], 21, -2054922799);
-    a = md5_ii(a, b, c, d, x[i+ 8], 6 ,  1873313359);
-    d = md5_ii(d, a, b, c, x[i+15], 10, -30611744);
-    c = md5_ii(c, d, a, b, x[i+ 6], 15, -1560198380);
-    b = md5_ii(b, c, d, a, x[i+13], 21,  1309151649);
-    a = md5_ii(a, b, c, d, x[i+ 4], 6 , -145523070);
-    d = md5_ii(d, a, b, c, x[i+11], 10, -1120210379);
-    c = md5_ii(c, d, a, b, x[i+ 2], 15,  718787259);
-    b = md5_ii(b, c, d, a, x[i+ 9], 21, -343485551);
-
-    a = safe_add(a, olda);
-    b = safe_add(b, oldb);
-    c = safe_add(c, oldc);
-    d = safe_add(d, oldd);
-  }
-  return Array(a, b, c, d);
-
-}
-
-/*
- * These functions implement the four basic operations the algorithm uses.
- */
-function md5_cmn(q, a, b, x, s, t)
-{
-  return safe_add(bit_rol(safe_add(safe_add(a, q), safe_add(x, t)), s),b);
-}
-function md5_ff(a, b, c, d, x, s, t)
-{
-  return md5_cmn((b & c) | ((~b) & d), a, b, x, s, t);
-}
-function md5_gg(a, b, c, d, x, s, t)
-{
-  return md5_cmn((b & d) | (c & (~d)), a, b, x, s, t);
-}
-function md5_hh(a, b, c, d, x, s, t)
-{
-  return md5_cmn(b ^ c ^ d, a, b, x, s, t);
-}
-function md5_ii(a, b, c, d, x, s, t)
-{
-  return md5_cmn(c ^ (b | (~d)), a, b, x, s, t);
-}
-
-/*
- * Add integers, wrapping at 2^32. This uses 16-bit operations internally
- * to work around bugs in some JS interpreters.
- */
-function safe_add(x, y)
-{
-  var lsw = (x & 0xFFFF) + (y & 0xFFFF);
-  var msw = (x >> 16) + (y >> 16) + (lsw >> 16);
-  return (msw << 16) | (lsw & 0xFFFF);
-}
-
-/*
- * Bitwise rotate a 32-bit number to the left.
- */
-function bit_rol(num, cnt)
-{
-  return (num << cnt) | (num >>> (32 - cnt));
-}
-
-module.exports = function md5(buf) {
-  return helpers.hash(buf, core_md5, 16);
-};
-
-},{"./helpers":5}],8:[function(require,module,exports){
-// Original code adapted from Robert Kieffer.
-// details at https://github.com/broofa/node-uuid
-(function() {
-  var _global = this;
-
-  var mathRNG, whatwgRNG;
-
-  // NOTE: Math.random() does not guarantee "cryptographic quality"
-  mathRNG = function(size) {
-    var bytes = new Array(size);
-    var r;
-
-    for (var i = 0, r; i < size; i++) {
-      if ((i & 0x03) == 0) r = Math.random() * 0x100000000;
-      bytes[i] = r >>> ((i & 0x03) << 3) & 0xff;
-    }
-
-    return bytes;
-  }
-
-  if (_global.crypto && crypto.getRandomValues) {
-    whatwgRNG = function(size) {
-      var bytes = new Uint8Array(size);
-      crypto.getRandomValues(bytes);
-      return bytes;
-    }
-  }
-
-  module.exports = whatwgRNG || mathRNG;
-
-}())
-
-},{}],9:[function(require,module,exports){
-/*
- * A JavaScript implementation of the Secure Hash Algorithm, SHA-1, as defined
- * in FIPS PUB 180-1
- * Version 2.1a Copyright Paul Johnston 2000 - 2002.
- * Other contributors: Greg Holt, Andrew Kepert, Ydnar, Lostinet
- * Distributed under the BSD License
- * See http://pajhome.org.uk/crypt/md5 for details.
- */
-
-var helpers = require('./helpers');
-
-/*
- * Calculate the SHA-1 of an array of big-endian words, and a bit length
- */
-function core_sha1(x, len)
-{
-  /* append padding */
-  x[len >> 5] |= 0x80 << (24 - len % 32);
-  x[((len + 64 >> 9) << 4) + 15] = len;
-
-  var w = Array(80);
-  var a =  1732584193;
-  var b = -271733879;
-  var c = -1732584194;
-  var d =  271733878;
-  var e = -1009589776;
-
-  for(var i = 0; i < x.length; i += 16)
-  {
-    var olda = a;
-    var oldb = b;
-    var oldc = c;
-    var oldd = d;
-    var olde = e;
-
-    for(var j = 0; j < 80; j++)
-    {
-      if(j < 16) w[j] = x[i + j];
-      else w[j] = rol(w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16], 1);
-      var t = safe_add(safe_add(rol(a, 5), sha1_ft(j, b, c, d)),
-                       safe_add(safe_add(e, w[j]), sha1_kt(j)));
-      e = d;
-      d = c;
-      c = rol(b, 30);
-      b = a;
-      a = t;
-    }
-
-    a = safe_add(a, olda);
-    b = safe_add(b, oldb);
-    c = safe_add(c, oldc);
-    d = safe_add(d, oldd);
-    e = safe_add(e, olde);
-  }
-  return Array(a, b, c, d, e);
-
-}
-
-/*
- * Perform the appropriate triplet combination function for the current
- * iteration
- */
-function sha1_ft(t, b, c, d)
-{
-  if(t < 20) return (b & c) | ((~b) & d);
-  if(t < 40) return b ^ c ^ d;
-  if(t < 60) return (b & c) | (b & d) | (c & d);
-  return b ^ c ^ d;
-}
-
-/*
- * Determine the appropriate additive constant for the current iteration
- */
-function sha1_kt(t)
-{
-  return (t < 20) ?  1518500249 : (t < 40) ?  1859775393 :
-         (t < 60) ? -1894007588 : -899497514;
-}
-
-/*
- * Add integers, wrapping at 2^32. This uses 16-bit operations internally
- * to work around bugs in some JS interpreters.
- */
-function safe_add(x, y)
-{
-  var lsw = (x & 0xFFFF) + (y & 0xFFFF);
-  var msw = (x >> 16) + (y >> 16) + (lsw >> 16);
-  return (msw << 16) | (lsw & 0xFFFF);
-}
-
-/*
- * Bitwise rotate a 32-bit number to the left.
- */
-function rol(num, cnt)
-{
-  return (num << cnt) | (num >>> (32 - cnt));
-}
-
-module.exports = function sha1(buf) {
-  return helpers.hash(buf, core_sha1, 20, true);
-};
-
-},{"./helpers":5}],10:[function(require,module,exports){
-
-/**
- * A JavaScript implementation of the Secure Hash Algorithm, SHA-256, as defined
- * in FIPS 180-2
- * Version 2.2-beta Copyright Angel Marin, Paul Johnston 2000 - 2009.
- * Other contributors: Greg Holt, Andrew Kepert, Ydnar, Lostinet
- *
- */
-
-var helpers = require('./helpers');
-
-var safe_add = function(x, y) {
-  var lsw = (x & 0xFFFF) + (y & 0xFFFF);
-  var msw = (x >> 16) + (y >> 16) + (lsw >> 16);
-  return (msw << 16) | (lsw & 0xFFFF);
-};
-
-var S = function(X, n) {
-  return (X >>> n) | (X << (32 - n));
-};
-
-var R = function(X, n) {
-  return (X >>> n);
-};
-
-var Ch = function(x, y, z) {
-  return ((x & y) ^ ((~x) & z));
-};
-
-var Maj = function(x, y, z) {
-  return ((x & y) ^ (x & z) ^ (y & z));
-};
-
-var Sigma0256 = function(x) {
-  return (S(x, 2) ^ S(x, 13) ^ S(x, 22));
-};
-
-var Sigma1256 = function(x) {
-  return (S(x, 6) ^ S(x, 11) ^ S(x, 25));
-};
-
-var Gamma0256 = function(x) {
-  return (S(x, 7) ^ S(x, 18) ^ R(x, 3));
-};
-
-var Gamma1256 = function(x) {
-  return (S(x, 17) ^ S(x, 19) ^ R(x, 10));
-};
-
-var core_sha256 = function(m, l) {
-  var K = new Array(0x428A2F98,0x71374491,0xB5C0FBCF,0xE9B5DBA5,0x3956C25B,0x59F111F1,0x923F82A4,0xAB1C5ED5,0xD807AA98,0x12835B01,0x243185BE,0x550C7DC3,0x72BE5D74,0x80DEB1FE,0x9BDC06A7,0xC19BF174,0xE49B69C1,0xEFBE4786,0xFC19DC6,0x240CA1CC,0x2DE92C6F,0x4A7484AA,0x5CB0A9DC,0x76F988DA,0x983E5152,0xA831C66D,0xB00327C8,0xBF597FC7,0xC6E00BF3,0xD5A79147,0x6CA6351,0x14292967,0x27B70A85,0x2E1B2138,0x4D2C6DFC,0x53380D13,0x650A7354,0x766A0ABB,0x81C2C92E,0x92722C85,0xA2BFE8A1,0xA81A664B,0xC24B8B70,0xC76C51A3,0xD192E819,0xD6990624,0xF40E3585,0x106AA070,0x19A4C116,0x1E376C08,0x2748774C,0x34B0BCB5,0x391C0CB3,0x4ED8AA4A,0x5B9CCA4F,0x682E6FF3,0x748F82EE,0x78A5636F,0x84C87814,0x8CC70208,0x90BEFFFA,0xA4506CEB,0xBEF9A3F7,0xC67178F2);
-  var HASH = new Array(0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19);
-    var W = new Array(64);
-    var a, b, c, d, e, f, g, h, i, j;
-    var T1, T2;
-  /* append padding */
-  m[l >> 5] |= 0x80 << (24 - l % 32);
-  m[((l + 64 >> 9) << 4) + 15] = l;
-  for (var i = 0; i < m.length; i += 16) {
-    a = HASH[0]; b = HASH[1]; c = HASH[2]; d = HASH[3]; e = HASH[4]; f = HASH[5]; g = HASH[6]; h = HASH[7];
-    for (var j = 0; j < 64; j++) {
-      if (j < 16) {
-        W[j] = m[j + i];
-      } else {
-        W[j] = safe_add(safe_add(safe_add(Gamma1256(W[j - 2]), W[j - 7]), Gamma0256(W[j - 15])), W[j - 16]);
-      }
-      T1 = safe_add(safe_add(safe_add(safe_add(h, Sigma1256(e)), Ch(e, f, g)), K[j]), W[j]);
-      T2 = safe_add(Sigma0256(a), Maj(a, b, c));
-      h = g; g = f; f = e; e = safe_add(d, T1); d = c; c = b; b = a; a = safe_add(T1, T2);
-    }
-    HASH[0] = safe_add(a, HASH[0]); HASH[1] = safe_add(b, HASH[1]); HASH[2] = safe_add(c, HASH[2]); HASH[3] = safe_add(d, HASH[3]);
-    HASH[4] = safe_add(e, HASH[4]); HASH[5] = safe_add(f, HASH[5]); HASH[6] = safe_add(g, HASH[6]); HASH[7] = safe_add(h, HASH[7]);
-  }
-  return HASH;
-};
-
-module.exports = function sha256(buf) {
-  return helpers.hash(buf, core_sha256, 32, true);
-};
-
-},{"./helpers":5}],11:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2144,7 +301,7 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],12:[function(require,module,exports){
+},{}],2:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -2169,7 +326,7 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],13:[function(require,module,exports){
+},{}],3:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -2396,8 +553,8 @@ var substr = 'ab'.substr(-1) === 'b'
     }
 ;
 
-}).call(this,require("uojqOp"))
-},{"uojqOp":14}],14:[function(require,module,exports){
+}).call(this,require("z02cDi"))
+},{"z02cDi":4}],4:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -2462,14 +619,14 @@ process.chdir = function (dir) {
     throw new Error('process.chdir is not supported');
 };
 
-},{}],15:[function(require,module,exports){
+},{}],5:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],16:[function(require,module,exports){
+},{}],6:[function(require,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -3058,63 +1215,1121 @@ function hasOwnProperty(obj, prop) {
   return Object.prototype.hasOwnProperty.call(obj, prop);
 }
 
-}).call(this,require("uojqOp"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":15,"inherits":12,"uojqOp":14}],17:[function(require,module,exports){
-'use strict';
+}).call(this,require("z02cDi"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./support/isBuffer":5,"inherits":2,"z02cDi":4}],7:[function(require,module,exports){
+module.exports.BinarySearchTree = require('./lib/bst');
+module.exports.AVLTree = require('./lib/avltree');
 
-var util = require('util');
+},{"./lib/avltree":8,"./lib/bst":9}],8:[function(require,module,exports){
+/**
+ * Self-balancing binary search tree using the AVL implementation
+ */
+var BinarySearchTree = require('./bst')
+  , customUtils = require('./customUtils')
+  , util = require('util')
+  , _ = require('underscore')
+  ;
 
-function ConnectionMap() {
 
+/**
+ * Constructor
+ * We can't use a direct pointer to the root node (as in the simple binary search tree)
+ * as the root will change during tree rotations
+ * @param {Boolean}  options.unique Whether to enforce a 'unique' constraint on the key or not
+ * @param {Function} options.compareKeys Initialize this BST's compareKeys
+ */
+function AVLTree (options) {
+  this.tree = new _AVLTree(options);
 }
 
-util.inherits(ConnectionMap, Object);
 
-ConnectionMap.prototype.toJSON = function() {
-  var json = {};
-  var key;
-  for (key in this) {
-    if (this.hasOwnProperty(key)) {
-      for (var i = 0; i < this[key].length; i++) {
-        if (!json[key]) {
-          json[key] = [];
-        }
-        json[key][i] = this[key][i].toJSON();
+/**
+ * Constructor of the internal AVLTree
+ * @param {Object} options Optional
+ * @param {Boolean}  options.unique Whether to enforce a 'unique' constraint on the key or not
+ * @param {Key}      options.key Initialize this BST's key with key
+ * @param {Value}    options.value Initialize this BST's data with [value]
+ * @param {Function} options.compareKeys Initialize this BST's compareKeys
+ */
+function _AVLTree (options) {
+  options = options || {};
+
+  this.left = null;
+  this.right = null;
+  this.parent = options.parent !== undefined ? options.parent : null;
+  if (options.hasOwnProperty('key')) { this.key = options.key; }
+  this.data = options.hasOwnProperty('value') ? [options.value] : [];
+  this.unique = options.unique || false;
+
+  this.compareKeys = options.compareKeys || customUtils.defaultCompareKeysFunction;
+  this.checkValueEquality = options.checkValueEquality || customUtils.defaultCheckValueEquality;
+}
+
+
+/**
+ * Inherit basic functions from the basic binary search tree
+ */
+util.inherits(_AVLTree, BinarySearchTree);
+
+/**
+ * Keep a pointer to the internal tree constructor for testing purposes
+ */
+AVLTree._AVLTree = _AVLTree;
+
+
+/**
+ * Check the recorded height is correct for every node
+ * Throws if one height doesn't match
+ */
+_AVLTree.prototype.checkHeightCorrect = function () {
+  var leftH, rightH;
+
+  if (!this.hasOwnProperty('key')) { return; }   // Empty tree
+
+  if (this.left && this.left.height === undefined) { throw "Undefined height for node " + this.left.key; }
+  if (this.right && this.right.height === undefined) { throw "Undefined height for node " + this.right.key; }
+  if (this.height === undefined) { throw "Undefined height for node " + this.key; }
+
+  leftH = this.left ? this.left.height : 0;
+  rightH = this.right ? this.right.height : 0;
+
+  if (this.height !== 1 + Math.max(leftH, rightH)) { throw "Height constraint failed for node " + this.key; }
+  if (this.left) { this.left.checkHeightCorrect(); }
+  if (this.right) { this.right.checkHeightCorrect(); }
+};
+
+
+/**
+ * Return the balance factor
+ */
+_AVLTree.prototype.balanceFactor = function () {
+  var leftH = this.left ? this.left.height : 0
+    , rightH = this.right ? this.right.height : 0
+    ;
+  return leftH - rightH;
+};
+
+
+/**
+ * Check that the balance factors are all between -1 and 1
+ */
+_AVLTree.prototype.checkBalanceFactors = function () {
+  if (Math.abs(this.balanceFactor()) > 1) { throw 'Tree is unbalanced at node ' + this.key; }
+
+  if (this.left) { this.left.checkBalanceFactors(); }
+  if (this.right) { this.right.checkBalanceFactors(); }
+};
+
+
+/**
+ * When checking if the BST conditions are met, also check that the heights are correct
+ * and the tree is balanced
+ */
+_AVLTree.prototype.checkIsAVLT = function () {
+  _AVLTree.super_.prototype.checkIsBST.call(this);
+  this.checkHeightCorrect();
+  this.checkBalanceFactors();
+};
+AVLTree.prototype.checkIsAVLT = function () { this.tree.checkIsAVLT(); };
+
+
+/**
+ * Perform a right rotation of the tree if possible
+ * and return the root of the resulting tree
+ * The resulting tree's nodes' heights are also updated
+ */
+_AVLTree.prototype.rightRotation = function () {
+  var q = this
+    , p = this.left
+    , b
+    , ah, bh, ch;
+
+  if (!p) { return this; }   // No change
+
+  b = p.right;
+
+  // Alter tree structure
+  if (q.parent) {
+    p.parent = q.parent;
+    if (q.parent.left === q) { q.parent.left = p; } else { q.parent.right = p; }
+  } else {
+    p.parent = null;
+  }
+  p.right = q;
+  q.parent = p;
+  q.left = b;
+  if (b) { b.parent = q; }
+
+  // Update heights
+  ah = p.left ? p.left.height : 0;
+  bh = b ? b.height : 0;
+  ch = q.right ? q.right.height : 0;
+  q.height = Math.max(bh, ch) + 1;
+  p.height = Math.max(ah, q.height) + 1;
+
+  return p;
+};
+
+
+/**
+ * Perform a left rotation of the tree if possible
+ * and return the root of the resulting tree
+ * The resulting tree's nodes' heights are also updated
+ */
+_AVLTree.prototype.leftRotation = function () {
+  var p = this
+    , q = this.right
+    , b
+    , ah, bh, ch;
+
+  if (!q) { return this; }   // No change
+
+  b = q.left;
+
+  // Alter tree structure
+  if (p.parent) {
+    q.parent = p.parent;
+    if (p.parent.left === p) { p.parent.left = q; } else { p.parent.right = q; }
+  } else {
+    q.parent = null;
+  }
+  q.left = p;
+  p.parent = q;
+  p.right = b;
+  if (b) { b.parent = p; }
+
+  // Update heights
+  ah = p.left ? p.left.height : 0;
+  bh = b ? b.height : 0;
+  ch = q.right ? q.right.height : 0;
+  p.height = Math.max(ah, bh) + 1;
+  q.height = Math.max(ch, p.height) + 1;
+
+  return q;
+};
+
+
+/**
+ * Modify the tree if its right subtree is too small compared to the left
+ * Return the new root if any
+ */
+_AVLTree.prototype.rightTooSmall = function () {
+  if (this.balanceFactor() <= 1) { return this; }   // Right is not too small, don't change
+
+  if (this.left.balanceFactor() < 0) {
+    this.left.leftRotation();
+  }
+
+  return this.rightRotation();
+};
+
+
+/**
+ * Modify the tree if its left subtree is too small compared to the right
+ * Return the new root if any
+ */
+_AVLTree.prototype.leftTooSmall = function () {
+  if (this.balanceFactor() >= -1) { return this; }   // Left is not too small, don't change
+
+  if (this.right.balanceFactor() > 0) {
+    this.right.rightRotation();
+  }
+
+  return this.leftRotation();
+};
+
+
+/**
+ * Rebalance the tree along the given path. The path is given reversed (as he was calculated
+ * in the insert and delete functions).
+ * Returns the new root of the tree
+ * Of course, the first element of the path must be the root of the tree
+ */
+_AVLTree.prototype.rebalanceAlongPath = function (path) {
+  var newRoot = this
+    , rotated
+    , i;
+
+  if (!this.hasOwnProperty('key')) { delete this.height; return this; }   // Empty tree
+
+  // Rebalance the tree and update all heights
+  for (i = path.length - 1; i >= 0; i -= 1) {
+    path[i].height = 1 + Math.max(path[i].left ? path[i].left.height : 0, path[i].right ? path[i].right.height : 0);
+
+    if (path[i].balanceFactor() > 1) {
+      rotated = path[i].rightTooSmall();
+      if (i === 0) { newRoot = rotated; }
+    }
+
+    if (path[i].balanceFactor() < -1) {
+      rotated = path[i].leftTooSmall();
+      if (i === 0) { newRoot = rotated; }
+    }
+  }
+
+  return newRoot;
+};
+
+
+/**
+ * Insert a key, value pair in the tree while maintaining the AVL tree height constraint
+ * Return a pointer to the root node, which may have changed
+ */
+_AVLTree.prototype.insert = function (key, value) {
+  var insertPath = []
+    , currentNode = this
+    ;
+
+  // Empty tree, insert as root
+  if (!this.hasOwnProperty('key')) {
+    this.key = key;
+    this.data.push(value);
+    this.height = 1;
+    return this;
+  }
+
+  // Insert new leaf at the right place
+  while (true) {
+    // Same key: no change in the tree structure
+    if (currentNode.compareKeys(currentNode.key, key) === 0) {
+      if (currentNode.unique) {
+        throw { message: "Can't insert key " + key + ", it violates the unique constraint"
+              , key: key
+              , errorType: 'uniqueViolated'
+              };
+      } else {
+        currentNode.data.push(value);
+      }
+      return this;
+    }
+
+    insertPath.push(currentNode);
+
+    if (currentNode.compareKeys(key, currentNode.key) < 0) {
+      if (!currentNode.left) {
+        insertPath.push(currentNode.createLeftChild({ key: key, value: value }));
+        break;
+      } else {
+        currentNode = currentNode.left;
+      }
+    } else {
+      if (!currentNode.right) {
+        insertPath.push(currentNode.createRightChild({ key: key, value: value }));
+        break;
+      } else {
+        currentNode = currentNode.right;
       }
     }
   }
-  return json;
+
+  return this.rebalanceAlongPath(insertPath);
 };
 
-module.exports = ConnectionMap;
+// Insert in the internal tree, update the pointer to the root if needed
+AVLTree.prototype.insert = function (key, value) {
+  var newTree = this.tree.insert(key, value);
 
-},{"util":16}],18:[function(require,module,exports){
+  // If newTree is undefined, that means its structure was not modified
+  if (newTree) { this.tree = newTree; }
+};
+
+
+/**
+ * Delete a key or just a value and return the new root of the tree
+ * @param {Key} key
+ * @param {Value} value Optional. If not set, the whole key is deleted. If set, only this value is deleted
+ */
+_AVLTree.prototype.delete = function (key, value) {
+  var newData = [], replaceWith
+    , self = this
+    , currentNode = this
+    , deletePath = []
+    ;
+
+  if (!this.hasOwnProperty('key')) { return this; }   // Empty tree
+
+  // Either no match is found and the function will return from within the loop
+  // Or a match is found and deletePath will contain the path from the root to the node to delete after the loop
+  while (true) {
+    if (currentNode.compareKeys(key, currentNode.key) === 0) { break; }
+
+    deletePath.push(currentNode);
+
+    if (currentNode.compareKeys(key, currentNode.key) < 0) {
+      if (currentNode.left) {
+        currentNode = currentNode.left;
+      } else {
+        return this;   // Key not found, no modification
+      }
+    } else {
+      // currentNode.compareKeys(key, currentNode.key) is > 0
+      if (currentNode.right) {
+        currentNode = currentNode.right;
+      } else {
+        return this;   // Key not found, no modification
+      }
+    }
+  }
+
+  // Delete only a value (no tree modification)
+  if (currentNode.data.length > 1 && value) {
+    currentNode.data.forEach(function (d) {
+      if (!currentNode.checkValueEquality(d, value)) { newData.push(d); }
+    });
+    currentNode.data = newData;
+    return this;
+  }
+
+  // Delete a whole node
+
+  // Leaf
+  if (!currentNode.left && !currentNode.right) {
+    if (currentNode === this) {   // This leaf is also the root
+      delete currentNode.key;
+      currentNode.data = [];
+      delete currentNode.height;
+      return this;
+    } else {
+      if (currentNode.parent.left === currentNode) {
+        currentNode.parent.left = null;
+      } else {
+        currentNode.parent.right = null;
+      }
+      return this.rebalanceAlongPath(deletePath);
+    }
+  }
+
+
+  // Node with only one child
+  if (!currentNode.left || !currentNode.right) {
+    replaceWith = currentNode.left ? currentNode.left : currentNode.right;
+
+    if (currentNode === this) {   // This node is also the root
+      replaceWith.parent = null;
+      return replaceWith;   // height of replaceWith is necessarily 1 because the tree was balanced before deletion
+    } else {
+      if (currentNode.parent.left === currentNode) {
+        currentNode.parent.left = replaceWith;
+        replaceWith.parent = currentNode.parent;
+      } else {
+        currentNode.parent.right = replaceWith;
+        replaceWith.parent = currentNode.parent;
+      }
+
+      return this.rebalanceAlongPath(deletePath);
+    }
+  }
+
+
+  // Node with two children
+  // Use the in-order predecessor (no need to randomize since we actively rebalance)
+  deletePath.push(currentNode);
+  replaceWith = currentNode.left;
+
+  // Special case: the in-order predecessor is right below the node to delete
+  if (!replaceWith.right) {
+    currentNode.key = replaceWith.key;
+    currentNode.data = replaceWith.data;
+    currentNode.left = replaceWith.left;
+    if (replaceWith.left) { replaceWith.left.parent = currentNode; }
+    return this.rebalanceAlongPath(deletePath);
+  }
+
+  // After this loop, replaceWith is the right-most leaf in the left subtree
+  // and deletePath the path from the root (inclusive) to replaceWith (exclusive)
+  while (true) {
+    if (replaceWith.right) {
+      deletePath.push(replaceWith);
+      replaceWith = replaceWith.right;
+    } else {
+      break;
+    }
+  }
+
+  currentNode.key = replaceWith.key;
+  currentNode.data = replaceWith.data;
+
+  replaceWith.parent.right = replaceWith.left;
+  if (replaceWith.left) { replaceWith.left.parent = replaceWith.parent; }
+
+  return this.rebalanceAlongPath(deletePath);
+};
+
+// Delete a value
+AVLTree.prototype.delete = function (key, value) {
+  var newTree = this.tree.delete(key, value);
+
+  // If newTree is undefined, that means its structure was not modified
+  if (newTree) { this.tree = newTree; }
+};
+
+
+/**
+ * Other functions we want to use on an AVLTree as if it were the internal _AVLTree
+ */
+['getNumberOfKeys', 'search', 'betweenBounds', 'prettyPrint', 'executeOnEveryNode'].forEach(function (fn) {
+  AVLTree.prototype[fn] = function () {
+    return this.tree[fn].apply(this.tree, arguments);
+  };
+});
+
+
+// Interface
+module.exports = AVLTree;
+
+},{"./bst":9,"./customUtils":10,"underscore":85,"util":6}],9:[function(require,module,exports){
+/**
+ * Simple binary search tree
+ */
+var customUtils = require('./customUtils');
+
+
+/**
+ * Constructor
+ * @param {Object} options Optional
+ * @param {Boolean}  options.unique Whether to enforce a 'unique' constraint on the key or not
+ * @param {Key}      options.key Initialize this BST's key with key
+ * @param {Value}    options.value Initialize this BST's data with [value]
+ * @param {Function} options.compareKeys Initialize this BST's compareKeys
+ */
+function BinarySearchTree (options) {
+  options = options || {};
+
+  this.left = null;
+  this.right = null;
+  this.parent = options.parent !== undefined ? options.parent : null;
+  if (options.hasOwnProperty('key')) { this.key = options.key; }
+  this.data = options.hasOwnProperty('value') ? [options.value] : [];
+  this.unique = options.unique || false;
+
+  this.compareKeys = options.compareKeys || customUtils.defaultCompareKeysFunction;
+  this.checkValueEquality = options.checkValueEquality || customUtils.defaultCheckValueEquality;
+}
+
+
+// ================================
+// Methods used to test the tree
+// ================================
+
+
+/**
+ * Get the descendant with max key
+ */
+BinarySearchTree.prototype.getMaxKeyDescendant = function () {
+  if (this.right) {
+    return this.right.getMaxKeyDescendant();
+  } else {
+    return this;
+  }
+};
+
+
+/**
+ * Get the maximum key
+ */
+BinarySearchTree.prototype.getMaxKey = function () {
+  return this.getMaxKeyDescendant().key;
+};
+
+
+/**
+ * Get the descendant with min key
+ */
+BinarySearchTree.prototype.getMinKeyDescendant = function () {
+  if (this.left) {
+    return this.left.getMinKeyDescendant()
+  } else {
+    return this;
+  }
+};
+
+
+/**
+ * Get the minimum key
+ */
+BinarySearchTree.prototype.getMinKey = function () {
+  return this.getMinKeyDescendant().key;
+};
+
+
+/**
+ * Check that all nodes (incl. leaves) fullfil condition given by fn
+ * test is a function passed every (key, data) and which throws if the condition is not met
+ */
+BinarySearchTree.prototype.checkAllNodesFullfillCondition = function (test) {
+  if (!this.hasOwnProperty('key')) { return; }
+
+  test(this.key, this.data);
+  if (this.left) { this.left.checkAllNodesFullfillCondition(test); }
+  if (this.right) { this.right.checkAllNodesFullfillCondition(test); }
+};
+
+
+/**
+ * Check that the core BST properties on node ordering are verified
+ * Throw if they aren't
+ */
+BinarySearchTree.prototype.checkNodeOrdering = function () {
+  var self = this;
+
+  if (!this.hasOwnProperty('key')) { return; }
+
+  if (this.left) {
+    this.left.checkAllNodesFullfillCondition(function (k) {
+      if (self.compareKeys(k, self.key) >= 0) {
+        throw 'Tree with root ' + self.key + ' is not a binary search tree';
+      }
+    });
+    this.left.checkNodeOrdering();
+  }
+
+  if (this.right) {
+    this.right.checkAllNodesFullfillCondition(function (k) {
+      if (self.compareKeys(k, self.key) <= 0) {
+        throw 'Tree with root ' + self.key + ' is not a binary search tree';
+      }
+    });
+    this.right.checkNodeOrdering();
+  }
+};
+
+
+/**
+ * Check that all pointers are coherent in this tree
+ */
+BinarySearchTree.prototype.checkInternalPointers = function () {
+  if (this.left) {
+    if (this.left.parent !== this) { throw 'Parent pointer broken for key ' + this.key; }
+    this.left.checkInternalPointers();
+  }
+
+  if (this.right) {
+    if (this.right.parent !== this) { throw 'Parent pointer broken for key ' + this.key; }
+    this.right.checkInternalPointers();
+  }
+};
+
+
+/**
+ * Check that a tree is a BST as defined here (node ordering and pointer references)
+ */
+BinarySearchTree.prototype.checkIsBST = function () {
+  this.checkNodeOrdering();
+  this.checkInternalPointers();
+  if (this.parent) { throw "The root shouldn't have a parent"; }
+};
+
+
+/**
+ * Get number of keys inserted
+ */
+BinarySearchTree.prototype.getNumberOfKeys = function () {
+  var res;
+
+  if (!this.hasOwnProperty('key')) { return 0; }
+
+  res = 1;
+  if (this.left) { res += this.left.getNumberOfKeys(); }
+  if (this.right) { res += this.right.getNumberOfKeys(); }
+
+  return res;
+};
+
+
+
+// ============================================
+// Methods used to actually work on the tree
+// ============================================
+
+/**
+ * Create a BST similar (i.e. same options except for key and value) to the current one
+ * Use the same constructor (i.e. BinarySearchTree, AVLTree etc)
+ * @param {Object} options see constructor
+ */
+BinarySearchTree.prototype.createSimilar = function (options) {
+  options = options || {};
+  options.unique = this.unique;
+  options.compareKeys = this.compareKeys;
+  options.checkValueEquality = this.checkValueEquality;
+
+  return new this.constructor(options);
+};
+
+
+/**
+ * Create the left child of this BST and return it
+ */
+BinarySearchTree.prototype.createLeftChild = function (options) {
+  var leftChild = this.createSimilar(options);
+  leftChild.parent = this;
+  this.left = leftChild;
+
+  return leftChild;
+};
+
+
+/**
+ * Create the right child of this BST and return it
+ */
+BinarySearchTree.prototype.createRightChild = function (options) {
+  var rightChild = this.createSimilar(options);
+  rightChild.parent = this;
+  this.right = rightChild;
+
+  return rightChild;
+};
+
+
+/**
+ * Insert a new element
+ */
+BinarySearchTree.prototype.insert = function (key, value) {
+  // Empty tree, insert as root
+  if (!this.hasOwnProperty('key')) {
+    this.key = key;
+    this.data.push(value);
+    return;
+  }
+
+  // Same key as root
+  if (this.compareKeys(this.key, key) === 0) {
+    if (this.unique) {
+      throw { message: "Can't insert key " + key + ", it violates the unique constraint"
+            , key: key
+            , errorType: 'uniqueViolated'
+            };
+    } else {
+      this.data.push(value);
+    }
+    return;
+  }
+
+  if (this.compareKeys(key, this.key) < 0) {
+    // Insert in left subtree
+    if (this.left) {
+      this.left.insert(key, value);
+    } else {
+      this.createLeftChild({ key: key, value: value });
+    }
+  } else {
+    // Insert in right subtree
+    if (this.right) {
+      this.right.insert(key, value);
+    } else {
+      this.createRightChild({ key: key, value: value });
+    }
+  }
+};
+
+
+/**
+ * Search for all data corresponding to a key
+ */
+BinarySearchTree.prototype.search = function (key) {
+  if (!this.hasOwnProperty('key')) { return []; }
+
+  if (this.compareKeys(this.key, key) === 0) { return this.data; }
+
+  if (this.compareKeys(key, this.key) < 0) {
+    if (this.left) {
+      return this.left.search(key);
+    } else {
+      return [];
+    }
+  } else {
+    if (this.right) {
+      return this.right.search(key);
+    } else {
+      return [];
+    }
+  }
+};
+
+
+/**
+ * Return a function that tells whether a given key matches a lower bound
+ */
+BinarySearchTree.prototype.getLowerBoundMatcher = function (query) {
+  var self = this;
+
+  // No lower bound
+  if (!query.hasOwnProperty('$gt') && !query.hasOwnProperty('$gte')) {
+    return function () { return true; };
+  }
+
+  if (query.hasOwnProperty('$gt') && query.hasOwnProperty('$gte')) {
+    if (self.compareKeys(query.$gte, query.$gt) === 0) {
+      return function (key) { return self.compareKeys(key, query.$gt) > 0; };
+    }
+
+    if (self.compareKeys(query.$gte, query.$gt) > 0) {
+      return function (key) { return self.compareKeys(key, query.$gte) >= 0; };
+    } else {
+      return function (key) { return self.compareKeys(key, query.$gt) > 0; };
+    }
+  }
+
+  if (query.hasOwnProperty('$gt')) {
+    return function (key) { return self.compareKeys(key, query.$gt) > 0; };
+  } else {
+    return function (key) { return self.compareKeys(key, query.$gte) >= 0; };
+  }
+};
+
+
+/**
+ * Return a function that tells whether a given key matches an upper bound
+ */
+BinarySearchTree.prototype.getUpperBoundMatcher = function (query) {
+  var self = this;
+
+  // No lower bound
+  if (!query.hasOwnProperty('$lt') && !query.hasOwnProperty('$lte')) {
+    return function () { return true; };
+  }
+
+  if (query.hasOwnProperty('$lt') && query.hasOwnProperty('$lte')) {
+    if (self.compareKeys(query.$lte, query.$lt) === 0) {
+      return function (key) { return self.compareKeys(key, query.$lt) < 0; };
+    }
+
+    if (self.compareKeys(query.$lte, query.$lt) < 0) {
+      return function (key) { return self.compareKeys(key, query.$lte) <= 0; };
+    } else {
+      return function (key) { return self.compareKeys(key, query.$lt) < 0; };
+    }
+  }
+
+  if (query.hasOwnProperty('$lt')) {
+    return function (key) { return self.compareKeys(key, query.$lt) < 0; };
+  } else {
+    return function (key) { return self.compareKeys(key, query.$lte) <= 0; };
+  }
+};
+
+
+// Append all elements in toAppend to array
+function append (array, toAppend) {
+  var i;
+
+  for (i = 0; i < toAppend.length; i += 1) {
+    array.push(toAppend[i]);
+  }
+}
+
+
+/**
+ * Get all data for a key between bounds
+ * Return it in key order
+ * @param {Object} query Mongo-style query where keys are $lt, $lte, $gt or $gte (other keys are not considered)
+ * @param {Functions} lbm/ubm matching functions calculated at the first recursive step
+ */
+BinarySearchTree.prototype.betweenBounds = function (query, lbm, ubm) {
+  var res = [];
+
+  if (!this.hasOwnProperty('key')) { return []; }   // Empty tree
+
+  lbm = lbm || this.getLowerBoundMatcher(query);
+  ubm = ubm || this.getUpperBoundMatcher(query);
+
+  if (lbm(this.key) && this.left) { append(res, this.left.betweenBounds(query, lbm, ubm)); }
+  if (lbm(this.key) && ubm(this.key)) { append(res, this.data); }
+  if (ubm(this.key) && this.right) { append(res, this.right.betweenBounds(query, lbm, ubm)); }
+
+  return res;
+};
+
+
+/**
+ * Delete the current node if it is a leaf
+ * Return true if it was deleted
+ */
+BinarySearchTree.prototype.deleteIfLeaf = function () {
+  if (this.left || this.right) { return false; }
+
+  // The leaf is itself a root
+  if (!this.parent) {
+    delete this.key;
+    this.data = [];
+    return true;
+  }
+
+  if (this.parent.left === this) {
+    this.parent.left = null;
+  } else {
+    this.parent.right = null;
+  }
+
+  return true;
+};
+
+
+/**
+ * Delete the current node if it has only one child
+ * Return true if it was deleted
+ */
+BinarySearchTree.prototype.deleteIfOnlyOneChild = function () {
+  var child;
+
+  if (this.left && !this.right) { child = this.left; }
+  if (!this.left && this.right) { child = this.right; }
+  if (!child) { return false; }
+
+  // Root
+  if (!this.parent) {
+    this.key = child.key;
+    this.data = child.data;
+
+    this.left = null;
+    if (child.left) {
+      this.left = child.left;
+      child.left.parent = this;
+    }
+
+    this.right = null;
+    if (child.right) {
+      this.right = child.right;
+      child.right.parent = this;
+    }
+
+    return true;
+  }
+
+  if (this.parent.left === this) {
+    this.parent.left = child;
+    child.parent = this.parent;
+  } else {
+    this.parent.right = child;
+    child.parent = this.parent;
+  }
+
+  return true;
+};
+
+
+/**
+ * Delete a key or just a value
+ * @param {Key} key
+ * @param {Value} value Optional. If not set, the whole key is deleted. If set, only this value is deleted
+ */
+BinarySearchTree.prototype.delete = function (key, value) {
+  var newData = [], replaceWith
+    , self = this
+    ;
+
+  if (!this.hasOwnProperty('key')) { return; }
+
+  if (this.compareKeys(key, this.key) < 0) {
+    if (this.left) { this.left.delete(key, value); }
+    return;
+  }
+
+  if (this.compareKeys(key, this.key) > 0) {
+    if (this.right) { this.right.delete(key, value); }
+    return;
+  }
+
+  if (!this.compareKeys(key, this.key) === 0) { return; }
+
+  // Delete only a value
+  if (this.data.length > 1 && value !== undefined) {
+    this.data.forEach(function (d) {
+      if (!self.checkValueEquality(d, value)) { newData.push(d); }
+    });
+    self.data = newData;
+    return;
+  }
+
+  // Delete the whole node
+  if (this.deleteIfLeaf()) {
+    return;
+  }
+  if (this.deleteIfOnlyOneChild()) {
+    return;
+  }
+
+  // We are in the case where the node to delete has two children
+  if (Math.random() >= 0.5) {   // Randomize replacement to avoid unbalancing the tree too much
+    // Use the in-order predecessor
+    replaceWith = this.left.getMaxKeyDescendant();
+
+    this.key = replaceWith.key;
+    this.data = replaceWith.data;
+
+    if (this === replaceWith.parent) {   // Special case
+      this.left = replaceWith.left;
+      if (replaceWith.left) { replaceWith.left.parent = replaceWith.parent; }
+    } else {
+      replaceWith.parent.right = replaceWith.left;
+      if (replaceWith.left) { replaceWith.left.parent = replaceWith.parent; }
+    }
+  } else {
+    // Use the in-order successor
+    replaceWith = this.right.getMinKeyDescendant();
+
+    this.key = replaceWith.key;
+    this.data = replaceWith.data;
+
+    if (this === replaceWith.parent) {   // Special case
+      this.right = replaceWith.right;
+      if (replaceWith.right) { replaceWith.right.parent = replaceWith.parent; }
+    } else {
+      replaceWith.parent.left = replaceWith.right;
+      if (replaceWith.right) { replaceWith.right.parent = replaceWith.parent; }
+    }
+  }
+};
+
+
+/**
+ * Execute a function on every node of the tree, in key order
+ * @param {Function} fn Signature: node. Most useful will probably be node.key and node.data
+ */
+BinarySearchTree.prototype.executeOnEveryNode = function (fn) {
+  if (this.left) { this.left.executeOnEveryNode(fn); }
+  fn(this);
+  if (this.right) { this.right.executeOnEveryNode(fn); }
+};
+
+
+/**
+ * Pretty print a tree
+ * @param {Boolean} printData To print the nodes' data along with the key
+ */
+BinarySearchTree.prototype.prettyPrint = function (printData, spacing) {
+  spacing = spacing || "";
+
+  console.log(spacing + "* " + this.key);
+  if (printData) { console.log(spacing + "* " + this.data); }
+
+  if (!this.left && !this.right) { return; }
+
+  if (this.left) {
+    this.left.prettyPrint(printData, spacing + "  ");
+  } else {
+    console.log(spacing + "  *");
+  }
+  if (this.right) {
+    this.right.prettyPrint(printData, spacing + "  ");
+  } else {
+    console.log(spacing + "  *");
+  }
+};
+
+
+
+
+// Interface
+module.exports = BinarySearchTree;
+
+},{"./customUtils":10}],10:[function(require,module,exports){
+/**
+ * Return an array with the numbers from 0 to n-1, in a random order
+ */
+function getRandomArray (n) {
+  var res, next;
+
+  if (n === 0) { return []; }
+  if (n === 1) { return [0]; }
+
+  res = getRandomArray(n - 1);
+  next = Math.floor(Math.random() * n);
+  res.splice(next, 0, n - 1);   // Add n-1 at a random position in the array
+
+  return res;
+};
+module.exports.getRandomArray = getRandomArray;
+
+
+/*
+ * Default compareKeys function will work for numbers, strings and dates
+ */
+function defaultCompareKeysFunction (a, b) {
+  if (a < b) { return -1; }
+  if (a > b) { return 1; }
+  if (a === b) { return 0; }
+
+  throw { message: "Couldn't compare elements", a: a, b: b };
+}
+module.exports.defaultCompareKeysFunction = defaultCompareKeysFunction;
+
+
+/**
+ * Check whether two values are equal (used in non-unique deletion)
+ */
+function defaultCheckValueEquality (a, b) {
+  return a === b;
+}
+module.exports.defaultCheckValueEquality = defaultCheckValueEquality;
+
+},{}],11:[function(require,module,exports){
 'use strict';
 
-var Packet = require('./packet');
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var ConnectionMap = (function () {
+  function ConnectionMap() {
+    _classCallCheck(this, ConnectionMap);
+  }
+
+  _createClass(ConnectionMap, [{
+    key: 'toJSON',
+    value: function toJSON() {
+      var json = {};
+      for (var key in this) {
+        if (this.hasOwnProperty(key)) {
+          for (var i = 0; i < this[key].length; i++) {
+            if (!json[key]) {
+              json[key] = [];
+            }
+            json[key][i] = this[key][i].toJSON();
+          }
+        }
+      }
+      return json;
+    }
+  }]);
+
+  return ConnectionMap;
+})();
+
+module.exports = ConnectionMap;
+//# sourceMappingURL=ConnectionMap.js.map
+
+},{}],12:[function(require,module,exports){
+'use strict'
 
 // TODO: created something more flexible to load this on demand
-var nodeTypes = {
-  xNode: require('./node'),
-  polymer: require('./node/polymer')
-};
-var xLink = require('./link');
+;
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
 var util = require('util');
 var uuid = require('uuid').v4;
 var Run = require('./run');
-var Connector = require('./connector');
 var validate = require('./validate');
-var DefaultContextProvider = require('../lib/context/defaultProvider');
-var IoMapHandler = require('../lib/io/mapHandler');
-var DefaultProcessManager = require('../lib/process/defaultManager');
+var IoMapHandler = require('./io/mapHandler');
+var DefaultProcessManager = require('./process/defaultManager');
 var Loader = require('chix-loader');
-var multiSort = require('../lib/multisort');
-var EventEmitter = require('events').EventEmitter;
+var multiSort = require('./multisort');
+var EventEmitter = require('./events/after');
 var debug = require('debug')('chix:actor');
 
-var Status = {};
-Status.STOPPED = 'stopped';
-Status.RUNNING = 'running';
+var mixin = require('./mixin');
+var $Control = require('./actor/control');
+var $IIP = require('./actor/iip');
+var $Link = require('./actor/link');
+var $Node = require('./actor/node');
+var $Port = require('./actor/port');
+var $Report = require('./actor/report');
 
 /**
  *
@@ -3125,1846 +2340,2157 @@ Status.RUNNING = 'running';
  *
  * A node contains the actual programming logic.
  *
- * @api public
+ * @public
  * @author Rob Halff <rob.halff@gmail.com>
  * @constructor
  */
-function Actor() {
 
-  EventEmitter.apply(this, arguments);
+var Actor = (function (_EventEmitter) {
+  _inherits(Actor, _EventEmitter);
 
-  this.ioHandler = undefined;
-  this.processManager = undefined;
-  this.nodes = {};
-  this.links = {};
-  this.iips = {};
-  this.view = [];
-  this.status = undefined;
-  this.identifier = 'actor:main';
+  function Actor() {
+    _classCallCheck(this, Actor);
 
-  // default to own id, map can overwrite
-  this.id = uuid();
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(Actor).call(this));
 
-  this.type = 'flow';
+    _this.ioHandler = undefined;
+    _this.processManager = undefined;
+    _this.view = [];
+    _this.identifier = 'actor:main';
+
+    // default to own id, map can overwrite
+    _this.id = uuid();
+
+    _this.type = 'flow';
+
+    _this.links = new Map();
+    _this.iips = new Map();
+    _this.status = undefined;
+    _this.nodes = new Map();
+
+    /**
+     *
+     * Added by default.
+     *
+     * If others need to be used they should be set before addMap();
+     *
+     */
+    _this.setIoHandler(new IoMapHandler());
+    _this.setProcessManager(new DefaultProcessManager());
+    _this.setLoader(new Loader());
+    return _this;
+  }
 
   /**
    *
-   * Added by default.
+   * Create an actor
    *
-   * If others need to be used they should be set before addMap();
-   *
+   * @public
    */
-  this.setIoHandler(new IoMapHandler());
-  this.setProcessManager(new DefaultProcessManager());
-  this.setLoader(new Loader());
 
-}
+  _createClass(Actor, [{
+    key: 'addLoader',
 
-util.inherits(Actor, EventEmitter);
+    /**
+     *
+     * Adds the definition Loader
+     *
+     * This provides an api to get the required node definitions.
+     *
+     * The loader should already be init'ed
+     *
+     * e.g. the remote loader will already have loaded the definitions.
+     * and is ready to respond to getNodeDefinition(ns, name, type, provider)
+     *
+     * e.g. An async loader could do something like this:
+     *
+     *   loader(flow, function() { actor.addLoader(loader); }
+     *
+     * With a sync loader it will just look like:
+     *
+     * actor.addLoader(loader);
+     *
+     * @public
+     */
+    value: function addLoader(loader) {
+      this.loader = loader;
+      return this;
+    }
 
-/**
- *
- * Create/instantiate  a node
- *
- * Node at this stage is nothing more then:
- *
- *  { ns: "fs", name: "readFile" }
- *
- * @param {Object} node - Node as defined within a map
- * @param {Object} def  - Node Definition
- *
- * @api public
- */
-Actor.prototype.createNode = function(node, def) {
+    /**
+     *
+     * Validate and read map
+     *
+     * @param {Object} map
+     * @public
+     *
+     */
 
-  var self = this;
+  }, {
+    key: 'addMap',
+    value: function addMap(map) {
+      debug('%s: addMap()', this.identifier);
 
-  if (!def) {
-    throw new Error(
-      util.format(
-        'Failed to get node definition for %s:%s', node.ns, node.name
-      )
-    );
+      var self = this;
+
+      if (typeof map === 'undefined') {
+        throw new Error('map is not defined');
+      }
+
+      if (map !== Object(map)) {
+        throw new Error('addMap expects an object');
+      }
+
+      try {
+        validate.flow(map);
+      } catch (e) {
+        if (map.title) {
+          throw Error(util.format('Flow `%s`: %s', map.title, e.message));
+        } else {
+          throw Error(util.format('Flow %s:%s: %s', map.ns, map.name, e.message));
+        }
+      }
+
+      if (map.id) {
+        // xFlow contains it, direct actors don't perse
+        this.id = map.id;
+      }
+
+      // add ourselves (actor/xFlow) to the processmanager
+      // this way links can store our id and pid
+      // must be done *before* adding our nodes.
+      // otherwise our nodes will be registered before ourselves.
+      if (!this.pid) {
+        // re-run
+        this.processManager.register(this);
+      }
+
+      // allow a map to carry it's own definitions
+      if (map.nodeDefinitions) {
+        this.loader.addNodeDefinitions('@', map.nodeDefinitions);
+      }
+
+      // add nodes and links one by one so there is more control
+      map.nodes.forEach(function (node) {
+        if (!node.id) {
+          throw new Error(util.format('Node lacks an id: %s:%s', node.ns, node.name));
+        }
+
+        // give the node a default provider.
+        if (!node.provider) {
+          if (map.providers && map.providers.hasOwnProperty('@')) {
+            node.provider = map.providers['@'].url;
+          }
+        }
+
+        var def = self.loader.getNodeDefinition(node, map);
+        if (!def) {
+
+          throw new Error(util.format('Failed to get node definition for %s:%s', node.ns, node.name));
+        }
+
+        self.createNode(node, def);
+      });
+
+      // this.ensureConnectionNumbering(map);
+
+      if (map.hasOwnProperty('links')) {
+        map.links.forEach(function (link) {
+          self.addLink(self.createLink(link));
+        });
+      }
+
+      for (var i = 0; i < map.nodes.length; i++) {
+        this.view.push(map.nodes[i].id);
+      }
+
+      /*
+       Disabled. Actor.start() does this and xFlow.start()
+       will start all their nodes, and then goes recursive.
+        // all nodes & links setup, run start method on node
+       for (const node of this.nodes.values()) {
+         node.start();
+       }
+       */
+
+      return this;
+    }
+
+    /**
+     *
+     * Used by the process manager to set our id
+     *
+     */
+
+  }, {
+    key: 'setPid',
+    value: function setPid(pid) {
+      this.pid = pid;
+    }
+  }, {
+    key: 'unlockConnections',
+    value: function unlockConnections(node) {
+      // fix this, flow connections setup is different
+      var conns = node.getConnections();
+      for (var port in conns) {
+        if (conns.hasOwnProperty(port)) {
+          for (var i = 0; i < conns[port].length; i++) {
+            this.ioHandler.unlock(conns[port][i]);
+          }
+        }
+      }
+    }
+  }, {
+    key: '__input',
+    value: function __input(link, p) {
+      var self = this;
+
+      this.ioHandler.lock(link);
+
+      var targetNode = this.getNode(link.target.id);
+
+      // give owner ship to targetNode
+      p.setOwner(targetNode);
+
+      var ret = targetNode.fill(link.target, p);
+
+      // breakpoint
+      if (util.isError(ret)) {
+        // `hard reject`
+        // set node in error state and output error to ioHandler
+        targetNode.error(ret);
+
+        p.release(targetNode);
+        p.setOwner(link);
+
+        debug('%s: reject %s', this.identifier, ret);
+        self.ioHandler.reject(ret, link, p);
+      } else if (ret === false) {
+        p.release(targetNode);
+        p.setOwner(link);
+
+        // something should unlock.
+        // having this reject unlock it is too much free form.
+        debug('%s: `%s` soft reject re-queue', this.identifier, targetNode.identifier);
+        // `soft reject`
+        self.ioHandler.reject(ret, link, p);
+      } else {
+        // unlock *all* queues targeting this node.
+        // the IOHandler can do this.
+        debug('%s: unlock all queues for `%s`', this.identifier, targetNode.identifier);
+
+        self.unlockConnections(targetNode);
+
+        self.ioHandler.accept(link, p);
+      }
+    }
+  }, {
+    key: 'setMeta',
+    value: function setMeta(nodeId, key, value) {
+      var node = this.getNode(nodeId);
+
+      node.setMeta(key, value);
+
+      this.emit('metadata', {
+        id: this.id,
+        node: node.export()
+      });
+    }
+
+    /**
+     *
+     * Add IO Handler.
+     *
+     * The IO Handler handles all the input and output.
+     *
+     * @param {IOHandler} handler
+     * @public
+     *
+     */
+
+  }, {
+    key: 'addIoHandler',
+    value: function addIoHandler(handler) {
+      this.ioHandler = handler;
+
+      return this;
+    }
+
+    /**
+     *
+     * Add Process Manager.
+     *
+     * The Process Manager holds all processes.
+     *
+     * @param {Object} manager
+     * @public
+     *
+     */
+
+  }, {
+    key: 'addProcessManager',
+    value: function addProcessManager(manager) {
+      this.processManager = manager;
+
+      return this;
+    }
+
+    /**
+     *
+     * Add a new context provider.
+     *
+     * A context provider pre-processes the raw context
+     *
+     * This is useful for example when using the command line.
+     * All nodes which do not have context set can be asked for context.
+     *
+     * E.g. database credentials could be prompted for after which all
+     *      input is fullfilled and the flow will start to run.
+     *
+     * @param {ContextProvider} provider
+     * @private
+     *
+     */
+
+  }, {
+    key: 'addContextProvider',
+    value: function addContextProvider(provider) {
+      this.contextProvider = provider;
+
+      return this;
+    }
+
+    /**
+     *
+     * Explains what input and output ports are
+     * available for interaction.
+     *
+     */
+
+  }, {
+    key: 'help',
+    value: function help() {}
+
+    /**
+     *
+     * Retrieve a node by it's process id
+     *
+     * @param {String} pid - Process ID
+     * @return {Object} node
+     * @public
+     */
+
+  }, {
+    key: 'getNodeByPid',
+    value: function getNodeByPid(pid) {
+      return Array.from(this.nodes.values()).find(function (node) {
+        return node.pid === pid;
+      });
+    }
+
+    /**
+     *
+     * Get all node ids this node depends on.
+     *
+     * @param {String} nodeId
+     * @return {Array} nodes
+     * @public
+     */
+
+  }, {
+    key: 'getAncestorIds',
+    value: function getAncestorIds(nodeId) {
+      var self = this;
+
+      var pids = this.ioHandler.getAncestorPids(this.getNode(nodeId).pid);
+
+      var ids = [];
+      pids.forEach(function (pid) {
+        ids.push(self.getNodeByPid(pid).id);
+      });
+      return ids;
+    }
+
+    /**
+     *
+     * Get the entire node branch this node depends on
+     *
+     * @param {String} nodeId
+     * @return {Array} nodes
+     * @public
+     */
+
+  }, {
+    key: 'getAncestorNodes',
+    value: function getAncestorNodes(nodeId) {
+      var nodes = [];
+      var ids = this.getAncestorIds(nodeId);
+
+      for (var i = 0; i < ids.length; i++) {
+        nodes.push(this.getNode(ids[i]));
+      }
+
+      return nodes;
+    }
+
+    /**
+     *
+     * Get all node ids that target this node.
+     *
+     * @param {String} nodeId
+     * @return {Array} ids
+     * @public
+     */
+
+  }, {
+    key: 'getSourceIds',
+    value: function getSourceIds(nodeId) {
+      var self = this;
+      var ids = [];
+
+      var pids = this.ioHandler.getSourcePids(this.getNode(nodeId).pid);
+
+      pids.forEach(function (pid) {
+        var node = self.getNodeByPid(pid);
+        if (node) {
+          // iips will not be found
+          ids.push(node.id);
+        }
+      });
+      return ids;
+    }
+
+    /**
+     *
+     * Get all nodes that target this node.
+     *
+     * @param {String} nodeId
+     * @return {Array} nodes
+     * @public
+     */
+
+  }, {
+    key: 'getSourceNodes',
+    value: function getSourceNodes(nodeId) {
+      var nodes = [];
+      var ids = this.getSourceIds(nodeId);
+
+      for (var i = 0; i < ids.length; i++) {
+        nodes.push(this.getNode(ids[i]));
+      }
+
+      return nodes;
+    }
+
+    /**
+     *
+     * Get all nodes that use this node as a source .
+     *
+     * @param {String} nodeId
+     * @return {Array} ids
+     * @public
+     */
+
+  }, {
+    key: 'getTargetIds',
+    value: function getTargetIds(nodeId) {
+      var self = this;
+
+      var pids = this.ioHandler.getTargetPids(this.getNode(nodeId).pid);
+
+      var ids = [];
+      pids.forEach(function (pid) {
+        ids.push(self.getNodeByPid(pid).id);
+      });
+      return ids;
+    }
+
+    /**
+     *
+     * Use is a generic way of creating a new instance of self
+     * And only act upon a subset of our map.
+     */
+
+  }, {
+    key: 'use',
+    value: function use() /*name, context*/{
+      throw Error('TODO: reimplement actions');
+      /*
+       const i;
+       const action;
+       const map = {};
+       const sub = new this.constructor();
+        // Use this handlers events also on the action.
+       sub._events = this._events;
+        // Find our action
+       if (!this.map.actions) {
+       throw new Error('This flow has no actions');
+       }
+        if (!this.map.actions.hasOwnProperty(name)) {
+       throw new Error('Action not found');
+       }
+        action = this.map.actions[name];
+        // Create a reduced map
+       map.env = this.map.env;
+       map.title =  action.title;
+       map.description = action.description;
+       map.ports = this.map.ports;
+       map.nodes = [];
+       map.links = [];
+        for (i = 0; i < this.map.nodes.length; i++) {
+       if (action.nodes.indexOf(this.map.nodes[i].id) >= 0) {
+       map.nodes.push(this.map.nodes[i]);
+       }
+       }
+        for (i = 0; i < this.map.links.length; i++) {
+       if (
+       action.nodes.indexOf(this.map.links[i].source.id) >= 0 &&
+       action.nodes.indexOf(this.map.links[i].target.id) >= 0) {
+       map.links.push(this.map.links[i]);
+       }
+       }
+        // re-use the loader
+       sub.addLoader(this.loader);
+        // add the nodes to our newly instantiated Actor
+       sub.addMap(map);
+        // hack to autostart it during run()
+       // this only makes sense with actions.
+       // TODO: doesn work anymore
+       // sub.trigger = action.nodes[0];
+        return sub;
+       */
+    }
+
+    /**
+     *
+     * Run the current flow
+     *
+     * The flow starts by providing the ports with their context.
+     *
+     * Nodes which have all their ports filled by context will run immediatly.
+     *
+     * Others will wait until their unfilled ports are filled by connections.
+     *
+     * Internally the node will be set to a `contextGiven` state.
+     * It's a method to tell the node we expect it to have enough
+     * information to start running.
+     *
+     * If a port is not required and context was given and there are
+     * no connections on it, it will not block the node from running.
+     *
+     * If a map has actions defined, run expects an action name to run.
+     *
+     * Combinations:
+     *
+     *   - run()
+     *     run flow without callback
+     *
+     *   - run(callback)
+     *     run with callback
+     *
+     *   - action('actionName').run()
+     *     run action without callback
+     *
+     *   - action('actionName').run(callback)
+     *     run action with callback
+     *
+     * The callback will receive the output of the (last) node(s)
+     * Determined by which output ports are exposed.
+     *
+     * If we pass the exposed output, it can contain output from anywhere.
+     *
+     * If a callback is defined but there are no exposed output ports.
+     * The callback will never fire.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'run',
+    value: function run(callback) {
+      return new Run(this, callback);
+    }
+    /**
+     *
+     * Need to do it like this, we want the new sub actor
+     * to be returned to place events on etc.
+     *
+     * Otherwise it's hidden within the actor itself
+     *
+     * Usage: Actor.action('action').run(callback);
+     *
+     */
+
+  }, {
+    key: 'action',
+    value: function action(_action, context) {
+      var sub = this.use(_action, context);
+      return sub;
+    }
+
+    /**
+     *
+     * If there are multiple connections to one port
+     * the connections are numbered.
+     *
+     * If there is a index specified by using the
+     * [] property, it will be considered.
+     *
+     * If it's not specified although there are
+     * multiple connections to one port, it will be added.
+     *
+     * The sort takes care of adding connections where
+     * [] is undefined to be placed last.
+     *
+     * The second loop makes sure they are correctly numbered.
+     *
+     * If connections are defined like:
+     *
+     *   undefined, [4],undefined, [3],[2]
+     *
+     * The corrected result will be:
+     *
+     * [2]        -> [0]
+     * [3]        -> [1]
+     * [4]        -> [2]
+     * undefined  -> [3]
+     * undefined  -> [4]
+     *
+     * Ports which only have one connection will be left unmodified.
+     *
+     */
+
+  }, {
+    key: 'ensureConnectionNumbering',
+    value: function ensureConnectionNumbering(map) {
+      var c = 0;
+      var i = undefined;
+      var link = undefined;
+      var last = {};
+      var node = undefined;
+
+      // first sort so order of appearance of
+      // target.in is correct
+      //
+      // FIX: seems like multisort is messing up the array.
+      // target suddenly has unknown input ports...
+      if (map.links.length) {
+        multiSort(map.links, ['target', 'in', 'index']);
+      }
+
+      for (i = 0; i < map.links.length; i++) {
+        link = map.links[i];
+
+        // Weird, the full node is not build yet here?
+        // so have to look at the nodeDefinitions ns and name _is_
+        // known at this point.
+        node = this.nodes.get(link.target.id);
+
+        if (this.nodeDefinitions[node.ns][node.name].ports.input[link.target.port].type === 'array') {
+
+          if (last.target.id === link.target.id && last.target.port === link.target.port) {
+            last.index = c++;
+            link.index = c;
+          } else {
+            c = 0; // reset
+          }
+          last = link;
+        }
+      }
+    }
+  }, {
+    key: 'hasParent',
+    value: function hasParent() {
+      return false;
+    }
+
+    /**
+     *
+     * Register extra node types:
+     *
+     * Current types available are:
+     *
+     *  - ReactNode
+     *  - PolymerNode
+     *
+     */
+
+  }, {
+    key: 'registerNodeType',
+    value: function registerNodeType(Type) {
+      Actor.nodeTypes[Type.name] = Type;
+    }
+  }], [{
+    key: 'create',
+    value: function create(map, loader, ioHandler, processManager) {
+      var actor = new Actor();
+      loader = loader || new Loader();
+      processManager = processManager || new DefaultProcessManager();
+      ioHandler = ioHandler || new IoMapHandler();
+      actor.addLoader(loader);
+      actor.addIoHandler(ioHandler);
+      actor.addProcessManager(processManager);
+      actor.addMap(map);
+
+      return actor;
+    }
+  }]);
+
+  return Actor;
+})(EventEmitter);
+
+Actor.prototype.setLoader = Actor.prototype.addLoader;
+Actor.prototype.setContextProvider = Actor.prototype.addContextProvider;
+Actor.prototype.setIoHandler = Actor.prototype.addIoHandler;
+Actor.prototype.setProcessManager = Actor.prototype.addProcessManager;
+
+mixin(Actor, $Control, $IIP, $Link, $Node, $Port, $Report);
+module.exports = Actor;
+//# sourceMappingURL=actor.js.map
+
+},{"./actor/control":13,"./actor/iip":14,"./actor/link":15,"./actor/node":16,"./actor/port":17,"./actor/report":18,"./events/after":22,"./io/mapHandler":25,"./mixin":27,"./multisort":28,"./process/defaultManager":34,"./run":37,"./validate":41,"chix-loader":49,"debug":"V4HZ/5","util":6,"uuid":61}],13:[function(require,module,exports){
+'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var Status = require('./status');
+var debug = require('debug')('chix:actor');
+var Connector = require('../connector');
+
+var Control = (function () {
+  function Control() {
+    _classCallCheck(this, Control);
   }
 
-  if (!node.id) {
-    throw Error('Node should have an id');
-  }
+  _createClass(Control, [{
+    key: 'hold',
 
-  if (!def.ports) {
-    def.ports = {};
-  }
+    /**
+     *
+     * Holds a Node
+     *
+     * @param {String} id
+     * @public
+     */
+    value: function hold(id) {
+      this.getNode(id).hold();
 
-  // merges expose, persist etc, with port definitions.
-  // This is not needed with proper inheritance
-  for (var type in node.ports) {
-    if (node.ports.hasOwnProperty(type) &&
-      def.ports.hasOwnProperty(type)
-    ) {
-      for (var name in node.ports[type]) {
-        if (node.ports[type].hasOwnProperty(name) &&
-          def.ports[type].hasOwnProperty(name)
-        ) {
+      return this;
+    }
 
-          for (var property in node.ports[type][name]) {
-            if (node.ports[type][name].hasOwnProperty(property)) {
-              // add or overwrite it.
-              def.ports[type][name][property] =
-                node.ports[type][name][property];
+    /**
+     *
+     * Pushes the Actor
+     *
+     * Will send :start to all nodes without input
+     * and all nodes which have all their input ports
+     * filled by context already.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'push',
+    value: function push() {
+      this.status = Status.RUNNING;
+      debug('%s: push()', this.identifier);
+
+      var _iteratorNormalCompletion = true;
+      var _didIteratorError = false;
+      var _iteratorError = undefined;
+
+      try {
+        for (var _iterator = this.nodes.values()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+          var node = _step.value;
+
+          if (node.isStartable()) {
+            var iip = new Connector();
+            iip.plug(node.id, ':start');
+            this.sendIIP(iip, '');
+          } else {
+            debug('%s: `%s` not startable', this.identifier, node.identifier);
+          }
+        }
+      } catch (err) {
+        _didIteratorError = true;
+        _iteratorError = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion && _iterator.return) {
+            _iterator.return();
+          }
+        } finally {
+          if (_didIteratorError) {
+            throw _iteratorError;
+          }
+        }
+      }
+
+      return this;
+    }
+
+    /**
+     *
+     * Starts the actor
+     *
+     * @param {Boolean} push
+     * @public
+     */
+
+  }, {
+    key: 'start',
+    value: function start(push) {
+      this.status = Status.RUNNING;
+
+      debug('%s: start', this.identifier);
+
+      // TODO: this means IIPs should be send after start.
+      //       enforce this..
+      this.clearIIPs();
+
+      // start all nodes
+      // (could also be started during addMap
+      // runtime is skipping addMap.
+      // so make sure start() is restartable.
+      var _iteratorNormalCompletion2 = true;
+      var _didIteratorError2 = false;
+      var _iteratorError2 = undefined;
+
+      try {
+        for (var _iterator2 = this.nodes.values()[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+          var node = _step2.value;
+
+          node.start();
+        }
+      } catch (err) {
+        _didIteratorError2 = true;
+        _iteratorError2 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion2 && _iterator2.return) {
+            _iterator2.return();
+          }
+        } finally {
+          if (_didIteratorError2) {
+            throw _iteratorError2;
+          }
+        }
+      }
+
+      if (push !== false) {
+        this.push();
+      }
+
+      // there are many other ways to start
+      // so this does not ensure much.
+      // however the process manager listens to this.
+      // Real determination if something is started or stopped
+      // includes the ioHandler.
+      // So let's just inform the io handler we are started.
+
+      this.emit('start', {
+        node: this
+      });
+
+      return this;
+    }
+
+    /**
+     *
+     * Stops the actor
+     *
+     * Use a callback to make sure it is stopped.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'stop',
+    value: function stop(cb) {
+      var self = this;
+
+      this.status = Status.STOPPED;
+
+      if (this.ioHandler) {
+        this.ioHandler.reset(function resetCallbackIoHandler() {
+          // close ports opened by iips
+          self.clearIIPs();
+
+          self.emit('stop', {
+            node: self
+          });
+
+          if (cb) {
+            cb();
+          }
+        });
+      }
+    }
+  }, {
+    key: 'pause',
+    value: function pause() {
+      this.status = Status.STOPPED;
+
+      var _iteratorNormalCompletion3 = true;
+      var _didIteratorError3 = false;
+      var _iteratorError3 = undefined;
+
+      try {
+        for (var _iterator3 = this.nodes.values()[Symbol.iterator](), _step3; !(_iteratorNormalCompletion3 = (_step3 = _iterator3.next()).done); _iteratorNormalCompletion3 = true) {
+          var node = _step3.value;
+
+          node.hold();
+        }
+      } catch (err) {
+        _didIteratorError3 = true;
+        _iteratorError3 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion3 && _iterator3.return) {
+            _iterator3.return();
+          }
+        } finally {
+          if (_didIteratorError3) {
+            throw _iteratorError3;
+          }
+        }
+      }
+
+      return this;
+    }
+
+    /**
+     *
+     * Resumes the actor
+     *
+     * All nodes which are on hold will resume again.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'resume',
+    value: function resume() {
+      this.status = Status.RUNNING;
+
+      var _iteratorNormalCompletion4 = true;
+      var _didIteratorError4 = false;
+      var _iteratorError4 = undefined;
+
+      try {
+        for (var _iterator4 = this.nodes.values()[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
+          var node = _step4.value;
+
+          node.release();
+        }
+      } catch (err) {
+        _didIteratorError4 = true;
+        _iteratorError4 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion4 && _iterator4.return) {
+            _iterator4.return();
+          }
+        } finally {
+          if (_didIteratorError4) {
+            throw _iteratorError4;
+          }
+        }
+      }
+
+      return this;
+    }
+
+    /**
+     *
+     * Get the current status
+     *
+     * @public
+     */
+
+  }, {
+    key: 'getStatus',
+    value: function getStatus() {
+      return this.status;
+    }
+
+    /**
+     *
+     * Releases a node if it was on hold
+     *
+     * @param {String} id
+     * @public
+     */
+
+  }, {
+    key: 'release',
+    value: function release(id) {
+      return this.getNode(id).release();
+    }
+
+    /**
+     *
+     * Resets this instance so it can be re-used
+     *
+     * Note: The registered loader is left untouched.
+     *
+     * @public
+     *
+     */
+
+  }, {
+    key: 'reset',
+    value: function reset() {
+      var _iteratorNormalCompletion5 = true;
+      var _didIteratorError5 = false;
+      var _iteratorError5 = undefined;
+
+      try {
+        for (var _iterator5 = this.nodes.values()[Symbol.iterator](), _step5; !(_iteratorNormalCompletion5 = (_step5 = _iterator5.next()).done); _iteratorNormalCompletion5 = true) {
+          var node = _step5.value;
+
+          node.reset();
+        }
+
+        // if nothing has started yet
+        // there is no ioHandler
+      } catch (err) {
+        _didIteratorError5 = true;
+        _iteratorError5 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion5 && _iterator5.return) {
+            _iterator5.return();
+          }
+        } finally {
+          if (_didIteratorError5) {
+            throw _iteratorError5;
+          }
+        }
+      }
+
+      if (this.ioHandler) {
+        this.ioHandler.reset();
+      }
+
+      return this;
+    }
+  }, {
+    key: 'clear',
+    value: function clear(cb) {
+      if (!cb) {
+        throw Error('clear expects a callback');
+      }
+
+      var self = this;
+      var cnt = 0;
+      var total = this.nodes.size;
+
+      function removeNodeHandler() {
+        cnt++;
+        if (cnt === total) {
+          self.nodes = {};
+          cb();
+        }
+      }
+
+      if (total === 0) {
+        cb();
+      } else {
+        // remove node will automatically remove all links
+        var _iteratorNormalCompletion6 = true;
+        var _didIteratorError6 = false;
+        var _iteratorError6 = undefined;
+
+        try {
+          for (var _iterator6 = this.nodes.values()[Symbol.iterator](), _step6; !(_iteratorNormalCompletion6 = (_step6 = _iterator6.next()).done); _iteratorNormalCompletion6 = true) {
+            var node = _step6.value;
+
+            // will remove links also.
+            this.removeNode(node.id, removeNodeHandler);
+          }
+        } catch (err) {
+          _didIteratorError6 = true;
+          _iteratorError6 = err;
+        } finally {
+          try {
+            if (!_iteratorNormalCompletion6 && _iterator6.return) {
+              _iterator6.return();
+            }
+          } finally {
+            if (_didIteratorError6) {
+              throw _iteratorError6;
             }
           }
         }
       }
     }
+  }]);
+
+  return Control;
+})();
+
+module.exports = Control;
+//# sourceMappingURL=control.js.map
+
+},{"../connector":20,"./status":19,"debug":"V4HZ/5"}],14:[function(require,module,exports){
+'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var Packet = require('../packet');
+var Connector = require('../connector');
+
+var IIP = (function () {
+  function IIP() {
+    _classCallCheck(this, IIP);
   }
 
-  // allow instance to overwrite other node definition data also.
-  // probably make much more overwritable, although many
-  // should not be overwritten, so maybe just keep it this way.
-  if (node.title) {
-    def.title = node.title;
-  }
+  _createClass(IIP, [{
+    key: 'sendIIPs',
 
-  if (node.description) {
-    def.description = node.description;
-  }
+    /**
+     *
+     * Send IIPs
+     *
+     * Optionally with `options` for the port:
+     *
+     * e.g. { persist: true }
+     *
+     * Optionally with `source` information
+     *
+     * e.g. { index: 1 } // index for array port
+     *
+     * @param {Object} iips
+     * @public
+     */
+    value: function sendIIPs(iips) {
+      var self = this;
 
-  var identifier = node.title || [
-    node.ns, '::', node.name, '-',
-    Object.keys(this.nodes).length
-  ].join('');
+      var links = [];
 
-  if (def.type === 'flow') {
+      iips.forEach(function (iip) {
+        var xLink = self.createLink({
+          source: {
+            id: self.id, // we are the sender
+            port: ':iip'
+          },
+          target: iip.target
+        });
 
-    var xFlow = require('./flow'); // solve circular reference.
+        // dispose after fill
+        xLink.set('dispose', true);
 
-    validate.flow(def);
-
-    this.nodes[node.id] = new xFlow(
-      node.id,
-      def,
-      identifier,
-      this.loader, // single(ton) instance (TODO: di)
-      this.ioHandler, // single(ton) instance
-      this.processManager // single(ton) instance
-    );
-    debug('%s: created %s', this.identifier, this.nodes[node.id].identifier);
-
-  }
-  else {
-
-    var cls = def.type || 'xNode';
-
-    if (nodeTypes.hasOwnProperty(cls)) {
-
-      validate.nodeDefinition(def);
-
-      this.nodes[node.id] = new nodeTypes[cls](
-        node.id,
-        def,
-        identifier,
-        this.ioHandler.CHI
-      );
-
-      debug('%s: created %s', this.identifier, this.nodes[node.id].identifier);
-
-      // register and set pid, xFlow/actor adds itself to it (hack)
-      this.processManager.register(this.nodes[node.id]);
-
-    }
-    else {
-
-      throw Error(
-        util.format('Unknown node type: `%s`', cls)
-      );
-
-    }
-
-  }
-
-  // add parent to both xflow's and node's
-  // not very pure seperation, but it's just very convenient
-  this.nodes[node.id].setParent(this);
-
-  if (node.provider) {
-    this.nodes[node.id].provider = node.provider;
-  }
-
-  // TODO: move this to something more general.
-  // not on every node creation.
-  if (!this.contextProvider) {
-    this.addContextProvider(new DefaultContextProvider());
-  }
-
-  this.contextProvider.addContext(
-    this.nodes[node.id],
-    node.context
-  );
-
-  function nodeOutputHandlerActor(event) {
-    self.ioHandler.output(event);
-  }
-
-  this.nodes[node.id].on('output', nodeOutputHandlerActor);
-
-  this.nodes[node.id].on('freePort', function freePortHandlerActor(event) {
-
-    var links;
-    var i;
-
-    debug('%s:%s freePortHandler', self.identifier, event.port);
-
-    // get all current port connections
-    links = this.portGetConnections(event.port);
-
-    if (links.length) {
-
-      for (i = 0; i < links.length; i++) {
-
-        var link = links[i];
-
-        // unlock if it was locked
-        if (self.ioHandler.queueManager.isLocked(link.ioid)) {
-          self.ioHandler.queueManager.unlock(link.ioid);
+        if (iip.data === undefined) {
+          throw Error('IIP data is `undefined`');
         }
 
+        xLink.data = iip.data;
+
+        links.push(xLink);
+      });
+
+      links.forEach(function (iip) {
+        // TODO: this doesn't happen anymore it's always a link.
+        // make sure settings are always set also.
+        if (iip.target.constructor.name !== 'Connector') {
+          var target = new Connector();
+          target.plug(iip.target.id, iip.target.port);
+          for (var key in iip.target.setting) {
+            if (iip.target.setting.hasOwnProperty(key)) {
+              target.set(key, iip.target.setting[key]);
+            }
+          }
+          iip.target = target;
+        }
+
+        if (!self.id) {
+          throw Error('Actor must contain an id');
+        }
+
+        self.addLink(iip);
+      });
+
+      links.forEach(function (link) {
+        self.ioHandler.emit('send', link);
+
+        // Packet owned by the link
+        var p = new Packet(link,
+        //JSON.parse(JSON.stringify(link.data)),
+        link.data, self.getNode(link.target.id).getPortType('input', link.target.port));
+
+        // a bit too direct, ioHandler should do this..
+        self.ioHandler.queueManager.queue(link.ioid, p);
+
+        // remove data bit.
+        delete link.data;
+      });
+
+      return links;
+    }
+
+    /*
+     * Send a single IIP to a port.
+     *
+     * Note: If multiple IIPs have to be send use sendIIPs instead.
+     *
+     * Source is mainly for testing, but essentially it allows you
+     * to imposter a sender as long as you send along the right
+     * id and source port name.
+     *
+     * Source is also used to set an index[] for array ports.
+     * However, if you send multiple iips for an array port
+     * they should be send as a group using sendIIPs
+     *
+     * This is because they should be added in reverse order.
+     * Otherwise the process will start too early.
+     *
+     * @param {Connector} target
+     * @param {Object} data
+     * @public
+     */
+
+  }, {
+    key: 'sendIIP',
+    value: function sendIIP(target, data) {
+
+      if (!this.id) {
+        throw Error('Actor must contain an id');
       }
 
-      if (event.link) {
+      if (undefined === data) {
+        throw Error('Refused to send IIP without data');
+      }
 
-        // remove the link belonging to this event
-        if (event.link.has('dispose')) {
+      var ln = {
+        source: {
+          id: this.id, // we are the sender
+          pid: this.pid,
+          port: ':iip'
+        },
+        target: target
+      };
 
-          // TODO: remove cyclic all together, just use core/forEach
-          //  this will cause bugs if you send multiple cyclics because
-          //  the port is never unplugged..
-          if (!event.link.target.has('cyclic')) {
-            self.removeLink(event.link);
+      var xLink = this.createLink(ln);
+      xLink.data = data;
+
+      // dispose after fill
+      xLink.set('dispose', true);
+
+      // makes use of xLink.data
+      this.addLink(xLink);
+
+      this.ioHandler.emit('send', xLink);
+
+      var p = new Packet(xLink,
+      //JSON.parse(JSON.stringify(xLink.data)),
+      xLink.data,
+      // target port type
+      this.getNode(xLink.target.id).getPortType('input', xLink.target.port));
+
+      this.ioHandler.queueManager.queue(xLink.ioid, p);
+
+      // remove data bit.
+      delete xLink.data;
+
+      return xLink;
+    }
+  }, {
+    key: 'clearIIP',
+    value: function clearIIP(link) {
+      var _iteratorNormalCompletion = true;
+      var _didIteratorError = false;
+      var _iteratorError = undefined;
+
+      try {
+        for (var _iterator = this.iips.values()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+          var oldLink = _step.value;
+
+          // source is always us so do not have to check it.
+          if ((oldLink.source.port === ':iip' || oldLink.target.port === link.target.port || oldLink.target.port === ':start' // huge uglyness
+          ) && oldLink.target.id === link.target.id) {
+
+            this.unplugNode(oldLink.target);
+
+            this.ioHandler.disconnect(oldLink);
+
+            this.iips.delete(oldLink.id);
+
+            // TODO: just rename this to clearIIP
+            this.emit('removeIIP', oldLink);
+          }
+        }
+      } catch (err) {
+        _didIteratorError = true;
+        _iteratorError = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion && _iterator.return) {
+            _iterator.return();
+          }
+        } finally {
+          if (_didIteratorError) {
+            throw _iteratorError;
+          }
+        }
+      }
+    }
+
+    /**
+     *
+     * Clear IIPs
+     *
+     * If target is specified, only those iips will be cleared.
+     *
+     */
+
+  }, {
+    key: 'clearIIPs',
+    value: function clearIIPs(target) {
+      var _iteratorNormalCompletion2 = true;
+      var _didIteratorError2 = false;
+      var _iteratorError2 = undefined;
+
+      try {
+        for (var _iterator2 = this.iips.values()[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+          var iip = _step2.value;
+
+          if (!target || target.id === iip.target.id && target.port === iip.target.port) {
+            this.clearIIP(iip);
+          }
+        }
+      } catch (err) {
+        _didIteratorError2 = true;
+        _iteratorError2 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion2 && _iterator2.return) {
+            _iterator2.return();
+          }
+        } finally {
+          if (_didIteratorError2) {
+            throw _iteratorError2;
+          }
+        }
+      }
+    }
+  }]);
+
+  return IIP;
+})();
+
+module.exports = IIP;
+//# sourceMappingURL=iip.js.map
+
+},{"../connector":20,"../packet":31}],15:[function(require,module,exports){
+'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var xLink = require('../link');
+var debug = require('debug')('chix:actor');
+var util = require('util');
+
+var Link = (function () {
+  function Link() {
+    _classCallCheck(this, Link);
+  }
+
+  _createClass(Link, [{
+    key: 'createLink',
+
+    /**
+     *
+     * Creates a new connection/link
+     *
+     * Basically takes a plain link object
+     * and creates a proper xLink from it.
+     *
+     * The internal map holds xLinks, whereas
+     * the source map is just plain JSON.
+     *
+     * Structurewise they are almost the same.
+     *
+     * @param {Object} ln
+     * @return {xLink} link
+     * @public
+     *
+     */
+    value: function createLink(ln) {
+      return xLink.create(ln);
+    }
+
+    /**
+     *
+     * Adds a link
+     *
+     * @param {xLink} link
+     */
+
+  }, {
+    key: 'addLink',
+    value: function addLink(link) {
+      debug('%s: addLink()', this.identifier);
+
+      if (link.constructor.name !== 'Link') {
+        throw Error('Link must be of type Link');
+      }
+
+      if (link.source.id !== this.id) {
+        // Warn: IIP has our own id
+        var sourceNode = this.getNode(link.source.id);
+        if (!sourceNode.portExists('output', link.source.port)) {
+          throw Error(util.format('Source node (%s:%s) does not have an output port named `%s`\n\n' + '\tOutput ports available:\t%s\n', sourceNode.ns, sourceNode.name, link.source.port, Object.keys(sourceNode.ports.output).join(', ')));
+        }
+      }
+
+      var targetNode = this.getNode(link.target.id);
+      if (link.target.port !== ':start' && !targetNode.portExists('input', link.target.port)) {
+        throw Error(util.format('Target node (%s:%s) does not have an input port named `%s`\n\n' + '\tInput ports available:\t%s\n', targetNode.ns, targetNode.name, link.target.port, Object.keys(targetNode.ports.input).join(', ')));
+      }
+
+      // const targetNode = this.getNode(link.target.id);
+
+      // FIXME: rewriting sync property
+      // to contain the process id of the node it's pointing
+      // to not just the nodeId defined within the graph
+      if (link.target.has('sync')) {
+        link.target.set('sync', this.getNode(link.target.get('sync')).pid);
+      }
+
+      link.graphId = this.id;
+      link.graphPid = this.pid;
+
+      var self = this;
+
+      var dataHandler = function dataHandler(p) {
+        if (!this.ioid) {
+          throw Error('LINK MISSING IOID');
+        }
+
+        self.__input(this, p);
+      };
+
+      link.on('data', dataHandler);
+
+      if (link.source.id) {
+        if (link.source.id === this.id) {
+          link.setSourcePid(this.pid || this.id);
+        } else {
+          link.setSourcePid(this.getNode(link.source.id).pid);
+        }
+      }
+
+      link.setTargetPid(this.getNode(link.target.id).pid);
+
+      // remember our own links, so we can remove them
+      // if it has data it's an iip
+      if (undefined !== link.data) {
+        this.iips.set(link.id, link);
+      } else {
+        this.links.set(link.id, link);
+      }
+
+      this.ioHandler.connect(link);
+
+      this.plugNode(link.target);
+
+      link.on('change', function changeLink(link) {
+        self.emit('changeLink', link);
+      });
+
+      // bit inconsistent with event.node
+      // should be event.link
+      this.emit('addLink', link);
+
+      // this.ensureConnectionNumbering();
+      return link;
+    }
+  }, {
+    key: 'getLink',
+    value: function getLink(id) {
+      return this.links.get(id);
+    }
+
+    /**
+     *
+     * @param ln
+     * @returns {*}
+     */
+
+  }, {
+    key: 'findLink',
+    value: function findLink(ln) {
+      return Array.from(this.links).find(function (link) {
+        if (ln.source.id === link.source.id && ln.target.id === link.target.id && ln.source.port === link.source.port && ln.target.port === link.target.port) {
+          return (!ln.source.setting.index || ln.source.setting.index === link.source.setting.index) && (!ln.target.setting.index || ln.target.setting.index === link.target.setting.index);
+        }
+      });
+    }
+
+    /**
+     *
+     * Removes link
+     *
+     * @param {Link} ln
+     * @public
+     *
+     */
+
+  }, {
+    key: 'removeLink',
+    value: function removeLink(ln) {
+      // we should be able to find a link without id.
+      var what = 'links';
+
+      var link = this.links.get(ln.id);
+      if (!link) {
+        link = this.iips.get(ln.id);
+        if (!link) {
+          //throw Error('Cannot find link');
+          // TODO: Seems to happen with ip directly to subgraph (non-fatal)
+          console.warn('FIXME: cannot find link');
+          return this;
+        }
+        what = 'iips';
+      }
+
+      this.unplugNode(link.target);
+
+      this.ioHandler.disconnect(link);
+
+      // io handler could do this.
+      // removelink on the top-level actor/graph
+      // is not very useful
+
+      if (this[what].has(link.id)) {
+        var oldLink = this[what].get(link.id);
+
+        this[what].delete(link.id);
+
+        this.emit('removeLink', oldLink);
+
+        return this;
+      }
+      throw Error('Unable to remove link with id: ' + link.id);
+    }
+  }]);
+
+  return Link;
+})();
+
+module.exports = Link;
+//# sourceMappingURL=link.js.map
+
+},{"../link":26,"debug":"V4HZ/5","util":6}],16:[function(require,module,exports){
+'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var xNode = require('../node');
+var DefaultContextProvider = require('../context/defaultProvider');
+var validate = require('../validate');
+var debug = require('debug')('chix:actor');
+var util = require('util');
+
+var Node = (function () {
+  function Node() {
+    _classCallCheck(this, Node);
+  }
+
+  _createClass(Node, [{
+    key: 'createNode',
+
+    /**
+     *
+     * Create/instantiate  a node
+     *
+     * Node at this stage is nothing more then:
+     *
+     *  { ns: "fs", name: "readFile" }
+     *
+     * @param {Object} node - Node as defined within a map
+     * @param {Object} def  - Node Definition
+     *
+     * @public
+     */
+    value: function createNode(node, def) {
+      var self = this;
+
+      if (!def) {
+        throw new Error(util.format('Failed to get node definition for %s:%s', node.ns, node.name));
+      }
+
+      if (!node.id) {
+        throw Error('Node should have an id');
+      }
+
+      if (!def.ports) {
+        def.ports = {};
+      }
+      // merges expose, persist etc, with port definitions.
+      // This is not needed with proper inheritance
+      for (var type in node.ports) {
+        if (node.ports.hasOwnProperty(type) && def.ports.hasOwnProperty(type)) {
+          for (var name in node.ports[type]) {
+            if (node.ports[type].hasOwnProperty(name) && def.ports[type].hasOwnProperty(name)) {
+
+              for (var property in node.ports[type][name]) {
+                if (node.ports[type][name].hasOwnProperty(property)) {
+                  // add or overwrite it.
+                  def.ports[type][name][property] = node.ports[type][name][property];
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // allow instance to overwrite other node definition data also.
+      // probably make much more overwritable, although many
+      // should not be overwritten, so maybe just keep it this way.
+      if (node.title) {
+        def.title = node.title;
+      }
+
+      if (node.description) {
+        def.description = node.description;
+      }
+
+      var identifier = node.title || [node.ns, '::', node.name, '-', this.nodes.size].join('');
+
+      var _node = undefined;
+
+      if (def.type === 'flow') {
+        var xFlow = require('../flow'); // solve circular reference.
+
+        validate.flow(def);
+
+        _node = new xFlow(node.id, def, identifier, this.loader, // single(ton) instance (TODO: di)
+        this.ioHandler, // single(ton) instance
+        this.processManager // single(ton) instance
+        );
+
+        this.nodes.set(node.id, _node);
+
+        debug('%s: created %s', this.identifier, _node.identifier);
+      } else {
+        var cls = def.type || 'xNode';
+
+        if (Node.nodeTypes.hasOwnProperty(cls)) {
+          validate.nodeDefinition(def);
+
+          _node = new Node.nodeTypes[cls](node.id, def, identifier, this.ioHandler.CHI);
+
+          this.nodes.set(node.id, _node);
+
+          debug('%s: created %s', this.identifier, _node.identifier);
+
+          // register and set pid, xFlow/actor adds itself to it (hack)
+          this.processManager.register(this.nodes.get(node.id));
+        } else {
+          throw Error(util.format('Unknown node type: `%s`', cls));
+        }
+      }
+
+      // add parent to both xflow's and node's
+      // not very pure seperation, but it's just very convenient
+      _node.setParent(this);
+
+      if (node.provider) {
+        _node.provider = node.provider;
+      }
+
+      // TODO: move this to something more general.
+      // not on every node creation.
+      if (!this.contextProvider) {
+        this.addContextProvider(new DefaultContextProvider());
+      }
+
+      this.contextProvider.addContext(_node, node.context);
+
+      function nodeOutputHandlerActor(event) {
+        self.ioHandler.output(event);
+      }
+
+      _node.after('output', nodeOutputHandlerActor);
+
+      _node.on('freePort', function freePortHandlerActor(event) {
+        var links = undefined;
+        var i = undefined;
+
+        debug('%s:%s freePortHandler', self.identifier, event.port);
+
+        // get all current port connections
+        links = this.portGetConnections(event.port);
+
+        if (links.length) {
+          for (i = 0; i < links.length; i++) {
+            var link = links[i];
+
+            // unlock if it was locked
+            if (self.ioHandler.queueManager.isLocked(link.ioid)) {
+              self.ioHandler.queueManager.unlock(link.ioid);
+            }
+          }
+
+          if (event.link) {
+            // remove the link belonging to this event
+            if (event.link.has('dispose')) {
+
+              // TODO: remove cyclic all together, just use core/forEach
+              //  this will cause bugs if you send multiple cyclics because
+              //  the port is never unplugged..
+              if (!event.link.target.has('cyclic')) {
+                self.removeLink(event.link);
+              }
+            }
+          }
+        }
+      });
+
+      this.emit('addNode', { node: _node });
+
+      return _node;
+    }
+
+    /**
+     *
+     * Plugs a source into a target node
+     *
+     *
+     * @param {Connector} target
+     */
+
+  }, {
+    key: 'plugNode',
+    value: function plugNode(target) {
+      return this.getNode(target.id).plug(target);
+    }
+
+    /**
+     *
+     * Unplugs a port for the node specified.
+     *
+     * @param {Connector} target
+     */
+
+  }, {
+    key: 'unplugNode',
+    value: function unplugNode(target) {
+      // could be gone, if called from freePort
+      // when nodes are being removed.
+      if (this.hasNode(target.id)) {
+        return this.getNode(target.id).unplug(target);
+      }
+
+      return false;
+    }
+
+    /**
+     *
+     * Adds a node to the map.
+     *
+     * The object format is like it's defined within a map.
+     *
+     * Right now this is only used during map loading.
+     *
+     * For dynamic loading care should be taken to make
+     * this node resolvable by the loader.
+     *
+     * Which means the definition should either be found
+     * at the default location defined within the map.
+     * Or the node itself should carry provider information.
+     *
+     * A provider can be defined as:
+     *
+     *  - url:        https://serve.rhcloud.com/flows/{ns}/{name}
+     *  - file:       ./{ns}/{name}
+     *  - namespace:  MyNs
+     *
+     * Namespaces are defined within the map, so MyNs will point to
+     * either the full url or filesystem location.
+     *
+     * Once a map is loaded _all_ nodes will carry the full url individually.
+     * The namespace is just their to simplify the json format and for ease
+     * of maintainance.
+     *
+     *
+     * @param {Object} node
+     * @public
+     *
+     */
+
+  }, {
+    key: 'addNode',
+    value: function addNode(node) {
+      this.createNode(node);
+
+      return this;
+    }
+
+    /**
+     *
+     * Renames a node
+     *
+     * Renames the id of a node.
+     * This should not rename the real id.
+     *
+     * @param {string} nodeId
+     * @param {function} cb
+     * @public
+     */
+
+  }, {
+    key: 'renameNode',
+    value: function renameNode(nodeId, cb) {
+      console.log(nodeId, cb);
+    }
+
+    /**
+     *
+     * Removes a node
+     *
+     * @param {string} nodeId
+     * @param {function} cb
+     * @public
+     */
+
+  }, {
+    key: 'removeNode',
+    value: function removeNode(nodeId, cb) {
+      var self = this;
+      var _iteratorNormalCompletion = true;
+      var _didIteratorError = false;
+      var _iteratorError = undefined;
+
+      try {
+        for (var _iterator = this.links.values()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+          var link = _step.value;
+
+          if (link.source.id === nodeId || link.target.id === nodeId) {
+            this.removeLink(link);
           }
         }
 
-      }
-
-    }
-
-  });
-
-  this.emit('addNode', {
-    node: this.nodes[node.id]
-  });
-
-  return this.nodes[node.id];
-
-};
-
-/**
- *
- * Plugs a source into a target node
- *
- *
- * @param {Connector} target
- */
-Actor.prototype.plugNode = function(target) {
-
-  return this.getNode(target.id).plug(target);
-
-};
-
-/**
- *
- * Unplugs a port for the node specified.
- *
- * @param {Connector} target
- */
-Actor.prototype.unplugNode = function(target) {
-
-  // could be gone, if called from freePort
-  // when nodes are being removed.
-  if (this.hasNode(target.id)) {
-    return this.getNode(target.id).unplug(target);
-  }
-
-  return false;
-
-};
-
-/**
- *
- * Holds a Node
- *
- * @param {String} id
- * @api public
- */
-Actor.prototype.hold = function(id) {
-
-  this.getNode(id).hold();
-
-  return this;
-
-};
-
-/**
- *
- * Starts the actor
- *
- * @param {Boolean} push
- * @api public
- */
-Actor.prototype.start = function(push) {
-
-  this.status = Status.RUNNING;
-
-  debug('%s: start', this.identifier);
-
-  // TODO: this means IIPs should be send after start.
-  //       enforce this..
-  this.clearIIPs();
-
-  // start all nodes
-  // (could also be started during addMap
-  // runtime is skipping addMap.
-  // so make sure start() is restartable.
-  for (var id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      this.getNode(id).start();
-    }
-  }
-
-  if (push !== false) {
-    this.push();
-  }
-
-  // there are many other ways to start
-  // so this does not ensure much.
-  // however the process manager listens to this.
-  // Real determination if something is started or stopped
-  // includes the ioHandler.
-  // So let's just inform the io handler we are started.
-
-  this.emit('start', {
-    node: this
-  });
-
-  return this;
-
-};
-
-/**
- *
- * Stops the actor
- *
- * Use a callback to make sure it is stopped.
- *
- * @api public
- */
-Actor.prototype.stop = function(cb) {
-
-  var self = this;
-
-  this.status = Status.STOPPED;
-
-  if (this.ioHandler) {
-
-    this.ioHandler.reset(function resetCallbackIoHandler() {
-
-      // close ports opened by iips
-      self.clearIIPs();
-
-      self.emit('stop', {
-        node: self
-      });
-
-      if (cb) {
-        cb();
-      }
-
-    });
-
-  }
-
-};
-
-Actor.prototype.pause = function() {
-
-  this.status = Status.STOPPED;
-
-  for (var id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      this.getNode(id).hold();
-    }
-  }
-
-  return this;
-
-};
-
-/**
- *
- * Resumes the actor
- *
- * All nodes which are on hold will resume again.
- *
- * @api public
- */
-Actor.prototype.resume = function() {
-
-  this.status = Status.RUNNING;
-
-  for (var id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      this.getNode(id).release();
-    }
-  }
-
-  return this;
-
-};
-
-/**
- *
- * Get the current status
- *
- * @api public
- */
-Actor.prototype.getStatus = function() {
-  return this.status;
-};
-
-/**
- *
- * Create an actor
- *
- * @api public
- */
-Actor.create = function(map, loader, ioHandler, processManager) {
-
-  var actor = new Actor();
-  loader = loader || new Loader();
-  processManager = processManager || new DefaultProcessManager();
-  ioHandler = ioHandler || new IoMapHandler();
-  actor.addLoader(loader);
-  actor.addIoHandler(ioHandler);
-  actor.addProcessManager(processManager);
-  actor.addMap(map);
-
-  return actor;
-};
-
-/**
- *
- * Releases a node if it was on hold
- *
- * @param {String} id
- * @api public
- */
-Actor.prototype.release = function(id) {
-  return this.getNode(id).release();
-};
-
-/**
- *
- * Pushes the Actor
- *
- * Will send :start to all nodes without input
- * and all nodes which have all their input ports
- * filled by context already.
- *
- * @api public
- */
-Actor.prototype.push = function() {
-
-  this.status = Status.RUNNING;
-  debug('%s: push()', this.identifier);
-
-  for (var id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      var node = this.getNode(id);
-      if (node.isStartable()) {
-        var iip = new Connector();
-        iip.plug(id, ':start');
-        this.sendIIP(iip, '');
-      }
-      else {
-        debug('%s: `%s` not startable', this.identifier, node.identifier);
-      }
-    }
-  }
-
-  return this;
-};
-
-/**
- *
- * Adds the definition Loader
- *
- * This provides an api to get the required node definitions.
- *
- * The loader should already be init'ed
- *
- * e.g. the remote loader will already have loaded the definitions.
- * and is ready to respond to getNodeDefinition(ns, name, type, provider)
- *
- * e.g. An async loader could do something like this:
- *
- *   loader(flow, function() { actor.addLoader(loader); }
- *
- * With a sync loader it will just look like:
- *
- * actor.addLoader(loader);
- *
- * @api public
- */
-Actor.prototype.addLoader = function(loader) {
-  this.loader = loader;
-  return this;
-};
-
-Actor.prototype.setLoader = Actor.prototype.addLoader;
-
-/**
- *
- * Validate and read map
- *
- * @param {Object} map
- * @api public
- *
- */
-Actor.prototype.addMap = function(map) {
-
-  debug('%s: addMap()', this.identifier);
-
-  var i;
-  var self = this;
-
-  if (typeof map === 'undefined') {
-    throw new Error('map is not defined');
-  }
-
-  if (map !== Object(map)) {
-    throw new Error('addMap expects an object');
-  }
-
-  try {
-    validate.flow(map);
-  }
-  catch (e) {
-    if (map.title) {
-      throw Error(
-        util.format('Flow `%s`: %s', map.title, e.message)
-      );
-    }
-    else {
-      throw Error(
-        util.format('Flow %s:%s: %s', map.ns, map.name, e.message)
-      );
-    }
-  }
-
-  if (map.id) {
-    // xFlow contains it, direct actors don't perse
-    this.id = map.id;
-  }
-
-  // add ourselves (actor/xFlow) to the processmanager
-  // this way links can store our id and pid
-  // must be done *before* adding our nodes.
-  // otherwise our nodes will be registered before ourselves.
-  if (!this.pid) { // re-run
-    this.processManager.register(this);
-  }
-
-  // allow a map to carry it's own definitions
-  if (map.nodeDefinitions) {
-    this.loader.addNodeDefinitions('@', map.nodeDefinitions);
-  }
-
-  // add nodes and links one by one so there is more control
-  map.nodes.forEach(function(node) {
-
-    if (!node.id) {
-      throw new Error(
-        util.format('Node lacks an id: %s:%s', node.ns, node.name)
-      );
-    }
-
-    // give the node a default provider.
-    if (!node.provider) {
-      if (map.providers && map.providers.hasOwnProperty('@')) {
-        node.provider = map.providers['@'].url;
-      }
-    }
-
-    var def = self.loader.getNodeDefinition(node, map);
-    if (!def) {
-
-      throw new Error(
-        util.format(
-          'Failed to get node definition for %s:%s', node.ns, node.name
-        )
-      );
-    }
-
-    self.createNode(node, def);
-
-  });
-
-  // this.ensureConnectionNumbering(map);
-
-  if (map.hasOwnProperty('links')) {
-    map.links.forEach(function(link) {
-      self.addLink(
-        self.createLink(link)
-      );
-    });
-  }
-
-  for (i = 0; i < map.nodes.length; i++) {
-    this.view.push(map.nodes[i].id);
-  }
-
-  /*
-    Disabled. Actor.start() does this and xFlow.start()
-    will start all their nodes, and then goes recursive.
-
-    // all nodes & links setup, run start method on node
-    for (var id in this.nodes) {
-      if (this.nodes.hasOwnProperty(id)) {
-        this.getNode(id).start();
-      }
-    }
-  */
-
-  return this;
-
-};
-
-/**
- *
- * Used by the process manager to set our id
- *
- */
-Actor.prototype.setPid = function(pid) {
-  this.pid = pid;
-};
-
-/**
- *
- * Adds a node to the map.
- *
- * The object format is like it's defined within a map.
- *
- * Right now this is only used during map loading.
- *
- * For dynamic loading care should be taken to make
- * this node resolvable by the loader.
- *
- * Which means the definition should either be found
- * at the default location defined within the map.
- * Or the node itself should carry provider information.
- *
- * A provider can be defined as:
- *
- *  - url:        https://serve.rhcloud.com/flows/{ns}/{name}
- *  - file:       ./{ns}/{name}
- *  - namespace:  MyNs
- *
- * Namespaces are defined within the map, so MyNs will point to
- * either the full url or filesystem location.
- *
- * Once a map is loaded _all_ nodes will carry the full url individually.
- * The namespace is just their to simplify the json format and for ease
- * of maintainance.
- *
- *
- * @param {Object} node
- * @api public
- *
- */
-Actor.prototype.addNode = function(node) {
-
-  this.createNode(node);
-
-  return this;
-};
-
-/**
- *
- * Creates a new connection/link
- *
- * Basically takes a plain link object
- * and creates a proper xLink from it.
- *
- * The internal map holds xLinks, whereas
- * the source map is just plain JSON.
- *
- * Structurewise they are almost the same.
- *
- * @param {Object} ln
- * @return {xLink} link
- * @api public
- *
- */
-Actor.prototype.createLink = function(ln) {
-
-  return xLink.create(ln);
-
-};
-
-/**
- *
- * Adds a link
- *
- * @param {xLink} link
- */
-Actor.prototype.addLink = function(link) {
-
-  debug('%s: addLink()', this.identifier);
-
-  if (link.constructor.name !== 'Link') {
-    throw Error('Link must be of type Link');
-  }
-
-  if (link.source.id !== this.id) { // Warn: IIP has our own id
-    var sourceNode = this.getNode(link.source.id);
-    if (!sourceNode.portExists('output', link.source.port)) {
-      throw Error(util.format(
-        'Source node (%s:%s) does not have an output port named `%s`\n\n' +
-        '\tOutput ports available:\t%s\n',
-        sourceNode.ns,
-        sourceNode.name,
-        link.source.port,
-        Object.keys(sourceNode.ports.output).join(', ')
-      ));
-    }
-  }
-
-  var targetNode = this.getNode(link.target.id);
-  if (link.target.port !== ':start' &&
-    !targetNode.portExists('input', link.target.port)
-  ) {
-    throw Error(
-      util.format(
-        'Target node (%s:%s) does not have an input port named `%s`\n\n' +
-        '\tInput ports available:\t%s\n',
-        targetNode.ns,
-        targetNode.name,
-        link.target.port,
-        Object.keys(targetNode.ports.input).join(', ')
-      )
-    );
-  }
-
-  // var targetNode = this.getNode(link.target.id);
-
-  // FIXME: rewriting sync property
-  // to contain the process id of the node it's pointing
-  // to not just the nodeId defined within the graph
-  if (link.target.has('sync')) {
-    link.target.set('sync', this.getNode(link.target.get('sync')).pid);
-  }
-
-  link.graphId = this.id;
-  link.graphPid = this.pid;
-
-  var self = this;
-
-  var dataHandler = function dataHandler(p) {
-    if (!this.ioid) {
-      throw Error('LINK MISSING IOID');
-    }
-
-    self.__input(this, p);
-  };
-
-  link.on('data', dataHandler);
-
-  if (link.source.id) {
-    if (link.source.id === this.id) {
-      link.setSourcePid(this.pid || this.id);
-    }
-    else {
-      link.setSourcePid(this.getNode(link.source.id).pid);
-    }
-  }
-
-  link.setTargetPid(this.getNode(link.target.id).pid);
-
-  // remember our own links, so we can remove them
-  // if it has data it's an iip
-  if (undefined !== link.data) {
-    this.iips[link.id] = link;
-  }
-  else {
-    this.links[link.id] = link;
-  }
-
-  this.ioHandler.connect(link);
-
-  this.plugNode(link.target);
-
-  link.on('change', function changeLink(link) {
-    self.emit('changeLink', link);
-  });
-
-  // bit inconsistent with event.node
-  // should be event.link
-  this.emit('addLink', link);
-
-  // this.ensureConnectionNumbering();
-  return link;
-
-};
-
-Actor.prototype.getLink = function(id) {
-  return this.links[id];
-};
-
-Actor.prototype.unlockConnections = function(node) {
-
-  // fix this, flow connections setup is different
-  var conns = node.getConnections();
-  for (var port in conns) {
-    if (conns.hasOwnProperty(port)) {
-      for (var i = 0; i < conns[port].length; i++) {
-        this.ioHandler.unlock(conns[port][i]);
-      }
-    }
-  }
-
-};
-
-Actor.prototype.__input = function(link, p) {
-
-  var self = this;
-
-  this.ioHandler.lock(link);
-
-  var targetNode = this.getNode(link.target.id);
-
-  // give owner ship to targetNode
-  p.setOwner(targetNode);
-
-  var ret = targetNode.fill(link.target, p);
-
-  // breakpoint
-  if (util.isError(ret)) {
-
-    // `hard reject`
-    // set node in error state and output error to ioManager
-    targetNode.error(ret);
-
-    p.release(targetNode);
-    p.setOwner(link);
-
-    debug('%s: reject %s', this.identifier, ret);
-    self.ioHandler.reject(ret, link, p);
-
-  }
-  else if (ret === false) {
-
-    p.release(targetNode);
-    p.setOwner(link);
-
-    // something should unlock.
-    // having this reject unlock it is too much free form.
-    debug(
-      '%s: `%s` soft reject re-queue',
-      this.identifier,
-      targetNode.identifier
-    );
-    // `soft reject`
-    self.ioHandler.reject(ret, link, p);
-
-  }
-  else {
-
-    // unlock *all* queues targeting this node.
-    // the IOHandler can do this.
-    debug(
-      '%s: unlock all queues for `%s`',
-      this.identifier,
-      targetNode.identifier
-    );
-
-    self.unlockConnections(targetNode);
-
-    self.ioHandler.accept(link, p);
-  }
-
-};
-
-Actor.prototype.clearIIP = function(link) {
-
-  var id;
-  var oldLink;
-
-  for (id in this.iips) {
-
-    if (this.iips.hasOwnProperty(id)) {
-
-      oldLink = this.iips[id];
-
-      // source is always us so do not have to check it.
-      if ((
-          oldLink.source.port === ':iip' ||
-          oldLink.target.port === link.target.port ||
-          oldLink.target.port === ':start' // huge uglyness
-        ) &&
-        oldLink.target.id === link.target.id) {
-
-        this.unplugNode(oldLink.target);
-
-        this.ioHandler.disconnect(oldLink);
-
-        delete this.iips[oldLink.id];
-
-        // TODO: just rename this to clearIIP
-        this.emit('removeIIP', oldLink);
-
-      }
-
-    }
-  }
-
-};
-
-/**
- *
- * Clear IIPs
- *
- * If target is specified, only those iips will be cleared.
- *
- */
-Actor.prototype.clearIIPs = function(target) {
-
-  var id;
-  var iip;
-  for (id in this.iips) {
-    if (this.iips.hasOwnProperty(id)) {
-      iip = this.iips[id];
-      if (!target ||
-        (target.id === iip.target.id && target.port === iip.target.port)) {
-        this.clearIIP(this.iips[id]);
-      }
-    }
-  }
-};
-
-/**
- *
- * Renames a node
- *
- * Renames the id of a node.
- * This should not rename the real id.
- *
- * @param {string} nodeId
- * @param {function} cb
- * @api public
- */
-Actor.prototype.renameNode = function(/*nodeId, cb*/) {
-
-};
-
-/**
- *
- * Removes a node
- *
- * @param {string} nodeId
- * @param {function} cb
- * @api public
- */
-Actor.prototype.removeNode = function(nodeId, cb) {
-
-  var id;
-  var ln;
-  var self = this;
-  for (id in this.links) {
-    if (this.links.hasOwnProperty(id)) {
-
-      ln = this.links[id];
-
-      if (ln.source.id === nodeId ||
-        ln.target.id === nodeId) {
-        this.removeLink(ln);
-      }
-
-    }
-
-  }
-
-  // should wait for IO, especially there is a chance
-  // system events are still spitting.
-
-  // register and set pid
-  this.processManager.unregister(this.getNode(nodeId),
-    function unregisterHandlerActor() {
-
-      var oldNode = self.getNode(nodeId).export();
-
-      delete self.nodes[nodeId];
-
-      self.emit('removeNode', {
-        node: oldNode
-      });
-
-      if (cb) {
-        cb();
-      }
-
-    });
-
-};
-
-Actor.prototype.removeNodes = function() {
-
-  this.clear();
-
-};
-
-Actor.prototype.setMeta = function(nodeId, key, value) {
-
-  var node = this.getNode(nodeId);
-
-  node.setMeta(key, value);
-
-  this.emit('metadata', {
-    id: this.id,
-    node: node.export()
-  });
-
-};
-
-/**
- *
- * Removes link
- *
- * @param {Link} ln
- * @api public
- *
- */
-Actor.prototype.removeLink = function(ln) {
-
-  // we should be able to find a link without id.
-  var link;
-  var what = 'links';
-
-  link = this.links[ln.id];
-  if (!link) {
-    link = this.iips[ln.id];
-    if (!link) {
-      //throw Error('Cannot find link');
-      // TODO: Seems to happen with ip directly to subgraph (non-fatal)
-      console.warn('FIXME: cannot find link');
-      return;
-    }
-    what = 'iips';
-  }
-
-  this.unplugNode(link.target);
-
-  this.ioHandler.disconnect(link);
-
-  // io handler could do this.
-  // removelink on the top-level actor/graph
-  // is not very useful
-
-  var oldLink = this[what][link.id];
-
-  delete this[what][link.id];
-
-  this.emit('removeLink', oldLink);
-
-  return this;
-
-};
-
-/**
- *
- * Adds a port
- *
- * NOT IMPLEMENTED
- *
- * @api public
- */
-Actor.prototype.addPort = function() {
-
-  return this;
-
-};
-
-/**
- *
- * Removes a port
- *
- * NOT IMPLEMENTED
- *
- * @api public
- */
-Actor.prototype.removePort = function() {
-
-  return this;
-
-};
-
-/**
- *
- * Resets this instance so it can be re-used
- *
- * Note: The registered loader is left untouched.
- *
- * @api public
- *
- */
-Actor.prototype.reset = function() {
-
-  var id;
-
-  for (id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      this.getNode(id).reset();
-    }
-  }
-
-  // if nothing has started yet
-  // there is no ioHandler
-  if (this.ioHandler) {
-    this.ioHandler.reset();
-  }
-
-  return this;
-
-};
-
-Actor.prototype.clear = function(cb) {
-
-  if (!cb) {
-    throw Error('clear expects a callback');
-  }
-
-  var self = this;
-  var nodeId;
-  var cnt = 0;
-  var total = Object.keys(this.nodes).length;
-
-  if (total === 0) {
-    cb();
-  }
-
-  function removeNodeHandler() {
-      cnt++;
-      if (cnt === total) {
-        self.nodes = {};
-        cb();
-      }
-    }
-    // remove node will automatically remove all links
-  for (nodeId in this.nodes) {
-    if (this.nodes.hasOwnProperty(nodeId)) {
-      // will remove links also.
-      this.removeNode(nodeId, removeNodeHandler);
-    }
-  }
-
-};
-
-/**
- *
- * Add IO Handler.
- *
- * The IO Handler handles all the input and output.
- *
- * @param {IOHandler} handler
- * @api public
- *
- */
-Actor.prototype.addIoHandler = function(handler) {
-
-  this.ioHandler = handler;
-
-  return this;
-
-};
-
-Actor.prototype.setIoHandler = Actor.prototype.addIoHandler;
-
-/**
- *
- * Add Process Manager.
- *
- * The Process Manager holds all processes.
- *
- * @param {Object} manager
- * @api public
- *
- */
-Actor.prototype.addProcessManager = function(manager) {
-
-  this.processManager = manager;
-
-  return this;
-
-};
-
-Actor.prototype.setProcessManager = Actor.prototype.addProcessManager;
-
-/**
- *
- * Add a new context provider.
- *
- * A context provider pre-processes the raw context
- *
- * This is useful for example when using the command line.
- * All nodes which do not have context set can be asked for context.
- *
- * E.g. database credentials could be prompted for after which all
- *      input is fullfilled and the flow will start to run.
- *
- * @param {ContextProvider} provider
- * @api private
- *
- */
-Actor.prototype.addContextProvider = function(provider) {
-  this.contextProvider = provider;
-
-  return this;
-
-};
-
-Actor.prototype.setContextProvider = Actor.prototype.addContextProvider;
-
-/**
- *
- * Explains what input and output ports are
- * available for interaction.
- *
- */
-Actor.prototype.help = function() {
-
-};
-
-/**
- *
- * Send IIPs
- *
- * Optionally with `options` for the port:
- *
- * e.g. { persist: true }
- *
- * Optionally with `source` information
- *
- * e.g. { index: 1 } // index for array port
- *
- * @param {Object} iips
- * @api public
- */
-Actor.prototype.sendIIPs = function(iips) {
-
-  var self = this;
-
-  var links = [];
-
-  iips.forEach(function(iip) {
-
-    var xLink = self.createLink({
-      source: {
-        id: self.id, // we are the sender
-        port: ':iip'
-      },
-      target: iip.target
-    });
-
-    // dispose after fill
-    xLink.set('dispose', true);
-
-    if (iip.data === undefined) {
-      throw Error('IIP data is `undefined`');
-    }
-
-    xLink.data = iip.data;
-
-    links.push(xLink);
-
-  });
-
-  links.forEach(function(iip) {
-
-    // TODO: this doesn't happen anymore it's always a link.
-    // make sure settings are always set also.
-    if (iip.target.constructor.name !== 'Connector') {
-      var target = new Connector();
-      target.plug(iip.target.id, iip.target.port);
-      for (var key in iip.target.setting) {
-        if (iip.target.setting.hasOwnProperty(key)) {
-          target.set(key, iip.target.setting[key]);
+        // should wait for IO, especially there is a chance
+        // system events are still spitting.
+
+        // register and set pid
+      } catch (err) {
+        _didIteratorError = true;
+        _iteratorError = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion && _iterator.return) {
+            _iterator.return();
+          }
+        } finally {
+          if (_didIteratorError) {
+            throw _iteratorError;
+          }
         }
       }
-      iip.target = target;
-    }
 
-    if (!self.id) {
-      throw Error('Actor must contain an id');
-    }
+      this.processManager.unregister(this.getNode(nodeId), function unregisterHandlerActor() {
+        var oldNode = self.getNode(nodeId).export();
 
-    self.addLink(iip);
+        self.nodes.delete(nodeId);
 
-  });
-
-  links.forEach(function(link) {
-
-    self.ioHandler.emit('send', link);
-
-    // Packet owned by the link
-    var p = new Packet(
-      link,
-      JSON.parse(JSON.stringify(link.data)),
-      self.getNode(link.target.id).getPortType(link.target.port)
-    );
-
-    // a bit too direct, ioHandler should do this..
-    self.ioHandler.queueManager.queue(link.ioid, p);
-
-    // remove data bit.
-    delete link.data;
-  });
-
-  return links;
-
-};
-
-/*
- * Send a single IIP to a port.
- *
- * Note: If multiple IIPs have to be send use sendIIPs instead.
- *
- * Source is mainly for testing, but essentially it allows you
- * to imposter a sender as long as you send along the right
- * id and source port name.
- *
- * Source is also used to set an index[] for array ports.
- * However, if you send multiple iips for an array port
- * they should be send as a group using sendIIPs
- *
- * This is because they should be added in reverse order.
- * Otherwise the process will start too early.
- *
- * @param {Connector} target
- * @param {Object} data
- * @api public
- */
-Actor.prototype.sendIIP = function(target, data) {
-
-  if (!this.id) {
-    throw Error('Actor must contain an id');
-  }
-
-  if (undefined === data) {
-    throw Error('Refused to send IIP without data');
-  }
-
-  var ln = {
-    source: {
-      id: this.id, // we are the sender
-      pid: this.pid,
-      port: ':iip'
-    },
-    target: target
-  };
-
-  var xLink = this.createLink(ln);
-  xLink.data = data;
-
-  // dispose after fill
-  xLink.set('dispose', true);
-
-  // makes use of xLink.data
-  this.addLink(xLink);
-
-  this.ioHandler.emit('send', xLink);
-
-  var p = new Packet(
-    xLink,
-    JSON.parse(JSON.stringify(xLink.data)),
-    // target port type
-    this.getNode(xLink.target.id).getPortType(xLink.target.port)
-  );
-
-  this.ioHandler.queueManager.queue(xLink.ioid, p);
-
-  // remove data bit.
-  delete xLink.data;
-
-  return xLink;
-
-};
-
-/**
- *
- * Retrieve a node by it's process id
- *
- * @param {String} pid - Process ID
- * @return {Object} node
- * @api public
- */
-Actor.prototype.getNodeByPid = function(pid) {
-
-  var id;
-  var node;
-
-  for (id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      node = this.getNode(id);
-      if (node.pid === pid) {
-        return node;
-      }
-    }
-  }
-
-  return;
-};
-
-/**
- *
- * Get all node ids this node depends on.
- *
- * @param {String} nodeId
- * @return {Array} nodes
- * @api public
- */
-Actor.prototype.getAncestorIds = function(nodeId) {
-
-  var self = this;
-
-  var pids = this.ioHandler.getAncestorPids(
-    this.getNode(nodeId).pid
-  );
-
-  var ids = [];
-  pids.forEach(function(pid) {
-    ids.push(self.getNodeByPid(pid).id);
-  });
-  return ids;
-
-};
-
-/**
- *
- * Get the entire node branch this node depends on
- *
- * @param {String} nodeId
- * @return {Array} nodes
- * @api public
- */
-Actor.prototype.getAncestorNodes = function(nodeId) {
-  var i;
-  var nodes = [];
-  var ids = this.getAncestorIds(nodeId);
-
-  for (i = 0; i < ids.length; i++) {
-    nodes.push(this.getNode(ids[i]));
-  }
-
-  return nodes;
-};
-
-/**
- *
- * Get all node ids that target this node.
- *
- * @param {String} nodeId
- * @return {Array} ids
- * @api public
- */
-Actor.prototype.getSourceIds = function(nodeId) {
-
-  var self = this;
-  var ids = [];
-
-  var pids = this.ioHandler.getSourcePids(
-    this.getNode(nodeId).pid
-  );
-
-  pids.forEach(function(pid) {
-    var node = self.getNodeByPid(pid);
-    if (node) { // iips will not be found
-      ids.push(node.id);
-    }
-  });
-  return ids;
-
-};
-
-/**
- *
- * Get all nodes that target this node.
- *
- * @param {String} nodeId
- * @return {Array} nodes
- * @api public
- */
-Actor.prototype.getSourceNodes = function(nodeId) {
-
-  var i;
-  var nodes = [];
-  var ids = this.getSourceIds(nodeId);
-
-  for (i = 0; i < ids.length; i++) {
-    nodes.push(this.getNode(ids[i]));
-  }
-
-  return nodes;
-
-};
-
-/**
- *
- * Get all nodes that use this node as a source .
- *
- * @param {String} nodeId
- * @return {Array} ids
- * @api public
- */
-Actor.prototype.getTargetIds = function(nodeId) {
-
-  var self = this;
-
-  var pids = this.ioHandler.getTargetPids(
-    this.getNode(nodeId).pid
-  );
-
-  var ids = [];
-  pids.forEach(function(pid) {
-    ids.push(self.getNodeByPid(pid).id);
-  });
-  return ids;
-
-};
-
-/**
- *
- * Use is a generic way of creating a new instance of self
- * And only act upon a subset of our map.
- *
- *
- */
-Actor.prototype.use = function( /*name, context*/ ) {
-
-  throw Error('TODO: reimplement actions');
-  /*
-    var i;
-    var action;
-    var map = {};
-    var sub = new this.constructor();
-
-    // Use this handlers events also on the action.
-    sub._events = this._events;
-
-    // Find our action
-    if (!this.map.actions) {
-      throw new Error('This flow has no actions');
-    }
-
-    if (!this.map.actions.hasOwnProperty(name)) {
-      throw new Error('Action not found');
-    }
-
-    action = this.map.actions[name];
-
-    // Create a reduced map
-    map.env = this.map.env;
-    map.title =  action.title;
-    map.description = action.description;
-    map.ports = this.map.ports;
-    map.nodes = [];
-    map.links = [];
-
-    for (i = 0; i < this.map.nodes.length; i++) {
-      if (action.nodes.indexOf(this.map.nodes[i].id) >= 0) {
-        map.nodes.push(this.map.nodes[i]);
-      }
-    }
-
-    for (i = 0; i < this.map.links.length; i++) {
-      if (
-        action.nodes.indexOf(this.map.links[i].source.id) >= 0 &&
-        action.nodes.indexOf(this.map.links[i].target.id) >= 0) {
-        map.links.push(this.map.links[i]);
-      }
-    }
-
-    // re-use the loader
-    sub.addLoader(this.loader);
-
-    // add the nodes to our newly instantiated Actor
-    sub.addMap(map);
-
-    // hack to autostart it during run()
-    // this only makes sense with actions.
-    // TODO: doesn work anymore
-    // sub.trigger = action.nodes[0];
-
-    return sub;
-  */
-
-};
-
-/**
- *
- * Run the current flow
- *
- * The flow starts by providing the ports with their context.
- *
- * Nodes which have all their ports filled by context will run immediatly.
- *
- * Others will wait until their unfilled ports are filled by connections.
- *
- * Internally the node will be set to a `contextGiven` state.
- * It's a method to tell the node we expect it to have enough
- * information to start running.
- *
- * If a port is not required and context was given and there are
- * no connections on it, it will not block the node from running.
- *
- * If a map has actions defined, run expects an action name to run.
- *
- * Combinations:
- *
- *   - run()
- *     run flow without callback
- *
- *   - run(callback)
- *     run with callback
- *
- *   - action('actionName').run()
- *     run action without callback
- *
- *   - action('actionName').run(callback)
- *     run action with callback
- *
- * The callback will receive the output of the (last) node(s)
- * Determined by which output ports are exposed.
- *
- * If we pass the exposed output, it can contain output from anywhere.
- *
- * If a callback is defined but there are no exposed output ports.
- * The callback will never fire.
- *
- * @api public
- */
-Actor.prototype.run = function(callback) {
-
-  return new Run(this, callback);
-
-};
-/**
- *
- * Need to do it like this, we want the new sub actor
- * to be returned to place events on etc.
- *
- * Otherwise it's hidden within the actor itself
- *
- * Usage: Actor.action('action').run(callback);
- *
- */
-Actor.prototype.action = function(action, context) {
-
-  var sub = this.use(action, context);
-  return sub;
-
-};
-
-/**
- *
- * Get all nodes.
- *
- * TODO: unnecessary method
- *
- * @return {Object} nodes
- * @api public
- *
- */
-Actor.prototype.getNodes = function() {
-
-  return this.nodes;
-
-};
-
-/**
- *
- * Check if this node exists
- *
- * @param {String} id
- * @return {Object} node
- * @api public
- */
-Actor.prototype.hasNode = function(id) {
-
-  return this.nodes.hasOwnProperty(id);
-
-};
-
-/**
- *
- * Get a node by it's id.
- *
- * @param {String} id
- * @return {Object} node
- * @api public
- */
-Actor.prototype.getNode = function(id) {
-
-  if (this.nodes.hasOwnProperty(id)) {
-    return this.nodes[id];
-  }
-  else {
-    throw new Error(util.format('Node %s does not exist', id));
-  }
-
-};
-
-/**
- *
- * JSON Status report about the nodes.
- *
- * Mainly meant to debug after shutdown.
- *
- * Should handle all stuff one can think of
- * why `it` doesn't work.
- *
- */
-Actor.prototype.report = function() {
-
-  var link;
-  var node;
-  var id;
-  var size;
-  var qm = this.ioHandler.queueManager;
-
-  var report = {
-    ok: true,
-    flow: this.id,
-    nodes: [],
-    queues: []
-  };
-
-  for (id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      node = this.nodes[id];
-      if (node.status !== 'complete') {
-        report.ok = false;
-        report.nodes.push({
-          node: node.report()
+        self.emit('removeNode', {
+          node: oldNode
         });
-      }
+
+        if (cb) {
+          cb();
+        }
+      });
     }
-  }
-
-  for (id in this.links) {
-    if (this.links.hasOwnProperty(id)) {
-      link = this.links[id];
-      if (qm.hasQueue(link.ioid)) {
-        size = qm.size(link.ioid);
-        report.ok = false;
-        report.queues.push({
-          link: link.toJSON(),
-          port: link.target.port,
-          // super weird, will be undefined if called here.
-          // size: qm.size(link.ioid),
-          size: size,
-          node: this.getNode(link.target.id).report()
-        });
-      }
+  }, {
+    key: 'removeNodes',
+    value: function removeNodes() {
+      this.clear();
     }
-  }
 
-  return report;
+    /**
+     *
+     * Get all nodes.
+     *
+     * TODO: unnecessary method
+     *
+     * @return {Object} nodes
+     * @public
+     *
+     */
 
+  }, {
+    key: 'getNodes',
+    value: function getNodes() {
+      return this.nodes;
+    }
+
+    /**
+     *
+     * Check if this node exists
+     *
+     * @param {String} id
+     * @return {Object} node
+     * @public
+     */
+
+  }, {
+    key: 'hasNode',
+    value: function hasNode(id) {
+      return this.nodes.has(id);
+    }
+
+    /**
+     *
+     * Get a node by it's id.
+     *
+     * @param {String} id
+     * @return {Object} node
+     * @public
+     */
+
+  }, {
+    key: 'getNode',
+    value: function getNode(id) {
+      if (this.nodes.has(id)) {
+        return this.nodes.get(id);
+      } else {
+        var _iteratorNormalCompletion2 = true;
+        var _didIteratorError2 = false;
+        var _iteratorError2 = undefined;
+
+        try {
+          for (var _iterator2 = this.nodes.values()[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+            var node = _step2.value;
+
+            if (node.id === id || node.identifier === id) {
+              return node;
+            }
+          }
+        } catch (err) {
+          _didIteratorError2 = true;
+          _iteratorError2 = err;
+        } finally {
+          try {
+            if (!_iteratorNormalCompletion2 && _iterator2.return) {
+              _iterator2.return();
+            }
+          } finally {
+            if (_didIteratorError2) {
+              throw _iteratorError2;
+            }
+          }
+        }
+      }
+
+      throw new Error(util.format('Node %s does not exist', id));
+    }
+  }]);
+
+  return Node;
+})();
+
+Node.nodeTypes = {
+  xNode: xNode
 };
 
-/**
- *
- * If there are multiple connections to one port
- * the connections are numbered.
- *
- * If there is a index specified by using the
- * [] property, it will be considered.
- *
- * If it's not specified although there are
- * multiple connections to one port, it will be added.
- *
- * The sort takes care of adding connections where
- * [] is undefined to be placed last.
- *
- * The second loop makes sure they are correctly numbered.
- *
- * If connections are defined like:
- *
- *   undefined, [4],undefined, [3],[2]
- *
- * The corrected result will be:
- *
- * [2]        -> [0]
- * [3]        -> [1]
- * [4]        -> [2]
- * undefined  -> [3]
- * undefined  -> [4]
- *
- * Ports which only have one connection will be left unmodified.
- *
- */
-Actor.prototype.ensureConnectionNumbering = function(map) {
+module.exports = Node;
+//# sourceMappingURL=node.js.map
 
-  var c = 0;
-  var i;
-  var link;
-  var last = {};
-  var node;
+},{"../context/defaultProvider":21,"../flow":23,"../node":29,"../validate":41,"debug":"V4HZ/5","util":6}],17:[function(require,module,exports){
+"use strict";
 
-  // first sort so order of appearance of
-  // target.in is correct
-  //
-  // FIX: seems like multisort is messing up the array.
-  // target suddenly has unknown input ports...
-  if (map.links.length) {
-    multiSort(map.links, ['target', 'in', 'index']);
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var Port = (function () {
+  function Port() {
+    _classCallCheck(this, Port);
   }
 
-  for (i = 0; i < map.links.length; i++) {
+  _createClass(Port, [{
+    key: "addPort",
 
-    link = map.links[i];
-
-    // Weird, the full node is not build yet here?
-    // so have to look at the nodeDefinitions ns and name _is_
-    // known at this point.
-    node = this.nodes[link.target.id];
-
-    if (this.nodeDefinitions[node.ns][node.name]
-      .ports.input[link.target.port].type === 'array') {
-
-      if (last.target.id === link.target.id &&
-        last.target.port === link.target.port) {
-        last.index = c++;
-        link.index = c;
-      }
-      else {
-        c = 0; // reset
-      }
-      last = link;
-
+    /**
+     *
+     * Adds a port
+     *
+     * NOT IMPLEMENTED
+     *
+     * @public
+     */
+    value: function addPort() {
+      return this;
     }
-  }
 
-};
+    /**
+     *
+     * Removes a port
+     *
+     * NOT IMPLEMENTED
+     *
+     * @public
+     */
 
-Actor.prototype.hasParent = function() {
-  return false;
-};
+  }, {
+    key: "removePort",
+    value: function removePort() {
+      return this;
+    }
+  }]);
 
-module.exports = Actor;
+  return Port;
+})();
 
-},{"../lib/context/defaultProvider":20,"../lib/io/mapHandler":23,"../lib/multisort":25,"../lib/process/defaultManager":32,"./connector":19,"./flow":21,"./link":24,"./node":26,"./node/polymer":28,"./packet":29,"./run":34,"./validate":38,"chix-loader":48,"debug":49,"events":11,"util":16,"uuid":62}],19:[function(require,module,exports){
+module.exports = Port;
+//# sourceMappingURL=port.js.map
+
+},{}],18:[function(require,module,exports){
 'use strict';
 
-var util    = require('util');
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var Report = (function () {
+  function Report() {
+    _classCallCheck(this, Report);
+  }
+
+  _createClass(Report, [{
+    key: 'report',
+
+    /**
+     *
+     * JSON Status report about the nodes.
+     *
+     * Mainly meant to debug after shutdown.
+     *
+     * Should handle all stuff one can think of
+     * why `it` doesn't work.
+     *
+     */
+    value: function report() {
+      var size = undefined;
+      var qm = this.ioHandler.queueManager;
+
+      var _report = {
+        ok: true,
+        flow: this.id,
+        nodes: [],
+        queues: []
+      };
+
+      var _iteratorNormalCompletion = true;
+      var _didIteratorError = false;
+      var _iteratorError = undefined;
+
+      try {
+        for (var _iterator = this.nodes.values()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+          var node = _step.value;
+
+          if (node.status !== 'complete') {
+            _report.ok = false;
+            _report.nodes.push({
+              node: node.report()
+            });
+          }
+        }
+      } catch (err) {
+        _didIteratorError = true;
+        _iteratorError = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion && _iterator.return) {
+            _iterator.return();
+          }
+        } finally {
+          if (_didIteratorError) {
+            throw _iteratorError;
+          }
+        }
+      }
+
+      var _iteratorNormalCompletion2 = true;
+      var _didIteratorError2 = false;
+      var _iteratorError2 = undefined;
+
+      try {
+        for (var _iterator2 = this.links.values()[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+          var link = _step2.value;
+
+          if (qm.hasQueue(link.ioid)) {
+            size = qm.size(link.ioid);
+            _report.ok = false;
+            _report.queues.push({
+              link: link.toJSON(),
+              port: link.target.port,
+              // super weird, will be undefined if called here.
+              // size: qm.size(link.ioid),
+              size: size,
+              node: this.getNode(link.target.id).report()
+            });
+          }
+        }
+      } catch (err) {
+        _didIteratorError2 = true;
+        _iteratorError2 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion2 && _iterator2.return) {
+            _iterator2.return();
+          }
+        } finally {
+          if (_didIteratorError2) {
+            throw _iteratorError2;
+          }
+        }
+      }
+
+      return _report;
+    }
+  }]);
+
+  return Report;
+})();
+
+module.exports = Report;
+//# sourceMappingURL=report.js.map
+
+},{}],19:[function(require,module,exports){
+'use strict';
+
+var Status = {};
+Status.STOPPED = 'stopped';
+Status.RUNNING = 'running';
+
+module.exports = Status;
+//# sourceMappingURL=status.js.map
+
+},{}],20:[function(require,module,exports){
+'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
 var Setting = require('./setting');
 
 /**
@@ -4993,82 +4519,98 @@ var Setting = require('./setting');
  * @public
  *
  */
-function Connector(settings) {
-  Setting.apply(this, [settings]);
-  this.wire = undefined;
-}
 
-util.inherits(Connector, Setting);
+var Connector = (function (_Setting) {
+  _inherits(Connector, _Setting);
 
-/**
- *
- * Plug
- *
- * TODO: plug is not the correct name
- *
- * @param {String} id - TODO: not sure which id, from the node I pressume..
- * @param {String} port
- * @param {String} action
- */
-Connector.prototype.plug = function(id, port, action) {
-  this.id     = id;
-  this.port   = port;
-  if (action) {
-    this.action = action;
-  }
-};
+  function Connector(settings) {
+    _classCallCheck(this, Connector);
 
-/**
- *
- * Create
- *
- * Creates a connector
- *
- * @param {String} id - TODO: not sure which id, from the node I pressume..
- * @param {String} port
- * @param {Object} settings
- * @param {String} action
- */
-Connector.create = function(id, port, settings, action) {
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(Connector).call(this, settings));
 
-  var c = new Connector(settings);
-  c.plug(id, port, action);
-  return c;
-
-};
-
-/**
- *
- * Register process id this connector handles.
- *
- */
-Connector.prototype.setPid = function(pid) {
-  this.pid = pid;
-};
-
-Connector.prototype.toJSON = function() {
-
-  var ret = {
-    id: this.id,
-    port: this.port
-  };
-
-  if (this.setting) {
-    ret.setting = JSON.parse(JSON.stringify(this.setting));
+    _this.wire = undefined;
+    return _this;
   }
 
-  if (this.action) {
-    ret.action = this.action;
-  }
+  /**
+   *
+   * Plug
+   *
+   * TODO: plug is not the correct name
+   *
+   * @param {String} id - TODO: not sure which id, from the node I pressume..
+   * @param {String} port
+   * @param {String} action
+   */
 
-  return ret;
+  _createClass(Connector, [{
+    key: 'plug',
+    value: function plug(id, port, action) {
+      this.id = id;
+      this.port = port;
+      if (action) {
+        this.action = action;
+      }
+    }
 
-};
+    /**
+     *
+     * Create
+     *
+     * Creates a connector
+     *
+     * @param {String} id - TODO: not sure which id, from the node I pressume..
+     * @param {String} port
+     * @param {Object} settings
+     * @param {String} action
+     */
+
+  }, {
+    key: 'setPid',
+
+    /**
+     *
+     * Register process id this connector handles.
+     *
+     */
+    value: function setPid(pid) {
+      this.pid = pid;
+    }
+  }, {
+    key: 'toJSON',
+    value: function toJSON() {
+      var ret = {
+        id: this.id,
+        port: this.port
+      };
+
+      if (this.setting) {
+        ret.setting = JSON.parse(JSON.stringify(this.setting));
+      }
+
+      if (this.action) {
+        ret.action = this.action;
+      }
+
+      return ret;
+    }
+  }], [{
+    key: 'create',
+    value: function create(id, port, settings, action) {
+      var c = new Connector(settings);
+      c.plug(id, port, action);
+      return c;
+    }
+  }]);
+
+  return Connector;
+})(Setting);
 
 module.exports = Connector;
+//# sourceMappingURL=connector.js.map
 
-},{"./setting":37,"util":16}],20:[function(require,module,exports){
-'use strict';
+},{"./setting":40}],21:[function(require,module,exports){
+'use strict'
 
 /**
  *
@@ -5077,22 +4619,124 @@ module.exports = Connector;
  * @constructor
  * @public
  */
-function DefaultProvider() {
+;
 
-}
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
 
-DefaultProvider.prototype.addContext = function(node, defaultContext) {
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
-  if (typeof defaultContext !== 'undefined') {
-    node.addContext(defaultContext);
+var DefaultProvider = (function () {
+  function DefaultProvider() {
+    _classCallCheck(this, DefaultProvider);
   }
 
-};
+  _createClass(DefaultProvider, [{
+    key: 'addContext',
+    value: function addContext(node, defaultContext) {
+      if (typeof defaultContext !== 'undefined') {
+        node.addContext(defaultContext);
+      }
+    }
+  }]);
+
+  return DefaultProvider;
+})();
 
 module.exports = DefaultProvider;
+//# sourceMappingURL=defaultProvider.js.map
 
-},{}],21:[function(require,module,exports){
+},{}],22:[function(require,module,exports){
 'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+var _get = function get(object, property, receiver) { if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { return get(parent, property, receiver); } } else if ("value" in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } };
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
+var EventEmitter = require('events').EventEmitter;
+
+/**
+ *
+ * Used to add an event handler after all events are emitted
+ *
+ * e.g. actor listens to output of the nodes, but it must
+ * act after all other event listeners have run.
+ *
+ */
+
+var AfterEmitter = (function (_EventEmitter) {
+  _inherits(AfterEmitter, _EventEmitter);
+
+  function AfterEmitter() {
+    _classCallCheck(this, AfterEmitter);
+
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(AfterEmitter).call(this));
+
+    _this._after = {};
+    return _this;
+  }
+
+  _createClass(AfterEmitter, [{
+    key: 'emit',
+    value: function emit(type) {
+      var len = arguments.length;
+      var args = new Array(len - 1);
+      for (var i = 1; i < len; i++) {
+        args[i - 1] = arguments[i];
+      }
+
+      var ret = _get(Object.getPrototypeOf(AfterEmitter.prototype), 'emit', this).apply(this, arguments);
+
+      if (this._after[type]) {
+        this._after[type].apply(this, args);
+      }
+
+      return ret;
+    }
+  }, {
+    key: 'setAfterListener',
+    value: function setAfterListener(type, listener) {
+      if (this._after[type]) {
+        throw Error('after callback already registered');
+      } else {
+        this._after[type] = listener;
+      }
+    }
+  }, {
+    key: 'hasAfterListener',
+    value: function hasAfterListener(type) {
+      return Boolean(this._after[type]);
+    }
+  }, {
+    key: 'afterListener',
+    value: function afterListener(type) {
+      return this._after[type];
+    }
+  }]);
+
+  return AfterEmitter;
+})(EventEmitter);
+
+AfterEmitter.prototype.after = AfterEmitter.prototype.setAfterListener;
+
+module.exports = AfterEmitter;
+//# sourceMappingURL=after.js.map
+
+},{"events":1}],23:[function(require,module,exports){
+'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
 
 var Packet = require('./packet');
 var util = require('util');
@@ -5117,1377 +4761,1358 @@ var debug = require('debug')('chix:flow');
  * @public
  *
  */
-function Flow(id, map, identifier, loader, ioHandler, processManager) {
 
-  var self = this;
+var Flow = (function (_Actor) {
+  _inherits(Flow, _Actor);
 
-  if (!id) {
-    throw Error('xFlow requires an id');
-  }
+  function Flow(id, map, identifier, loader, ioHandler, processManager) {
+    _classCallCheck(this, Flow);
 
-  if (!map) {
-    throw Error('xFlow requires a map');
-  }
+    if (!id) {
+      throw Error('xFlow requires an id');
+    }
 
-  // Call the super's constructor
-  Actor.apply(this, arguments);
+    if (!map) {
+      throw Error('xFlow requires a map');
+    }
 
-  if (loader) {
-    this.loader = loader;
-  }
-  if (ioHandler) {
-    this.ioHandler = ioHandler;
-  }
+    // Call the super's constructor
 
-  if (processManager) {
-    this.processManager = processManager;
-  }
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(Flow).apply(this, arguments));
 
-  // External vs Internal links
-  this.linkMap = {};
+    var self = _this;
 
-  // indicates whether this is an action instance.
-  this.actionName = undefined;
+    _this._delay = 0;
 
-  // TODO: trying to solve provider issue
-  this.provider = map.provider;
+    if (loader) {
+      _this.loader = loader;
+    }
 
-  this.providers = map.providers;
+    if (ioHandler) {
+      _this.ioHandler = ioHandler;
+    }
 
-  this.actions = {};
+    if (processManager) {
+      _this.processManager = processManager;
+    }
 
-  // initialize both input and output ports might
-  // one of them be empty.
-  if (!map.ports) {
-    map.ports = {};
-  }
-  if (!map.ports.output) {
-    map.ports.output = {};
-  }
-  if (!map.ports.input) {
-    map.ports.input = {};
-  }
+    // External vs Internal links
+    _this.linkMap = new Map();
 
-  /*
-    // make available always.
-    node.ports.output['error'] = {
-      title: 'Error',
-      type: 'object'
+    // indicates whether this is an action instance.
+    _this.actionName = undefined;
+
+    // TODO: trying to solve provider issue
+    _this.provider = map.provider;
+
+    _this.providers = map.providers;
+
+    _this.actions = {};
+
+    // initialize both input and output ports might
+    // one of them be empty.
+    if (!map.ports) {
+      map.ports = {};
+    }
+    if (!map.ports.output) {
+      map.ports.output = {};
+    }
+    if (!map.ports.input) {
+      map.ports.input = {};
+    }
+
+    /*
+     // make available always.
+     node.ports.output['error'] = {
+     title: 'Error',
+     type: 'object'
+     };
+     */
+
+    _this.id = id;
+
+    _this.name = map.name;
+
+    _this.type = 'flow';
+
+    _this.title = map.title;
+
+    _this.description = map.description;
+
+    _this.ns = map.ns;
+
+    _this.active = false;
+
+    _this.metadata = map.metadata || {};
+
+    _this.identifier = identifier || [map.ns, ':', map.name].join('');
+
+    _this.ports = JSON.parse(JSON.stringify(map.ports));
+
+    // Need to think about how to implement this for flows
+    // this.ports.output[':complete'] = { type: 'any' };
+
+    _this.runCount = 0;
+
+    _this.inPorts = Object.keys(_this.ports.input);
+
+    _this.outPorts = Object.keys(_this.ports.output);
+
+    //this.filled = 0;
+
+    _this.chi = undefined;
+
+    _this._interval = 100;
+
+    // this.context = {};
+
+    _this.nodeTimeout = map.nodeTimeout || 3000;
+
+    _this.inputTimeout = typeof map.inputTimeout === 'undefined' ? 3000 : map.inputTimeout;
+
+    _this._hold = false; // whether this node is on hold.
+
+    _this._inputTimeout = null;
+
+    _this._openPorts = [];
+
+    _this._connections = new Connections();
+
+    _this._forks = [];
+
+    debug('%s: addMap', _this.identifier);
+    _this.addMap(map);
+
+    _this.fork = function () {
+
+      var Fork = function Fork() {
+        this.nodes = new Map();
+        //this.context = {};
+
+        // same ioHandler, tricky..
+        // this.ioHandler = undefined;
+      };
+
+      // Pre-filled baseActor is our prototype
+      Fork.prototype = this.baseActor;
+
+      var FActor = new Fork();
+
+      // Remember all forks for maintainance
+      self._forks.push(FActor);
+
+      // Each fork should have their own event handlers.
+      self.listenForOutput(FActor);
+
+      return FActor;
     };
-  */
 
-  this.id = id;
+    _this.listenForOutput();
 
-  this.name = map.name;
+    _this.initPortOptions = function () {
 
-  this.type = 'flow';
+      // Init port options.
+      for (var port in self.ports.input) {
+        if (self.ports.input.hasOwnProperty(port)) {
 
-  this.title = map.title;
+          // This flow's port
+          var thisPort = self.ports.input[port];
 
-  this.description = map.description;
-
-  this.ns = map.ns;
-
-  this.active = false;
-
-  this.metadata = map.metadata || {};
-
-  this.identifier = identifier || [
-    map.ns,
-    ':',
-    map.name
-  ].join('');
-
-  this.ports = JSON.parse(
-    JSON.stringify(map.ports)
-  );
-
-  // Need to think about how to implement this for flows
-  // this.ports.output[':complete'] = { type: 'any' };
-
-  this.runCount = 0;
-
-  this.inPorts = Object.keys(
-    this.ports.input
-  );
-
-  this.outPorts = Object.keys(
-    this.ports.output
-  );
-
-  //this.filled = 0;
-
-  this.chi = undefined;
-
-  this._interval = 100;
-
-  // this.context = {};
-
-  this.nodeTimeout = map.nodeTimeout || 3000;
-
-  this.inputTimeout = typeof map.inputTimeout === 'undefined' ?
-    3000 :
-    map.inputTimeout;
-
-  this._hold = false; // whether this node is on hold.
-
-  this._inputTimeout = null;
-
-  this._openPorts = [];
-
-  this._connections = new Connections();
-
-  this._forks = [];
-
-  debug('%s: addMap', this.identifier);
-  this.addMap(map);
-
-  this.fork = function() {
-
-    var Fork = function Fork() {
-      this.nodes = {};
-      //this.context = {};
-
-      // same ioHandler, tricky..
-      // this.ioHandler = undefined;
-    };
-
-    // Pre-filled baseActor is our prototype
-    Fork.prototype = this.baseActor;
-
-    var FActor = new Fork();
-
-    // Remember all forks for maintainance
-    self._forks.push(FActor);
-
-    // Each fork should have their own event handlers.
-    self.listenForOutput(FActor);
-
-    return FActor;
-
-  };
-
-  this.listenForOutput();
-
-  this.initPortOptions = function() {
-
-    // Init port options.
-    for (var port in self.ports.input) {
-      if (self.ports.input.hasOwnProperty(port)) {
-
-        // This flow's port
-        var thisPort = self.ports.input[port];
-
-        // set port option
-        if (thisPort.options) {
-          for (var opt in thisPort.options) {
-            if (thisPort.options.hasOwnProperty(opt)) {
-              self.setPortOption(
-                'input',
-                port,
-                opt,
-                thisPort.options[opt]);
+          // set port option
+          if (thisPort.options) {
+            for (var opt in thisPort.options) {
+              if (thisPort.options.hasOwnProperty(opt)) {
+                self.setPortOption('input', port, opt, thisPort.options[opt]);
+              }
             }
           }
         }
-
       }
-    }
-  };
+    };
 
-  // Too late?
-  this.setup();
+    // Too late?
+    _this.setup();
 
-  this.setStatus('created');
-
-}
-
-util.inherits(Flow, Actor);
-
-Flow.prototype.action = function(action) {
-
-  if (!this.actions.hasOwnProperty(action)) {
-
-    throw Error('this.action should return something with the action map');
-    /*
-        var ActionActor = this.action(action);
-
-        // ActionActor.map.ports = this.ports;
-
-        // not sure what to do with the id and identifier.
-        // I think they should stay the same, for now.
-        //
-        this.actions[action] = new Flow(
-          this.id,
-          // ActionActor, // BROKEN
-          map, // action definition should be here
-          this.identifier + '::' + action
-        );
-
-        // a bit loose this.
-        this.actions[action].actionName = action;
-
-        //this.actions[action].ports = this.ports;
-    */
-
+    _this.setStatus('created');
+    return _this;
   }
 
-  return this.actions[action];
+  _createClass(Flow, [{
+    key: 'action',
+    value: function action(_action) {
+      if (!this.actions.hasOwnProperty(_action)) {
+        throw Error('this.action should return something with the action map');
+        /*
+         var ActionActor = this.action(action);
+          // ActionActor.map.ports = this.ports;
+          // not sure what to do with the id and identifier.
+         // I think they should stay the same, for now.
+         //
+         this.actions[action] = new Flow(
+         this.id,
+         // ActionActor, // BROKEN
+         map, // action definition should be here
+         this.identifier + '::' + action
+         );
+          // a bit loose this.
+         this.actions[action].actionName = action;
+          //this.actions[action].ports = this.ports;
+         */
+      }
 
-};
+      return this.actions[_action];
+    }
+  }, {
+    key: 'setup',
+    value: function setup() {
+      this.initPortOptions();
+    }
 
-Flow.prototype.setup = function() {
+    /**
+     *
+     * For forking it is relevant when this addContext is done.
+     * Probably this addContext should be done on baseActor.
+     * So subsequent forks will have the updated context.
+     * Yeah, baseActor is the fingerprint, currentActor is the
+     * current one, this._actors is the array of instantiated forks.
+     *
+     */
 
-  this.initPortOptions();
-
-};
-
-/**
- *
- * For forking it is relevant when this addContext is done.
- * Probably this addContext should be done on baseActor.
- * So subsequent forks will have the updated context.
- * Yeah, baseActor is the fingerprint, currentActor is the
- * current one, this._actors is the array of instantiated forks.
- *
- */
-Flow.prototype.addContext = function(context) {
-
-  debug('%s: addContext', this.identifier);
-  var port;
-  for (port in context) {
-
-    if (context.hasOwnProperty(port)) {
-
+  }, {
+    key: 'addContext',
+    value: function addContext(context) {
+      debug('%s: addContext', this.identifier);
+      for (var port in context) {
+        if (context.hasOwnProperty(port)) {
+          var portDef = this.getPortDefinition(port, 'input');
+          this.getNode(portDef.nodeId).setContextProperty(portDef.name, context[port]);
+          // Maybe too easy, but see if it works.
+          // Reset when all are filled, then fork.
+          //this.filled++;
+        }
+      }
+    }
+  }, {
+    key: 'setContextProperty',
+    value: function setContextProperty(port, data) {
       var portDef = this.getPortDefinition(port, 'input');
-
-      if (context.hasOwnProperty(port)) {
-        this.getNode(portDef.nodeId)
-          .setContextProperty(portDef.name, context[port]);
-
-        // Maybe too easy, but see if it works.
-        // Reset when all are filled, then fork.
-        //this.filled++;
-
-      }
-
+      this.getNode(portDef.nodeId).setContextProperty(portDef.name, data);
     }
-  }
-};
-
-Flow.prototype.setContextProperty = function(port, data) {
-
-  var portDef = this.getPortDefinition(port, 'input');
-  this.getNode(portDef.nodeId).setContextProperty(portDef.name, data);
-
-};
-
-Flow.prototype.getPortType = function(port) {
-  if (port === ':start') {
-    return 'any';
-  }
-  var portDef = this.getPortDefinition(port, 'input');
-  this.getNode(portDef.nodeId).getPortType(portDef.name);
-};
-
-Flow.prototype.clearContextProperty = function(port) {
-
-  var portDef = this.getPortDefinition(port, 'input');
-  this.getNode(portDef.nodeId).clearContextProperty(portDef.name);
-
-};
-
-Flow.prototype._delay = 0;
-
-Flow.prototype.inputPortAvailable = function(target) {
-
-  if (target.action && !this.isAction()) {
-
-    return this.action(target.action).inputPortAvailable(target);
-
-  }
-  else {
-
-    // little bit too much :start hacking..
-    // probably causes the :start problem with clock
-    if (target.port === ':start') {
-
-      return true;
-
-    }
-    else {
-
-      var portDef = this.getPortDefinition(target.port, 'input');
-
-      if (!this.linkMap.hasOwnProperty(target.wire.id)) {
-        throw Error('Cannot find internal link within linkMap');
+  }, {
+    key: 'getPortType',
+    value: function getPortType(kind, port) {
+      if (port === ':start') {
+        return 'any';
       }
-
-      return this.getNode(portDef.nodeId)
-        .inputPortAvailable(this.linkMap[target.wire.id].target);
-
-    }
-
-  }
-};
-
-// TODO: both flow & node can inherit this stuff
-
-Flow.prototype.getStatus = function() {
-
-  return this.status;
-
-};
-
-Flow.prototype.setStatus = function(status) {
-
-  this.status = status;
-  this.event(':statusUpdate', {
-    node: this.export(),
-    status: this.status
-  });
-
-};
-
-Flow.prototype.error = function(node, err) {
-
-  var error = util.isError(err) ? err : Error(err);
-
-  // TODO: better to have full (custom) error objects
-  var eobj = {
-    node: node.export(),
-    msg: err
-  };
-
-  // Update our own status, this should status be resolved
-  // Create a shell? yep..
-  node.setStatus('error');
-
-  // Used for in graph sending
-  node.event(':error', eobj);
-
-  // Used by Process Manager or whoever handles the node
-  node.emit('error', eobj);
-
-  return error;
-};
-
-Flow.prototype.fill = function(target, p) {
-
-  var node;
-
-  debug('%s:%s fill', this.identifier, target.port);
-
-  if (target.action && !this.isAction()) {
-
-    // NOTE: action does not take fork into account?
-    // test this later. it should be in the context of the currentActor.
-
-    node = this.action(target.action);
-    p.release(this);
-    p.setOwner(node);
-    node.fill(target, p);
-
-  }
-  else {
-
-    if (target.port === ':start') {
-
-      // :start is pushing the actor, so exposing a :start
-      // port does not make much sense.
-      this.event(':start', {
-        node: this.export()
-      });
-
-      this.setStatus('started');
-      debug('%s::start this.push()', this.identifier);
-      this.push();
-      return true;
-
-    }
-    else {
-
-      // delegate this to the node this port belongs to.
-      var portDef = this.getPortDefinition(target.port, 'input');
-
-      node = this.getNode(portDef.nodeId);
-
-      if (!this.linkMap.hasOwnProperty(target.wire.id)) {
-        throw Error('link not found within linkMap');
+      var portDef = this.getPortDefinition(port, 'input');
+      var type = this.getNode(portDef.nodeId).getPortType(kind, portDef.name);
+      if (type) {
+        return type;
+      } else {
+        throw Error('Unable to determine port type');
       }
-      p.release(this);
-      p.setOwner(node);
-      var err = node.fill(this.linkMap[target.wire.id].target, p);
-
-      if (util.isError(err)) {
-
-        Flow.error(this, err);
-
-        return err;
-
-      }
-      else {
-
-        this.event(':start', {
-          node: this.export()
-        });
-
-        //this.filled++;
-/*
-        // fishy, also, is filled used at all for flow?
-        // filled is irrelevant for flow.
-        if (this.filled === this._connections.size) {
-
-          // do not fork for now
-          // this.currentActor = this.fork();
-          // this.currentActor.run();
-
-          this.filled = 0;
-
-        }
-*/
-
-        return true;
-
-      }
-
     }
-
-  }
-
-};
-
-Flow.prototype.setMetadata = function(metadata) {
-  this.metadata = metadata;
-};
-
-Flow.prototype.setMeta = function(key, value) {
-  this.metadata[key] = value;
-};
-
-/**
- *
- * Checks whether the port exists at the node
- * this Flow is relaying for.
- *
- * @param {String} type
- * @param {String} port
- */
-Flow.prototype.portExists = function(type, port) {
-
-  // this returns whether this port exists for _us_
-  // it only considers the exposed ports.
-  var portDef = this.getPortDefinition(port, type);
-  return this.getNode(portDef.nodeId).portExists(type, portDef.name);
-
-};
-
-/**
- *
- * Checks whether the port is open at the node
- * this Flow is relaying for.
- *
- * @param {String} port
- */
-Flow.prototype.portIsOpen = function(port) {
-
-  // the port open logic is about _our_ open and exposed ports.
-  // yet ofcourse it should check the real node.
-  // so also delegate.
-  var portDef = this.getPortDefinition(port, 'input');
-  // Todo there is no real true false in portIsOpen?
-  // it will fail hard.
-  return this.getNode(portDef.nodeId).portIsOpen(portDef.name);
-
-};
-
-/**
- *
- * Get _this_ Flow's port definition.
- *
- * The definition contains the _real_ portname
- * of the node _this_ port is relaying for.
- *
- * @param {String} port
- */
-
-// JIKES, if we only need the ports we are all good..
-Flow.prototype.getPortDefinition = function(port, type) {
-  // uhm ok, we also need to add the start port
-  if (this.ports[type].hasOwnProperty(port)) {
-    return this.ports[type][port];
-  }
-  else {
-    throw new Error(
-      util.format(
-        'Unable to find exported port definition for %s port `%s` (%s:%s)\n' +
-        '\tAvailable ports: %s',
-        type,
-        port,
-        this.ns,
-        this.name,
-        Object.keys(this.ports[type]).toString()
-      )
-    );
-  }
-};
-
-Flow.prototype.getPort = function(type, name) {
-  return this.getPortDefinition(name, type);
-};
-
-/**
- *
- * Get the port option at the node
- * this flow is relaying for.
- *
- * @param {String} type
- * @param {String} port
- * @param {String} option
- */
-Flow.prototype.getPortOption = function(type, port, option) {
-
-  // Exposed ports can also have options set.
-  // if this is _our_ port (it is exposed)
-  // just delegate this to the real node.
-  var portDef = this.getPortDefinition(port, type);
-  // Todo there is no real true false in portIsOpen?
-  // it will fail hard.
-  return this.getNode(portDef.nodeId).getPortOption(type, portDef.name, option);
-};
-
-/**
- *
- * Sets an input port option.
- *
- * The node schema for instance can specifiy whether a port is persistent.
- *
- * At the moment a connection can override these values.
- * It's a way of saying I give you this once so take care of it.
- *
- * Ok, with forks running this should eventually be much smarter.
- * If there are long running flows, all instances should have their
- * ports updated.
- *
- * Not sure when setPortOption is called, if it is called during 'runtime'
- * there is no problem and we could just set it on the current Actor.
- * I could also just already fix it and update baseActor and all _actors.
- * which would be sufficient.
- *
- * Anyway, this._actors is nice, however what to do with other forking methods.
- * Nevermind first do this.
- *
- */
-Flow.prototype.setPortOption = function(type, port, opt, value) {
-  var portDef = this.getPortDefinition(port, type);
-  this.getNode(portDef.nodeId).setPortOption(type, portDef.name, opt, value);
-};
-
-Flow.prototype.openPort = function(port) {
-  if (this._openPorts.indexOf(port) === -1) {
-    this._openPorts.push(port);
-  }
-};
-
-Flow.prototype.isAction = function() {
-
-  return !!this.actionName;
-
-};
-
-// TODO: implement
-//Flow.prototype.unplug = function(target) {
-Flow.prototype.unplug = function(target) {
-
-  if (target.action && !this.isAction()) {
-
-    this.action(target.action).unplug(target);
-
-  }
-  else {
-
-    // unplug logic
-
-  }
-
-};
-
-/**
- *
- * Set port to open state
- *
- * This is a problem, xFlow has it's ports opened.
- * However this also means baseActor and all the forks
- * Should have their ports opened.
- *
- * Ok, not a problem, only that addition of the :start port
- * is a problem. Again not sure at what point plug()
- * is called. I think during setup, but later on also
- * in realtime. anyway for now I do not care so much about
- * realtime. Doesn't make sense most of the time.
- *
- * @param {Connector} target
- * @public
- */
-Flow.prototype.plug = function(target) {
-
-  if (target.action && !this.isAction()) {
-
-    this.action(target.action).plug(target);
-
-  }
-  else {
-
-    if (target.port === ':start') {
-      this.addPort('input', ':start', {
-        name: ':start',
-        type: 'any'
-      });
+  }, {
+    key: 'clearContextProperty',
+    value: function clearContextProperty(port) {
+      var portDef = this.getPortDefinition(port, 'input');
+      this.getNode(portDef.nodeId).clearContextProperty(portDef.name);
     }
+  }, {
+    key: 'inputPortAvailable',
+    value: function inputPortAvailable(target) {
+      if (target.action && !this.isAction()) {
+        return this.action(target.action).inputPortAvailable(target);
+      } else {
+        // little bit too much :start hacking..
+        // probably causes the :start problem with clock
+        if (target.port === ':start') {
+          return true;
+        } else {
+          var portDef = this.getPortDefinition(target.port, 'input');
 
-    // delegate this to the real node
-    // only if this is one of _our_ exposed nodes.
-    //var portDef = this.getPortDefinition(target.port, 'input');
-    var portDef = this.getPortDefinition(target.port, 'input');
-
-    // start is not an internal port, we will do a push on the internal
-    // actor and he may figure it out..
-    //if (target.port !== ':start') {
-    if (target.port !== ':start') {
-
-      // The Node we are gating for
-      var internalNode = this.getNode(portDef.nodeId);
-
-      var xlink = new xLink();
-      // just define our node as the source, and the external port
-      xlink.setSource(this.id, target.port, {}, target.action);
-      xlink.setTarget(target.id, portDef.name, {}, target.action);
-
-      for (var k in target.setting) {
-        if (target.setting.hasOwnProperty(k)) {
-          xlink.target.set(k, target.setting[k]);
-        }
-      }
-
-      // fixed settings
-      if (portDef.hasOwnProperty('setting')) {
-        for (k in portDef.setting) {
-          if (portDef.setting.hasOwnProperty(k)) {
-            xlink.target.set(k, portDef.setting[k]);
+          if (!this.linkMap.has(target.wire.id)) {
+            throw Error('Cannot find internal link within linkMap');
           }
+
+          return this.getNode(portDef.nodeId).inputPortAvailable(this.linkMap.get(target.wire.id).target);
         }
       }
-
-      internalNode.plug(xlink.target);
-
-      // Copy the port type, delayed type setting, :start is only known after
-      // the port is opened...
-      this.ports.input[target.port].type =
-        internalNode.ports.input[xlink.target.port].type;
-
-      // we add our internalLink as reference to our link.
-      // a bit of a hack, it's not known by the definition of
-      // Link itself
-      target.wire.internalLink = xlink;
-
-      // outer/inner mapping
-      this.linkMap[target.wire.id] = xlink;
-
-    }
-    else {
-      // what to do with start port?
     }
 
-    // use same logic for our own ports
-    if (!this._connections.hasOwnProperty(target.port)) {
-      this._connections[target.port] = [];
+    // TODO: both flow & node can inherit this stuff
+
+  }, {
+    key: 'getStatus',
+    value: function getStatus() {
+      return this.status;
     }
+  }, {
+    key: 'setStatus',
+    value: function setStatus(status) {
+      this.status = status;
+      this.event(':statusUpdate', {
+        node: this.export(),
+        status: this.status
+      });
+    }
+  }, {
+    key: 'error',
+    value: function error(node, err) {
+      var _error = util.isError(err) ? err : Error(err);
 
-    this._connections[target.port].push(target.wire);
+      // TODO: better to have full (custom) error objects
+      var eobj = {
+        node: node.export(),
+        msg: err
+      };
 
-    this.openPort(target.port);
+      // Update our own status, this should status be resolved
+      // Create a shell? yep..
+      node.setStatus('error');
 
-  }
+      // Used for in graph sending
+      node.event(':error', eobj);
 
-};
+      // Used by Process Manager or whoever handles the node
+      node.emit('error', eobj);
 
-Flow.prototype.exposePort = function(type, nodeId, port, name) {
+      return _error;
+    }
+  }, {
+    key: 'fill',
+    value: function fill(target, p) {
+      var node = undefined;
 
-  var p;
-  var node = this.getNode(nodeId);
+      debug('%s:%s fill', this.identifier, target.port);
 
-  if (node.ports[type]) {
-    for (p in node.ports[type]) {
+      if (target.action && !this.isAction()) {
+        // NOTE: action does not take fork into account?
+        // test this later. it should be in the context of the currentActor.
 
-      if (node.ports[type].hasOwnProperty(p)) {
-
-        if (p === port) {
-
-          // not sure, is this all info?
-          this.addPort(type, name, {
-            nodeId: nodeId,
-            name: port
+        node = this.action(target.action);
+        p.release(this);
+        p.setOwner(node);
+        node.fill(target, p);
+      } else {
+        if (target.port === ':start') {
+          // :start is pushing the actor, so exposing a :start
+          // port does not make much sense.
+          this.event(':start', {
+            node: this.export()
           });
 
-          continue;
+          this.setStatus('started');
+          debug('%s::start this.push()', this.identifier);
+          this.push();
+          return true;
+        } else {
+          // delegate this to the node this port belongs to.
+          var portDef = this.getPortDefinition(target.port, 'input');
+
+          node = this.getNode(portDef.nodeId);
+
+          if (!this.linkMap.has(target.wire.id)) {
+            throw Error('link not found within linkMap');
+          }
+          p.release(this);
+          p.setOwner(node);
+          var err = node.fill(this.linkMap.get(target.wire.id).target, p);
+
+          if (util.isError(err)) {
+            Flow.error(this, err);
+
+            return err;
+          } else {
+            this.event(':start', {
+              node: this.export()
+            });
+
+            //this.filled++;
+            /*
+             // fishy, also, is filled used at all for flow?
+             // filled is irrelevant for flow.
+             if (this.filled === this._connections.size) {
+              // do not fork for now
+             // this.currentActor = this.fork();
+             // this.currentActor.run();
+              this.filled = 0;
+              }
+             */
+
+            return true;
+          }
         }
       }
     }
-  }
+  }, {
+    key: 'setMetadata',
+    value: function setMetadata(metadata) {
+      this.metadata = metadata;
+    }
+  }, {
+    key: 'setMeta',
+    value: function setMeta(key, value) {
+      this.metadata[key] = value;
+    }
 
-  this.emit('addPort', {
-    node: this.export(),
-    port: name
-  });
+    /**
+     *
+     * Checks whether the port exists at the node
+     * this Flow is relaying for.
+     *
+     * @param {String} type
+     * @param {String} port
+     */
 
-};
+  }, {
+    key: 'portExists',
+    value: function portExists(type, port) {
+      // this returns whether this port exists for _us_
+      // it only considers the exposed ports.
+      var portDef = this.getPortDefinition(port, type);
+      return this.getNode(portDef.nodeId).portExists(type, portDef.name);
+    }
 
-Flow.prototype.removePort = function(type, name) {
+    /**
+     *
+     * Checks whether the port is open at the node
+     * this Flow is relaying for.
+     *
+     * @param {String} port
+     */
 
-  if (this.ports[type][name]) {
+  }, {
+    key: 'portIsOpen',
+    value: function portIsOpen(port) {
+      // the port open logic is about _our_ open and exposed ports.
+      // yet ofcourse it should check the real node.
+      // so also delegate.
+      var portDef = this.getPortDefinition(port, 'input');
+      // Todo there is no real true false in portIsOpen?
+      // it will fail hard.
+      return this.getNode(portDef.nodeId).portIsOpen(portDef.name);
+    }
 
-    delete this.ports[type][name];
+    /**
+     *
+     * Get _this_ Flow's port definition.
+     *
+     * The definition contains the _real_ portname
+     * of the node _this_ port is relaying for.
+     *
+     * @param {String} port
+     */
 
-    this.emit('removePort', {
-      node: this.export(),
-      port: name
-    });
-
-  }
-
-};
-
-Flow.prototype.renamePort = function(type, from, to) {
-
-  var id;
-
-  if (this.ports[type][from]) {
-
-    this.ports[type][to] = JSON.parse(
-      JSON.stringify(this.ports[type][from])
-    );
-
-    // update links pointing to us.
-    // updates ioHandler also because it holds
-    // references to these links
-    // TODO: pid/id warning...
-    // renaming will only update this instance.
-    // accidently these links will make each instance
-    // point to the new ports, however not each instance
-    // has it's port renamed..
-    // For rename it's better to stop the graph
-    // update the definition itself then start it again
-    // Because for instance the io handler will still send
-    // to old ports.
-    for (id in this.links) {
-      if (type === 'input' &&
-        this.links[id].target.id === this.id &&
-        this.links[id].target.port === from) {
-
-        this.links[id].target.port = to;
-
+  }, {
+    key: 'getPortDefinition',
+    value: function getPortDefinition(port, type) {
+      // uhm ok, we also need to add the start port
+      if (this.ports[type].hasOwnProperty(port)) {
+        return this.ports[type][port];
+      } else {
+        throw new Error(util.format('Unable to find exported port definition for %s port `%s` (%s:%s)\n' + '\tAvailable ports: %s', type, port, this.ns, this.name, Object.keys(this.ports[type]).toString()));
       }
-      else if (type === 'output' &&
-        this.links[id].source.id === this.id &&
-        this.links[id].source.port === from) {
+    }
+  }, {
+    key: 'getPort',
+    value: function getPort(type, name) {
+      return this.getPortDefinition(name, type);
+    }
 
-        this.links[id].source.port = to;
+    /**
+     *
+     * Get the port option at the node
+     * this flow is relaying for.
+     *
+     * @param {String} type
+     * @param {String} port
+     * @param {String} option
+     */
+
+  }, {
+    key: 'getPortOption',
+    value: function getPortOption(type, port, option) {
+      // Exposed ports can also have options set.
+      // if this is _our_ port (it is exposed)
+      // just delegate this to the real node.
+      var portDef = this.getPortDefinition(port, type);
+      // Todo there is no real true false in portIsOpen?
+      // it will fail hard.
+      return this.getNode(portDef.nodeId).getPortOption(type, portDef.name, option);
+    }
+
+    /**
+     *
+     * Sets an input port option.
+     *
+     * The node schema for instance can specifiy whether a port is persistent.
+     *
+     * At the moment a connection can override these values.
+     * It's a way of saying I give you this once so take care of it.
+     *
+     * Ok, with forks running this should eventually be much smarter.
+     * If there are long running flows, all instances should have their
+     * ports updated.
+     *
+     * Not sure when setPortOption is called, if it is called during 'runtime'
+     * there is no problem and we could just set it on the current Actor.
+     * I could also just already fix it and update baseActor and all _actors.
+     * which would be sufficient.
+     */
+
+  }, {
+    key: 'setPortOption',
+    value: function setPortOption(type, port, opt, value) {
+      var portDef = this.getPortDefinition(port, type);
+      this.getNode(portDef.nodeId).setPortOption(type, portDef.name, opt, value);
+    }
+  }, {
+    key: 'openPort',
+    value: function openPort(port) {
+      if (this._openPorts.indexOf(port) === -1) {
+        this._openPorts.push(port);
+      }
+    }
+  }, {
+    key: 'isAction',
+    value: function isAction() {
+      return Boolean(this.actionName);
+    }
+
+    // TODO: implement
+
+  }, {
+    key: 'unplug',
+    value: function unplug(target) {
+      if (target.action && !this.isAction()) {
+        this.action(target.action).unplug(target);
+      } else {
+        // unplug logic
       }
     }
 
-    delete this.ports[type][from];
+    /**
+     *
+     * Set port to open state
+     *
+     * This is a problem, xFlow has it's ports opened.
+     * However this also means baseActor and all the forks
+     * Should have their ports opened.
+     *
+     * Ok, not a problem, only that addition of the :start port
+     * is a problem. Again not sure at what point plug()
+     * is called. I think during setup, but later on also
+     * in realtime. anyway for now I do not care so much about
+     * realtime. Doesn't make sense most of the time.
+     *
+     * @param {Connector} target
+     * @public
+     */
 
-    this.emit('renamePort', {
-      node: this.export(),
-      from: from,
-      to: to
-    });
+  }, {
+    key: 'plug',
+    value: function plug(target) {
+      if (target.action && !this.isAction()) {
+        this.action(target.action).plug(target);
+      } else {
+        if (target.port === ':start') {
+          this.addPort('input', ':start', {
+            name: ':start',
+            type: 'any'
+          });
+        }
 
-  }
+        // delegate this to the real node
+        // only if this is one of _our_ exposed nodes.
+        //var portDef = this.getPortDefinition(target.port, 'input');
+        var portDef = this.getPortDefinition(target.port, 'input');
 
-};
+        // start is not an internal port, we will do a push on the internal
+        // actor and he may figure it out..
+        //if (target.port !== ':start') {
+        if (target.port !== ':start') {
+          // The Node we are gating for
+          var internalNode = this.getNode(portDef.nodeId);
 
-Flow.prototype.addPort = function(type, name, def) {
+          var xlink = new xLink();
+          // just define our node as the source, and the external port
+          xlink.setSource(this.id, target.port, {}, target.action);
+          xlink.setTarget(target.id, portDef.name, {}, target.action);
 
-  // add it to known ports
-  if (!this.ports[type]) {
-    this.ports[type] = {};
-  }
-
-  this.ports[type][name] = def;
-
-  if (type === 'input') {
-    this.inPorts = Object.keys(this.ports[type]);
-  }
-  else {
-    this.outPorts = Object.keys(this.ports[type]);
-  }
-};
-
-/**
- *
- * Close the port of the node we are relaying for
- * and also close our own port.
- *
- * @param {String} port
- */
-Flow.prototype.closePort = function(port) {
-  // delegate this to the real node
-  // only if this is one of _our_ exposed nodes.
-  var portDef = this.getPortDefinition(port, 'input');
-
-  if (port !== ':start') {
-
-    this.getNode(portDef.nodeId).closePort(portDef.name);
-    // this._forks.forEach(function(fork) {
-    //  fork.getNode(portDef.nodeId).closePort(portDef.name);
-    //});
-  }
-
-  if (this.ports.input[port]) {
-    this._openPorts.splice(
-      this._openPorts.indexOf(port), 1
-    );
-  }
-
-  this._connections[port].pop();
-
-};
-
-Flow.prototype.hasConnections = function() {
-  return this._openPorts.length;
-};
-
-/**
- *
- * Puts this flow on hold.
- *
- * NOT IMPLEMENTED YET
- *
- * This should stop each and every fork.
- *
- */
-Flow.prototype.hold = function() {
-
-  // implement later, holds input for _this_ flow
-  this._hold = true;
-  this.stop();
-  /*
-  this._forks.forEach(function(fork) {
-    fork.stop();
-  });
-  */
-};
-
-/**
- *
- * Releases the node if it was on hold
- *
- * This should resume each and every fork.
- *
- * @public
- */
-Flow.prototype.release = function() {
-
-  // TODO: these are all just on the actor, not sure Flow also needs it.
-
-  this._hold = false;
-  this.resume();
-  /*
-  this._forks.forEach(function(fork) {
-    fork.resume();
-  });
-  */
-};
-
-/**
- *
- * Complete function
- *
- * @public
- */
-Flow.prototype.complete = function() {
-
-  // todo: check this.ready stuff logic.
-  this.ready = false;
-  this.active = false;
-
-};
-
-Flow.prototype.portHasConnection = function(port, link) {
-  if (this._connections.hasOwnProperty(port)) {
-    return this._connections[port].indexOf(link) >= 0;
-  }
-  else {
-    return false;
-  }
-};
-
-Flow.prototype.portHasConnections = function(port) {
-  if (this._connections.hasOwnProperty(port)) {
-    return this._connections[port].length >= 0;
-  }
-  else {
-    return false;
-  }
-};
-
-Flow.prototype.portGetConnections = function(port) {
-  return this._connections[port];
-};
-
-/**
- *
- * Listen for output on 'our' ports
- *
- * The internal Actor will actually listen just like the normal actor.
- *
- * @public
- */
-Flow.prototype.listenForOutput = function() {
-
-  var port;
-  var internalPort;
-  var self = this;
-
-  // not really used yet, but this would envolve just
-  // commanding all nodes to shutdown,
-  // which will be a simple loop.
-  // baseActor loop doesn't make much sense but ah well.
-  //
-  function outputHandler(port, internalPort) {
-    return function internalPortHandlerFlow(data) {
-      if (internalPort === data.port) {
-
-        var p = data.out;
-
-        // take ownership
-        p.setOwner(self);
-
-        debug('%s:%s output', self.identifier, port);
-        self.sendPortOutput(port, p);
-
-        // there is no real way to say a graph has executed.
-        // So just consider each output as an execution.
-        // TODO: a bit expensive
-        self.event(':executed', {
-          node: self.export()
-        });
-
-      }
-    };
-  }
-
-  function freePortHandler(externalPort, internalPort) {
-
-    return function freePortHandlerFlow(event) {
-
-      if (internalPort === event.port) {
-
-        if (self._connections.hasOwnProperty(externalPort)) {
-
-          var extLink;
-          var conns = self._connections[externalPort];
-          for (var i = 0; i < conns.length; i++) {
-            if (conns[i].internalLink === event.link) {
-              extLink = conns[i];
-              break; // yeay..
+          for (var k in target.setting) {
+            if (target.setting.hasOwnProperty(k)) {
+              xlink.target.set(k, target.setting[k]);
             }
           }
 
-          if (!extLink) {
-            throw Error('Cannot determine outer link');
-          }
-          else {
-            debug('%s:%s :freePort', self.identifier, externalPort);
-            self.event(':freePort', {
-              node: self.export(),
-              link: extLink,
-              port: externalPort
-            });
-
-            self.emit('freePort', {
-              node: self.export(),
-              link: extLink,
-              port: externalPort
-            });
+          // fixed settings
+          if (portDef.hasOwnProperty('setting')) {
+            for (var k in portDef.setting) {
+              if (portDef.setting.hasOwnProperty(k)) {
+                xlink.target.set(k, portDef.setting[k]);
+              }
+            }
           }
 
-        }
-        else {
-          // no connections.
-        }
+          internalNode.plug(xlink.target);
 
-      }
-    };
-  }
+          // Copy the port type, delayed type setting, :start is only known after
+          // the port is opened...
+          this.ports.input[target.port].type = internalNode.ports.input[xlink.target.port].type;
 
-  var internalNode;
-  if (this.ports.output) {
-    for (port in this.ports.output) {
-      if (this.ports.output.hasOwnProperty(port)) {
-        internalPort = this.ports.output[port];
-        // These bypass the IOHandler, but that's ok, they
-        // are just external internal port mappings.
-        internalNode = this.getNode(internalPort.nodeId);
-        internalNode.on('output', outputHandler(port, internalPort.name));
-      }
-    }
-  }
+          // we add our internalLink as reference to our link.
+          // a bit of a hack, it's not known by the definition of
+          // Link itself
+          target.wire.internalLink = xlink;
 
-  if (this.ports.input) {
-    for (port in this.ports.input) {
-      if (this.ports.input.hasOwnProperty(port)) {
-        internalPort = this.ports.input[port];
-        // These bypass the IOHandler, but that's ok, they
-        // are just external internal port mappings.
-        internalNode = this.getNode(internalPort.nodeId);
-        internalNode.on('freePort', freePortHandler(port, internalPort.name));
-      }
-    }
-  }
-};
+          // outer/inner mapping
+          this.linkMap.set(target.wire.id, xlink);
+        } else {}
+        // what to do with start port?
 
-/**
- *
- * Runs the shutdown method of the blackbox
- *
- * NOT IMPLEMENTED
- *
- * @public
- */
-Flow.prototype.shutdown = function() {
-
-  // not really used yet, but this would envolve just
-  // commanding all nodes to shutdown,
-  // which will be a simple loop.
-};
-
-/**
- *
- * Return a serializable export of this flow.
- *
- * @public
- */
-Flow.prototype.export = function() {
-
-  return {
-
-    id: this.id,
-    pid: this.pid,
-    ns: this.ns,
-    name: this.name,
-    identifier: this.identifier,
-    ports: this.ports,
-    // cycles: this.cycles,
-    inPorts: this.inPorts,
-    outPorts: this.outPorts,
-    //filled: this.filled,
-    // context: this.context,
-    active: this.active,
-    provider: this.provider,
-    // input: this._filteredInput(),
-    openPorts: this._openPorts,
-    // nodeTimeout: this.nodeTimeout,
-    // inputTimeout: this.inputTimeout
-  };
-
-};
-
-/**
- *
- * Export this modified instance to a nodedefinition.
- *
- * @public
- */
-Flow.prototype.toJSON = function() {
-
-  var def = {
-    id: this.id,
-    ns: this.ns,
-    name: this.name,
-    title: this.title,
-    type: this.type,
-    description: this.description,
-    // should not be the full nodes
-    nodes: [],
-    links: [],
-    ports: this.ports,
-    providers: this.providers
-  };
-
-  for (var name in this.nodes) {
-    if (this.nodes.hasOwnProperty(name)) {
-      def.nodes.push(this.nodes[name].toJSON());
-    }
-  }
-
-  for (var id in this.links) {
-    if (this.links.hasOwnProperty(id)) {
-      def.links.push(this.links[id].toJSON());
-    }
-  }
-
-  validate.flow(def);
-
-  return def;
-
-};
-
-Flow.prototype.isStartable = function() {
-
-  // err ok, how to determine this.
-  // a flow is always startable?
-  // ok for now it is..
-  // it should'nt though..
-  return true;
-
-};
-
-Flow.prototype.event = function(port, output) {
-  var p = new Packet(
-    this,
-    output,
-    'object' // always object
-  );
-  this.sendPortOutput(port, p);
-};
-
-Flow.prototype.sendPortOutput = function(port, p) {
-
-  // important identifies from what action this output came.
-  // used by connections to determine if it should consume
-  // the output.
-
-  var out = {
-    node: this.export(),
-    port: port,
-    out: p
-  };
-
-  if (this.isAction()) {
-    out.action = self.action;
-  }
-
-  // give up ownership
-  p.release(this);
-
-  this.emit('output', out);
-
-};
-
-Flow.prototype.destroy = function() {
-
-  // just ask all nodes to destroy themselves
-  // and finally do the same with self
-  for (var id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      this.nodes.destroy();
-    }
-  }
-
-};
-
-Flow.prototype.setPid = function(pid) {
-
-  this.pid = pid;
-
-};
-
-/**
- *
- * Create an xFlow
- *
- * Some kind of logic as the actor
- *
- * @api public
- */
-Flow.create = function(map, loader, ioHandler, processManager) {
-
-  var actor = new Flow(
-    map.id,
-    map,
-    map.ns + ':' + map.name,
-    loader,
-    ioHandler,
-    processManager
-  );
-
-  return actor;
-};
-
-Flow.prototype.reset = function() {
-
-  this.runCount = 0;
-  //this.filled = 0;
-
-  // ask all our nodes to reset.
-  // TODO: will be done double if the IO manager
-  // also ask all nodes to reset itself.
-  for (var id in this.nodes) {
-    if (this.nodes.hasOwnProperty(id)) {
-      this.nodes.reset();
-    }
-  }
-
-};
-
-/**
- *
- * Helper function to make the flow an npm module itself.
- *
- * Usage:
- *
- *   Ok, here is the clash...
- *   xFlow needs way to much information to initialize.
- *   It should have the same interface as actor.
- *
- *   var xflow = new xFlow:create(map, loader);
- *   xflow.addMap(map);
- *
- *   module.exports = xflow.expose;
- *
- *   ---
- *
- *   var flow = require('my-flow');
- *
- *   flow({
- *     in: 'some_data',
- *     in2: 'other_data'
- *   }, {
- *     out: function(data) {
- *       // do something with data..
- *     }
- *   });
- *
- * Ok, then what about the actions.
- *
- */
-Flow.prototype.expose = function(input, output) {
-
-  var iips = [];
-  var key;
-  var self = this;
-  if (this.hasOwnProperty('ports')) {
-
-    if (this.ports.hasOwnProperty('input')) {
-
-      for (key in input) {
-
-        if (input.hasOwnProperty(key)) {
-
-          var iip;
-          var inputPorts = this.ports.input;
-
-          if (inputPorts.hasOwnProperty(key)) {
-
-            iip = {
-              target: {
-                id: inputPorts[key].nodeId,
-                port: inputPorts[key].name,
-              },
-              data: input[key]
-            };
-
-            iips.push(iip);
-
-            // Within the exposed ports these should
-            // already be set if they must be used.
-            // (implement that) they are not properties
-            // a caller should set.
-            //
-            // target.settings,
-            // target.action
-
-          }
-          else {
-
-            throw Error(util.format('No such input port %s', key));
-
-          }
-
+        // use same logic for our own ports
+        if (!this._connections.hasOwnProperty(target.port)) {
+          this._connections[target.port] = [];
         }
 
+        this._connections[target.port].push(target.wire);
+
+        this.openPort(target.port);
+      }
+    }
+  }, {
+    key: 'exposePort',
+    value: function exposePort(type, nodeId, port, name) {
+      var node = this.getNode(nodeId);
+
+      if (node.ports[type]) {
+        for (var p in node.ports[type]) {
+          if (node.ports[type].hasOwnProperty(p)) {
+            if (p === port) {
+              // not sure, is this all info?
+              this.addPort(type, name, {
+                nodeId: nodeId,
+                name: port
+              });
+
+              continue;
+            }
+          }
+        }
       }
 
+      this.emit('addPort', {
+        node: this.export(),
+        port: name
+      });
     }
-    else {
-      throw Error('The map provided does not have any input ports available');
-    }
+  }, {
+    key: 'removePort',
+    value: function removePort(type, name) {
+      if (this.ports[type][name]) {
+        delete this.ports[type][name];
 
-    if (output) {
-
-      var cb = output;
-
-      if (this.ports.hasOwnProperty('output')) {
-
-        /////// setup callbacks
-        this.on('output', function output(data) {
-          if (data.node.id === self.id && cb.hasOwnProperty(data.port)) {
-            // TODO: does not take ownership into account
-            cb[data.port](data.out);
-          }
+        this.emit('removePort', {
+          node: this.export(),
+          port: name
         });
-
       }
-      else {
-        throw Error(
-          'The map provided does not have any output ports available'
-        );
+    }
+  }, {
+    key: 'renamePort',
+    value: function renamePort(type, from, to) {
+      if (this.ports[type][from]) {
+        this.ports[type][to] = JSON.parse(JSON.stringify(this.ports[type][from]));
+
+        // update links pointing to us.
+        // updates ioHandler also because it holds
+        // references to these links
+        // TODO: pid/id warning...
+        // renaming will only update this instance.
+        // accidently these links will make each instance
+        // point to the new ports, however not each instance
+        // has it's port renamed..
+        // For rename it's better to stop the graph
+        // update the definition itself then start it again
+        // Because for instance the io handler will still send
+        // to old ports.
+        var _iteratorNormalCompletion = true;
+        var _didIteratorError = false;
+        var _iteratorError = undefined;
+
+        try {
+          for (var _iterator = this.links.values()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+            var link = _step.value;
+
+            if (type === 'input' && link.target.id === this.id && link.target.port === from) {
+
+              link.target.port = to;
+            } else if (type === 'output' && link.source.id === this.id && link.source.port === from) {
+
+              link.source.port = to;
+            }
+          }
+        } catch (err) {
+          _didIteratorError = true;
+          _iteratorError = err;
+        } finally {
+          try {
+            if (!_iteratorNormalCompletion && _iterator.return) {
+              _iterator.return();
+            }
+          } finally {
+            if (_didIteratorError) {
+              throw _iteratorError;
+            }
+          }
+        }
+
+        delete this.ports[type][from];
+
+        this.emit('renamePort', {
+          node: this.export(),
+          from: from,
+          to: to
+        });
+      }
+    }
+  }, {
+    key: 'addPort',
+    value: function addPort(type, name, def) {
+      // add it to known ports
+      if (!this.ports[type]) {
+        this.ports[type] = {};
       }
 
+      this.ports[type][name] = def;
+
+      if (type === 'input') {
+        this.inPorts = Object.keys(this.ports[type]);
+      } else {
+        this.outPorts = Object.keys(this.ports[type]);
+      }
     }
 
-  }
-  else {
-    throw Error('The map provided does not have any ports available');
-  }
+    /**
+     *
+     * Close the port of the node we are relaying for
+     * and also close our own port.
+     *
+     * @param {String} port
+     */
 
-  // start it all
-  if (iips.length) {
-    this.sendIIPs(iips);
-  }
+  }, {
+    key: 'closePort',
+    value: function closePort(port) {
+      // delegate this to the real node
+      // only if this is one of _our_ exposed nodes.
+      var portDef = this.getPortDefinition(port, 'input');
 
-  this.push();
+      if (port !== ':start') {
+        this.getNode(portDef.nodeId).closePort(portDef.name);
+        // this._forks.forEach(function(fork) {
+        //  fork.getNode(portDef.nodeId).closePort(portDef.name);
+        //});
+      }
 
-  return this;
+      if (this.ports.input[port]) {
+        this._openPorts.splice(this._openPorts.indexOf(port), 1);
+      }
 
-};
+      this._connections[port].pop();
+    }
+  }, {
+    key: 'hasConnections',
+    value: function hasConnections() {
+      return this._openPorts.length;
+    }
 
-Flow.prototype.getConnections = function() {
-  return this._connections;
-};
+    /**
+     *
+     * Puts this flow on hold.
+     *
+     * NOT IMPLEMENTED YET
+     *
+     * This should stop each and every fork.
+     *
+     */
 
-/**
- *
- * Adds the parent Actor.
- *
- * For now this is only used to copy the events.
- *
- * It causes all nested actors to report to the root
- * actor's listeners.
- *
- * Rather important, otherwise you would
- * only get the events from the first root Actor/Flow
- *
- * @param {Object} actor
- */
-Flow.prototype.setParent = function(actor) {
-  this.parent = actor;
-};
+  }, {
+    key: 'hold',
+    value: function hold() {
+      // implement later, holds input for _this_ flow
+      this._hold = true;
+      this.stop();
+      /*
+       this._forks.forEach(function(fork) {
+       fork.stop();
+       });
+       */
+    }
 
-Flow.prototype.getParent = function() {
-  return this.parent;
-};
+    /**
+     *
+     * Releases the node if it was on hold
+     *
+     * This should resume each and every fork.
+     *
+     * @public
+     */
 
-Flow.prototype.hasParent = function() {
-  return !!this.parent;
-};
+  }, {
+    key: 'release',
+    value: function release() {
+      // TODO: these are all just on the actor, not sure Flow also needs it.
+
+      this._hold = false;
+      this.resume();
+      /*
+       this._forks.forEach(function(fork) {
+       fork.resume();
+       });
+       */
+    }
+
+    /**
+     *
+     * Complete function
+     *
+     * @public
+     */
+
+  }, {
+    key: 'complete',
+    value: function complete() {
+      // todo: check this.ready stuff logic.
+      this.ready = false;
+      this.active = false;
+    }
+  }, {
+    key: 'portHasConnection',
+    value: function portHasConnection(port, link) {
+      if (this._connections.hasOwnProperty(port)) {
+        return this._connections[port].indexOf(link) >= 0;
+      } else {
+        return false;
+      }
+    }
+  }, {
+    key: 'portHasConnections',
+    value: function portHasConnections(port) {
+      if (this._connections.hasOwnProperty(port)) {
+        return this._connections[port].length >= 0;
+      } else {
+        return false;
+      }
+    }
+  }, {
+    key: 'portGetConnections',
+    value: function portGetConnections(port) {
+      return this._connections[port];
+    }
+
+    /**
+     *
+     * Listen for output on 'our' ports
+     *
+     * The internal Actor will actually listen just like the normal actor.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'listenForOutput',
+    value: function listenForOutput() {
+      var self = this;
+
+      // not really used yet, but this would envolve just
+      // commanding all nodes to shutdown,
+      // which will be a simple loop.
+      // baseActor loop doesn't make much sense but ah well.
+      //
+      function outputHandler(port, internalPort) {
+        return function internalPortHandlerFlow(data) {
+          if (internalPort === data.port) {
+            var p = data.out;
+
+            // take ownership
+            p.setOwner(self);
+
+            debug('%s:%s output', self.identifier, port);
+            self.sendPortOutput(port, p);
+
+            // there is no real way to say a graph has executed.
+            // So just consider each output as an execution.
+            // TODO: a bit expensive
+            self.event(':executed', {
+              node: self.export()
+            });
+          }
+        };
+      }
+
+      function freePortHandler(externalPort, internalPort) {
+        return function freePortHandlerFlow(event) {
+          if (internalPort === event.port) {
+            if (self._connections.hasOwnProperty(externalPort)) {
+              var extLink;
+              var conns = self._connections[externalPort];
+              for (var i = 0; i < conns.length; i++) {
+                if (conns[i].internalLink === event.link) {
+                  extLink = conns[i];
+                  break; // yeay..
+                }
+              }
+
+              if (!extLink) {
+                throw Error('Cannot determine outer link');
+              } else {
+                debug('%s:%s :freePort', self.identifier, externalPort);
+                self.event(':freePort', {
+                  node: self.export(),
+                  link: extLink,
+                  port: externalPort
+                });
+
+                self.emit('freePort', {
+                  node: self.export(),
+                  link: extLink,
+                  port: externalPort
+                });
+              }
+            } else {
+              // no connections.
+            }
+          }
+        };
+      }
+
+      var internalNode = undefined;
+      var internalPort = undefined;
+      if (this.ports.output) {
+        for (var port in this.ports.output) {
+          if (this.ports.output.hasOwnProperty(port)) {
+            internalPort = this.ports.output[port];
+            // These bypass the IOHandler, but that's ok, they
+            // are just external internal port mappings.
+            internalNode = this.getNode(internalPort.nodeId);
+            internalNode.on('output', outputHandler(port, internalPort.name));
+          }
+        }
+      }
+
+      if (this.ports.input) {
+        for (var port in this.ports.input) {
+          if (this.ports.input.hasOwnProperty(port)) {
+            internalPort = this.ports.input[port];
+            // These bypass the IOHandler, but that's ok, they
+            // are just external internal port mappings.
+            internalNode = this.getNode(internalPort.nodeId);
+            internalNode.on('freePort', freePortHandler(port, internalPort.name));
+          }
+        }
+      }
+    }
+
+    /**
+     *
+     * Runs the shutdown method of the blackbox
+     *
+     * NOT IMPLEMENTED
+     *
+     * @public
+     */
+
+  }, {
+    key: 'shutdown',
+    value: function shutdown() {}
+    // not really used yet, but this would envolve just
+    // commanding all nodes to shutdown,
+    // which will be a simple loop.
+
+    /**
+     *
+     * Return a serializable export of this flow.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'export',
+    value: function _export() {
+      return {
+        id: this.id,
+        pid: this.pid,
+        ns: this.ns,
+        name: this.name,
+        identifier: this.identifier,
+        ports: this.ports,
+        // cycles: this.cycles,
+        inPorts: this.inPorts,
+        outPorts: this.outPorts,
+        //filled: this.filled,
+        // context: this.context,
+        active: this.active,
+        provider: this.provider,
+        // input: this._filteredInput(),
+        openPorts: this._openPorts
+        // nodeTimeout: this.nodeTimeout,
+        // inputTimeout: this.inputTimeout
+      };
+    }
+
+    /**
+     *
+     * Export this modified instance to a nodedefinition.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'toJSON',
+    value: function toJSON() {
+      var def = {
+        id: this.id,
+        ns: this.ns,
+        name: this.name,
+        title: this.title,
+        type: this.type,
+        description: this.description,
+        // should not be the full nodes
+        nodes: [],
+        links: [],
+        ports: this.ports,
+        providers: this.providers
+      };
+
+      var _iteratorNormalCompletion2 = true;
+      var _didIteratorError2 = false;
+      var _iteratorError2 = undefined;
+
+      try {
+        for (var _iterator2 = this.nodes.values()[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+          var node = _step2.value;
+
+          def.nodes.push(node.toJSON());
+        }
+      } catch (err) {
+        _didIteratorError2 = true;
+        _iteratorError2 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion2 && _iterator2.return) {
+            _iterator2.return();
+          }
+        } finally {
+          if (_didIteratorError2) {
+            throw _iteratorError2;
+          }
+        }
+      }
+
+      var _iteratorNormalCompletion3 = true;
+      var _didIteratorError3 = false;
+      var _iteratorError3 = undefined;
+
+      try {
+        for (var _iterator3 = this.links.values()[Symbol.iterator](), _step3; !(_iteratorNormalCompletion3 = (_step3 = _iterator3.next()).done); _iteratorNormalCompletion3 = true) {
+          var link = _step3.value;
+
+          def.links.push(link.toJSON());
+        }
+      } catch (err) {
+        _didIteratorError3 = true;
+        _iteratorError3 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion3 && _iterator3.return) {
+            _iterator3.return();
+          }
+        } finally {
+          if (_didIteratorError3) {
+            throw _iteratorError3;
+          }
+        }
+      }
+
+      validate.flow(def);
+
+      return def;
+    }
+  }, {
+    key: 'isStartable',
+    value: function isStartable() {
+      // err ok, how to determine this.
+      // a flow is always startable?
+      // ok for now it is..
+      // it should'nt though..
+      return true;
+    }
+  }, {
+    key: 'event',
+    value: function event(port, output) {
+      var p = new Packet(this, output, 'object' // always object
+      );
+      this.sendPortOutput(port, p);
+    }
+  }, {
+    key: 'sendPortOutput',
+    value: function sendPortOutput(port, p) {
+      // important identifies from what action this output came.
+      // used by connections to determine if it should consume
+      // the output.
+
+      var out = {
+        node: this.export(),
+        port: port,
+        out: p
+      };
+
+      if (this.isAction()) {
+        out.action = this.action;
+      }
+
+      // give up ownership
+      p.release(this);
+
+      this.emit('output', out);
+    }
+  }, {
+    key: 'destroy',
+    value: function destroy() {
+      // just ask all nodes to destroy themselves
+      // and finally do the same with self
+      var _iteratorNormalCompletion4 = true;
+      var _didIteratorError4 = false;
+      var _iteratorError4 = undefined;
+
+      try {
+        for (var _iterator4 = this.nodes.values()[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
+          var node = _step4.value;
+
+          node.destroy();
+        }
+      } catch (err) {
+        _didIteratorError4 = true;
+        _iteratorError4 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion4 && _iterator4.return) {
+            _iterator4.return();
+          }
+        } finally {
+          if (_didIteratorError4) {
+            throw _iteratorError4;
+          }
+        }
+      }
+    }
+  }, {
+    key: 'setPid',
+    value: function setPid(pid) {
+      this.pid = pid;
+    }
+
+    /**
+     *
+     * Create an xFlow
+     *
+     * Some kind of logic as the actor
+     *
+     * @public
+     */
+
+  }, {
+    key: 'reset',
+    value: function reset() {
+      this.runCount = 0;
+      //this.filled = 0;
+
+      // ask all our nodes to reset.
+      // TODO: will be done double if the IO manager
+      // also ask all nodes to reset itself.
+      var _iteratorNormalCompletion5 = true;
+      var _didIteratorError5 = false;
+      var _iteratorError5 = undefined;
+
+      try {
+        for (var _iterator5 = this.nodes.values()[Symbol.iterator](), _step5; !(_iteratorNormalCompletion5 = (_step5 = _iterator5.next()).done); _iteratorNormalCompletion5 = true) {
+          var node = _step5.value;
+
+          node.reset();
+        }
+      } catch (err) {
+        _didIteratorError5 = true;
+        _iteratorError5 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion5 && _iterator5.return) {
+            _iterator5.return();
+          }
+        } finally {
+          if (_didIteratorError5) {
+            throw _iteratorError5;
+          }
+        }
+      }
+    }
+
+    /**
+     *
+     * Helper function to make the flow an npm module itself.
+     *
+     * Usage:
+     *
+     *   Ok, here is the clash...
+     *   xFlow needs way to much information to initialize.
+     *   It should have the same interface as actor.
+     *
+     *   var xflow = new xFlow:create(map, loader);
+     *   xflow.addMap(map);
+     *
+     *   module.exports = xflow.expose;
+     *
+     *   ---
+     *
+     *   var flow = require('my-flow');
+     *
+     *   flow({
+    *     in: 'some_data',
+    *     in2: 'other_data'
+    *   }, {
+    *     out: function(data) {
+    *       // do something with data..
+    *     }
+    *   });
+     *
+     * Ok, then what about the actions.
+     *
+     */
+
+  }, {
+    key: 'expose',
+    value: function expose(input, output) {
+      var iips = [];
+      var key;
+      var self = this;
+      if (this.hasOwnProperty('ports')) {
+        if (this.ports.hasOwnProperty('input')) {
+          for (key in input) {
+            if (input.hasOwnProperty(key)) {
+              var iip;
+              var inputPorts = this.ports.input;
+
+              if (inputPorts.hasOwnProperty(key)) {
+                iip = {
+                  target: {
+                    id: inputPorts[key].nodeId,
+                    port: inputPorts[key].name
+                  },
+                  data: input[key]
+                };
+
+                iips.push(iip);
+
+                // Within the exposed ports these should
+                // already be set if they must be used.
+                // (implement that) they are not properties
+                // a caller should set.
+                //
+                // target.settings,
+                // target.action
+              } else {
+                  throw Error(util.format('No such input port %s', key));
+                }
+            }
+          }
+        } else {
+          throw Error('The map provided does not have any input ports available');
+        }
+
+        if (output) {
+          var cb = output;
+
+          if (this.ports.hasOwnProperty('output')) {
+            /////// setup callbacks
+            this.on('output', function output(data) {
+              if (data.node.id === self.id && cb.hasOwnProperty(data.port)) {
+                // TODO: does not take ownership into account
+                cb[data.port](data.out);
+              }
+            });
+          } else {
+            throw Error('The map provided does not have any output ports available');
+          }
+        }
+      } else {
+        throw Error('The map provided does not have any ports available');
+      }
+
+      // start it all
+      if (iips.length) {
+        this.sendIIPs(iips);
+      }
+
+      this.push();
+
+      return this;
+    }
+  }, {
+    key: 'getConnections',
+    value: function getConnections() {
+      return this._connections;
+    }
+
+    /**
+     *
+     * Adds the parent Actor.
+     *
+     * For now this is only used to copy the events.
+     *
+     * It causes all nested actors to report to the root
+     * actor's listeners.
+     *
+     * Rather important, otherwise you would
+     * only get the events from the first root Actor/Flow
+     *
+     * @param {Object} actor
+     */
+
+  }, {
+    key: 'setParent',
+    value: function setParent(actor) {
+      this.parent = actor;
+    }
+  }, {
+    key: 'getParent',
+    value: function getParent() {
+      return this.parent;
+    }
+  }, {
+    key: 'hasParent',
+    value: function hasParent() {
+      return Boolean(this.parent);
+    }
+  }], [{
+    key: 'create',
+    value: function create(map, loader, ioHandler, processManager) {
+      var actor = new Flow(map.id, map, map.ns + ':' + map.name, loader, ioHandler, processManager);
+
+      return actor;
+    }
+  }]);
+
+  return Flow;
+})(Actor);
 
 module.exports = Flow;
+//# sourceMappingURL=flow.js.map
 
-},{"./ConnectionMap":17,"./actor":18,"./link":24,"./packet":29,"./validate":38,"debug":49,"util":16}],22:[function(require,module,exports){
+},{"./ConnectionMap":11,"./actor":12,"./link":26,"./packet":31,"./validate":41,"debug":"V4HZ/5","util":6}],24:[function(require,module,exports){
 'use strict';
+
+function _typeof(obj) { return obj && typeof Symbol !== "undefined" && obj.constructor === Symbol ? "symbol" : typeof obj; }
 
 var util = require('util');
 
@@ -6500,9 +6125,9 @@ var util = require('util');
  * @param {Link} link
  * @param {Data} data
  * @param {Packet} p
- * @api public
+ * @public
  */
-module.exports = function handleIndex(link, data, p) {
+function handleIndex(link, data, p) {
   // TODO: data should be better defined and a typed object
   var index = link.source.get('index');
   if (/^\d+/.test(index)) {
@@ -6513,66 +6138,54 @@ module.exports = function handleIndex(link, data, p) {
         p.point(link, index);
         //p.index = index;
         //return data[index];
-      }
-      else {
-        throw new Error(
-          util.format(
-            'index[] out-of-bounds on array output port `%s`',
-            link.source.port
-          )
-        );
-      }
+      } else {
+          throw new Error(util.format('index[] out-of-bounds on array output port `%s`', link.source.port));
+        }
+    } else {
+      throw new Error(util.format('Got index[] on array output port `%s`, ' + 'but data is not of the array type', link.source.port));
     }
-    else {
-      throw new Error(
-        util.format(
-          'Got index[] on array output port `%s`, ' +
-          'but data is not of the array type',
-          link.source.port
-        )
-      );
-    }
-  }
-  else {
-    if (typeof data === 'object') {
+  } else {
+    if ((typeof data === 'undefined' ? 'undefined' : _typeof(data)) === 'object') {
       if (data.hasOwnProperty(index)) {
+        // TODO: test with dot-object
         // new remember index.
         p.point(link, index);
         //p.index = index;
         //return data[index];
-      }
-      else {
-        // maybe do not fail hard and just send to the error port.
-        console.log(p);
-        throw new Error(
-          util.format(
-            'Property `%s` not found on object output port `%s`',
-            index,
-            link.source.port
-          )
-        );
-      }
-    }
-    else {
-      throw new Error(
-        util.format(
-          'Got index[] on non-object output port %s',
-          link.source.port
-        )
-      );
+      } else {
+          // maybe do not fail hard and just send to the error port.
+          console.log(p);
+          throw new Error(util.format('Property `%s` not found on object output port `%s`', index, link.source.port));
+        }
+    } else {
+      throw new Error(util.format('Got index[] on non-object output port %s', link.source.port));
     }
   }
-};
+}
 
-},{"util":16}],23:[function(require,module,exports){
+module.exports = handleIndex;
+//# sourceMappingURL=indexHandler.js.map
+
+},{"util":6}],25:[function(require,module,exports){
 'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _typeof(obj) { return obj && typeof Symbol !== "undefined" && obj.constructor === Symbol ? "symbol" : typeof obj; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
 var Packet = require('../packet');
 var EventEmitter = require('events').EventEmitter;
 var util = require('util');
 var CHI = require('chix-chi');
 var uuid = require('uuid').v4;
 var handleIndex = require('./indexHandler');
-var isPlainObject = require('is-plain-object');
+//const isPlainObject = require('is-plain-object');
 var DefaultQueueManager = require('../queue/defaultManager');
 var debug = require('debug')('chix:io');
 
@@ -6596,700 +6209,725 @@ var debug = require('debug')('chix:io');
  *
  **/
 
-function IoMapHandler() {
-  this.CHI = new CHI();
-  // todo: create maps from each of these and wrap them in a connections map
-  // so all there wil be is this.connections.
-  // connections.byTarget, connections.bySource etc.
-  this.targetMap = {};
-  this.connections = {};
-  this.sourceMap = {};
-  this.syncedTargetMap = {};
-  this.pointerPorts = {};
-  this._shutdown = false;
-  this.addQueueManager(
-    new DefaultQueueManager(this.receiveFromQueue.bind(this))
-  );
-  this.addCHI(this.CHI);
-}
+var IoMapHandler = (function (_EventEmitter) {
+  _inherits(IoMapHandler, _EventEmitter);
 
-util.inherits(IoMapHandler, EventEmitter);
+  function IoMapHandler() {
+    _classCallCheck(this, IoMapHandler);
 
-IoMapHandler.prototype.addCHI = function(CHI) {
-  this.CHI = CHI;
-  this.CHI.on('begingroup', this.beginGroup.bind(this));
-  this.CHI.on('endgroup', this.sendGroup.bind(this));
-  this.CHI.on('collected', this.collected.bind(this));
-  this.CHI.on('synced', this.sendSynced.bind(this));
-};
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(IoMapHandler).call(this));
 
-/**
- *
- * Connects ports together using the link information provided.
- *
- *  @param {xLink} link
- * @api public
- */
-IoMapHandler.prototype.connect = function(link) {
-  if (!link.source) {
-    throw Error('Link requires a source');
+    _this.CHI = new CHI();
+    // todo: create maps from each of these and wrap them in a connections map
+    // so all there wil be is this.connections.
+    // connections.byTarget, connections.bySource etc.
+    _this.targetMap = new Map();
+    _this.sourceMap = new Map();
+    _this.connections = new Map();
+    _this.syncedTargetMap = new Map();
+    _this.pointerPorts = new Map();
+    _this._shutdown = false;
+    _this.addQueueManager(new DefaultQueueManager(_this.receiveFromQueue.bind(_this)));
+    _this.addCHI(_this.CHI);
+    return _this;
   }
-  if (!link.source.pid) {
-    link.source.pid = link.source.id;
-  }
-  // TODO: quick fix, which never works..
-  // ioHandler is the only one assigning these..
-  // a link with ioid set should be rejected..
-  if (!link.ioid) {
-    link.ioid = uuid();
-  }
-  if (!link.target) {
-    throw Error('Link requires a target');
-  }
-  if (!link.target.pid) {
-    link.target.pid = link.target.id;
-  }
-  // register the connection
-  this.connections[link.ioid] = link;
-  if (!this.targetMap[link.source.pid]) {
-    this.targetMap[link.source.pid] = [];
-  }
-  this.targetMap[link.source.pid].push(link);
-  if (!this.sourceMap[link.target.pid]) {
-    this.sourceMap[link.target.pid] = [];
-  }
-  this.sourceMap[link.target.pid].push(link);
-  // build the syncedTargetMap, it contains a port array
-  // (the group that wants a sync with some originId
-  if (link.target.has('sync')) {
-    if (!this.syncedTargetMap[link.target.pid]) {
-      this.syncedTargetMap[link.target.pid] = {};
+
+  _createClass(IoMapHandler, [{
+    key: 'addCHI',
+    value: function addCHI(CHI) {
+      this.CHI = CHI;
+      this.CHI.on('begingroup', this.beginGroup.bind(this));
+      this.CHI.on('endgroup', this.sendGroup.bind(this));
+      this.CHI.on('collected', this.collected.bind(this));
+      this.CHI.on('synced', this.sendSynced.bind(this));
     }
-    if (!this.syncedTargetMap[link.target.pid][link.target.get('sync')]) {
-      this.syncedTargetMap[link.target.pid][link.target.get('sync')] = [];
+
+    /**
+     *
+     * Connects ports together using the link information provided.
+     *
+     * @param {xLink} link
+     * @public
+     */
+
+  }, {
+    key: 'connect',
+    value: function connect(link) {
+      if (!link.source) {
+        throw Error('Link requires a source');
+      }
+      if (!link.source.pid) {
+        link.source.pid = link.source.id;
+      }
+      // TODO: quick fix, which never works..
+      // ioHandler is the only one assigning these..
+      // a link with ioid set should be rejected..
+      if (!link.ioid) {
+        link.ioid = uuid();
+      }
+      if (!link.target) {
+        throw Error('Link requires a target');
+      }
+      if (!link.target.pid) {
+        link.target.pid = link.target.id;
+      }
+      // register the connection
+      this.connections.set(link.ioid, link);
+      if (!this.targetMap.has(link.source.pid)) {
+        this.targetMap.set(link.source.pid, []);
+      }
+      this.targetMap.get(link.source.pid).push(link);
+      if (!this.sourceMap.has(link.target.pid)) {
+        this.sourceMap.set(link.target.pid, []);
+      }
+      this.sourceMap.get(link.target.pid).push(link);
+      // build the syncedTargetMap, it contains a port array
+      // (the group that wants a sync with some originId
+      if (link.target.has('sync')) {
+        if (!this.syncedTargetMap.has(link.target.pid)) {
+          this.syncedTargetMap.set(link.target.pid, {});
+        }
+        if (!this.syncedTargetMap.get(link.target.pid)[link.target.get('sync')]) {
+          this.syncedTargetMap.get(link.target.pid)[link.target.get('sync')] = [];
+        }
+        this.syncedTargetMap.get(link.target.pid)[link.target.get('sync')].push(link.target.port);
+        debug('%s: syncing source port `%s` with target port %s', link.ioid, link.target.get('sync'), link.target.port);
+      }
+      if (link.source.get('pointer')) {
+        if (!this.pointerPorts.has(link.source.pid)) {
+          this.pointerPorts.set(link.source.pid, []);
+        }
+        this.pointerPorts.get(link.source.pid).push(link.source.port);
+        debug('%s: added pointer port `%s`', link.ioid, link.source.port);
+      }
+
+      debug('%s: link connected', link.ioid);
+
+      this.emit('connect', link);
     }
-    this.syncedTargetMap[link.target.pid][link.target.get('sync')]
-      .push(link.target.port);
-    debug(
-      '%s: syncing source port `%s` with target port %s',
-      link.ioid, link.target.get('sync'), link.target.port
-    );
-  }
-  if (link.source.get('pointer')) {
-    if (!this.pointerPorts[link.source.pid]) {
-      this.pointerPorts[link.source.pid] = [];
-    }
-    this.pointerPorts[link.source.pid].push(link.source.port);
-    debug('%s: added pointer port `%s`', link.ioid, link.source.port);
-  }
 
-  debug('%s: link connected', link.ioid);
+    // TODO: ugly, source & target map
+    // should be one central place of registration.
+    // now a link is in two places.
 
-  this.emit('connect', link);
-};
-
-// TODO: ugly, source & target map
-// should be one central place of registration.
-// now a link is in two places.
-IoMapHandler.prototype.get = function(link) {
-  if (this.sourceMap[link.target.pid]) {
-    return this.sourceMap[link.target.pid];
-  }
-};
-
-IoMapHandler.prototype.lock = function(link) {
-  debug('%s: lock', link.ioid);
-  this.queueManager.lock(link.ioid);
-};
-
-IoMapHandler.prototype.unlock = function(link) {
-  debug('%s: unlock', link.ioid);
-  this.queueManager.unlock(link.ioid);
-};
-
-IoMapHandler.prototype.accept = function(link /*, p*/ ) {
-  debug('%s: accept', link.ioid);
-  // update the fill count.
-  // normally belongs to a Port Object.
-  link.fills++;
-  // re-open queue for this link.
-  if (this.queueManager.isLocked(link.ioid)) {
-    // freePort will do this now.
-    this.queueManager.unlock(link.ioid);
-  }
-};
-
-IoMapHandler.prototype.reject = function(err, link, p) {
-  // update the reject count.
-  // normally belongs to a Port Object.
-  link.rejects++;
-  this.queueManager.lock(link.ioid);
-  // Do not put it back in queue if there was a *real* error
-  // Default error is `false`, which is just a normal reject.
-  if (util.isError(err)) {
-    debug('%s: reject (error)', link.ioid);
-    // stays locked.
-  }
-  else {
-    // put it back in queue.
-    debug('%s: reject (requeue)', link.ioid);
-    this.queueManager.unshift(link.ioid, p);
-    // unlock again
-    // stay locked, untill unlocked
-    // IMPORTANT! unlock logic must just work
-    // otherwise it goes beserk.
-    // this.queueManager.unlock(link.ioid);
-    // The process manager is listening for the node
-    // which is already in error state
-    // this.emit('error', err);
-  }
-};
-
-/**
- *
- *  Disconnects a link
- *
- *  @param {xLink} link
- */
-IoMapHandler.prototype.disconnect = function(link) {
-  var src;
-  var tgt;
-  // unregister the connection
-  if (this.connections.hasOwnProperty(link.ioid)) {
-    delete this.connections[link.ioid];
-  }
-  else {
-    throw Error('Cannot disconnect an unknown connection');
-  }
-  if (this.targetMap[link.source.pid]) {
-    src = this.targetMap[link.source.pid];
-    src.splice(src.indexOf(link), 1);
-    if (src.length === 0) {
-      delete this.targetMap[link.source.pid];
-    }
-  }
-  if (this.sourceMap[link.target.pid]) {
-    tgt = this.sourceMap[link.target.pid];
-    tgt.splice(tgt.indexOf(link), 1);
-    if (tgt.length === 0) {
-      delete this.sourceMap[link.target.pid];
-    }
-  }
-  if (this.syncedTargetMap[link.target.pid]) {
-    tgt = this.syncedTargetMap[link.target.pid];
-    tgt.splice(src.indexOf(link.target.port), 1);
-    if (tgt.length === 0) {
-      delete this.syncedTargetMap[link.target.pid];
-    }
-  }
-  if (this.pointerPorts[link.source.pid]) {
-    src = this.pointerPorts[link.source.pid];
-    src.splice(src.indexOf(link.source.port), 1);
-    if (src.length === 0) {
-      delete this.pointerPorts[link.source.pid];
-    }
-  }
-  debug('%s: disconnected', link.ioid);
-  // prevents iip bug, where iip is still queued.
-  // disconnect does not correctly take queueing into account.
-  delete link.ioid;
-
-  // used by actor to close ports
-  this.emit('disconnect', link);
-};
-
-/**
- *
- * Get all node ids that target this node.
- *
- * TODO: return .id's not .pid ah well..
- *
- * @param {String} pid
- * @return {Array}
- * @api public
- */
-IoMapHandler.prototype.getSourcePids = function(pid) {
-  var i;
-  var src;
-  var ids = [];
-  if (this.sourceMap.hasOwnProperty(pid)) {
-    for (i = 0; i < this.sourceMap[pid].length; i++) {
-      src = this.sourceMap[pid][i].source;
-      if (ids.indexOf(src.pid) === -1) {
-        ids.push(src.pid);
+  }, {
+    key: 'get',
+    value: function get(link) {
+      if (this.sourceMap.has(link.target.pid)) {
+        return this.sourceMap.get(link.target.pid);
       }
     }
-  }
-  return ids;
-};
-
-/**
- *
- * Get all nodes that use this node as a source .
- *
- * @param {String} pid
- * @return {Array}
- * @api public
- */
-IoMapHandler.prototype.getTargetPids = function(pid) {
-  var i;
-  var ids = [];
-  if (this.targetMap.hasOwnProperty(pid)) {
-    for (i = 0; i < this.targetMap[pid].length; i++) {
-      ids.push(this.targetMap[pid][i].target.pid);
+  }, {
+    key: 'lock',
+    value: function lock(link) {
+      debug('%s: lock', link.ioid);
+      this.queueManager.lock(link.ioid);
     }
-  }
-  return ids;
-};
-
-/**
- *
- * Get all node ids this node depends on.
- *
- * @param {String} pid
- * @return {Array}
- * @api public
- */
-IoMapHandler.prototype.getAncestorPids = function(pid) {
-  var i;
-  var ids = [];
-  var aIds = [];
-  var u = [];
-  aIds = ids = this.getSourcePids(pid);
-  for (i = 0; i < ids.length; i++) {
-    aIds = aIds.concat(this.getAncestorPids(ids[i]));
-  }
-  for (i = 0; i < aIds.length; i++) {
-    if (u.indexOf(aIds[i]) === -1) {
-      u.push(aIds[i]);
+  }, {
+    key: 'unlock',
+    value: function unlock(link) {
+      debug('%s: unlock', link.ioid);
+      this.queueManager.unlock(link.ioid);
     }
-  }
-  return u;
-};
-IoMapHandler.prototype.reset = function(cb) {
-  var self = this;
-  this._shutdown = true;
-  this.queueManager.reset(function() {
-    // All writes should stop, queuemanager resets.
-    // or maybe should wait for queuemanager to be empty.
-    if (cb) {
-      cb();
-    }
-    self._shutdown = false;
-  });
-};
-
-IoMapHandler.prototype.receiveFromQueue = function(ioid, p) {
-  debug('%s: receive from queue', ioid);
-  if (this.connections.hasOwnProperty(ioid)) {
-    this.send(this.connections[ioid], p);
-  }
-};
-
-/**
- *
- * The method to provide input to this io handler.
- *
- * @param {Link} link
- * @param {Packet} p
- *
- */
-IoMapHandler.prototype.send = function(link, p) {
-
-  if (!(p instanceof Packet)) {
-    throw Error('send expects a packet');
-  }
-
-  if (link.source.has('pointer')) { // is just a boolean
-    debug('%s: handling pointer', link.ioid);
-    var identifier;
-    var pp;
-    // THIS IS NOT THE PLACE TO CLONE, but let's try it.
-    // WILL BREAK ANYWAY WITH references.
-    //
-    // Ok, what is _the_ location to clone.
-    //
-    // A package going different routes must clone.
-    //
-    // p = p.clone();
-    // Create an identifier
-    pp = this.getPointerPorts(link.source.pid);
-    pp.unshift(link.source.pid);
-    identifier = pp.join('-');
-    // The source node+port are pointed to.
-    // The packet has it's chi updated with the
-    // source.pid as key and an assigned item id as value
-    //
-    this.CHI.pointer(
-      link.source.pid,
-      link.source.port,
-      p,
-      identifier
-    );
-  }
-  if (link.target.has('sync')) {
-    debug('%s: handling sync port', link.ioid);
-    var syncPorts = this.getSyncedTargetPorts(link.target);
-    this.CHI.sync(
-      //link.target,
-      link,
-      link.target.get('sync'), // originId
-      // TODO: should just only accept the packet
-      p,
-      syncPorts
-    );
-    // always return, react on CHI.on('synced')
-    return;
-  }
-  this.__sendData(link, p);
-};
-
-/**
- *
- * The method to provide input to this io handler.
- *
- * Ok, what misses here is info on how to find the actor
- * Who needs the information
- *
- *
- * Actor:
- *
- *  ioHandler.listenTo(Object.keys(this.nodes),
- *
- * @param {Connector} target
- * @param {object} input
- * @param {object} chi
- * @private
- */
-
-/*
- *
- * Send Data
- *
- * @param {xLink} link - Link to write to
- * @param {Any} data - The input data
- * @private
- */
-IoMapHandler.prototype.__sendData = function(link, p) {
-  if (this._shutdown) {
-    // TODO:: probably does not both have to be dropped
-    // during __sendData *and* during output
-    p.release(link);
-    this.drop(p, link);
-  }
-  else {
-    var data;
-    if (link.target.has('cyclic') &&
-      Array.isArray(p.read(link)) // second time it's not an array anymore
-    ) {
-      debug('%s: cycling', link.ioid);
-      // grouping
-      // The counter part will be 'collect'
-      var g = this.CHI.group();
-      if (p.read(link).length === 0) {
-        return false;
+  }, {
+    key: 'accept',
+    value: function accept(link /*, p*/) {
+      debug('%s: accept', link.ioid);
+      // update the fill count.
+      // normally belongs to a Port Object.
+      link.fills++;
+      // re-open queue for this link.
+      if (this.queueManager.isLocked(link.ioid)) {
+        // freePort will do this now.
+        this.queueManager.unlock(link.ioid);
       }
-      data = JSON.parse(JSON.stringify(p.read(link)));
-      var i;
-      for (i = 0; i < data.length; i++) {
-        // create new packet
-        var newp = new Packet(
-          link,
-          data[i],
-          typeof data[i] // not sure if this will always work.
-        );
-        // this is a copy taking place..
-        newp.set('chi', p.chi ? JSON.parse(JSON.stringify(p.chi)) : {});
-        g.item(newp.chi);
-        this.queueManager.queue(link.ioid, newp);
-      }
-      // we are done grouping now.
-      g.done();
-      return; // RETURN
     }
-    var cp; // current packet
-
-    // clone should not be needed, this is done elsewhere.
-    // cp is also not needed
-    // this.cloneData(link, cp, 'function');
-    // TODO: not sure if index should stay within the packet.
-    if (link.source.has('index') && !p.hasOwnProperty('index')) {
-      // already done during clone
-      //cp.chi = JSON.parse(JSON.stringify(cp.chi));
-      cp = p.clone(link); // important!
-      if (undefined === cp.read(link)[link.source.get('index')]) {
-        debug('%s: INDEX UNDEFINED %s', link.ioid, link.source, cp.read(link));
-        return; // nop
-      }
-      else {
-        handleIndex(link, cp.read(link), cp);
-        //cp.write(link, handleIndex(link, cp.read(link), cp));
-      }
-    } else {
-      cp = p;
+  }, {
+    key: 'reject',
+    value: function reject(err, link, p) {
+      // update the reject count.
+      // normally belongs to a Port Object.
+      link.rejects++;
+      this.queueManager.lock(link.ioid);
+      // Do not put it back in queue if there was a *real* error
+      // Default error is `false`, which is just a normal reject.
+      if (util.isError(err)) {
+        debug('%s: reject (error)', link.ioid);
+        // stays locked.
+      } else {
+          // put it back in queue.
+          debug('%s: reject (requeue)', link.ioid);
+          this.queueManager.unshift(link.ioid, p);
+          // unlock again
+          // stay locked, untill unlocked
+          // IMPORTANT! unlock logic must just work
+          // otherwise it goes beserk.
+          // this.queueManager.unlock(link.ioid);
+          // The process manager is listening for the node
+          // which is already in error state
+          // this.emit('error', err);
+        }
     }
-    // TODO: probably just remove this emit. (chix-runtime is using it)
-    this.emit('data', {
-      link: link,
-      data: cp.read(link)// only emit the data
-    });
 
-    debug('%s: writing packet', link.ioid);
+    /**
+     *
+     *  Disconnects a link
+     *
+     *  @param {xLink} link
+     */
 
-    link.write(cp);
-    this.emit('receive', link);
-  }
-};
-
-/**
- *
- * Handles the output of every node.
- *
- * This comes directly from the Actor, whom got it from the node.
- *
- * The emit should maybe come from the link write.
- *
- * If there is chi it will be passed along.
- *
- * @param {NodeEvent} event
- * @api public
- */
-IoMapHandler.prototype.output = function(event) {
-  // used by monitors
-  this.emit('output', event);
-  this.receive(event.node, event.port, event.out, event.action);
-};
-
-/**
- *
- * Monitor event types
- *
- * Optionally provided with a pid.
- *
- */
-IoMapHandler.prototype.monitor = function(eventType, pid, cb) {
-  this.__monitor(eventType, pid, cb, 'on');
-};
-
-IoMapHandler.prototype.monitorOnce = function(eventType, pid, cb) {
-  this.__monitor(eventType, pid, cb, 'once');
-};
-
-IoMapHandler.prototype.__monitor = function(eventType, pid, cb, how) {
-  debug('start monitoring %s', eventType);
-  if (!cb) {
-    cb = pid;
-    pid = undefined;
-  }
-  var monitor = (function(pid, eventType, cb) {
-    return function monitorCallback(event) {
-      if (event.port === eventType) {
-        if (!pid || event.node.pid === pid) {
-          cb(event.out);
+  }, {
+    key: 'disconnect',
+    value: function disconnect(link) {
+      var src = undefined;
+      var tgt = undefined;
+      // unregister the connection
+      if (this.connections.has(link.ioid)) {
+        this.connections.delete(link.ioid);
+      } else {
+        throw Error('Cannot disconnect an unknown connection');
+      }
+      if (this.targetMap.has(link.source.pid)) {
+        src = this.targetMap.get(link.source.pid);
+        src.splice(src.indexOf(link), 1);
+        if (src.length === 0) {
+          this.targetMap.delete(link.source.pid);
         }
       }
-    };
-  })(pid, eventType, cb);
-  this[how]('output', monitor);
-};
+      if (this.sourceMap.has(link.target.pid)) {
+        tgt = this.sourceMap.get(link.target.pid);
+        tgt.splice(tgt.indexOf(link), 1);
+        if (tgt.length === 0) {
+          this.sourceMap.delete(link.target.pid);
+        }
+      }
+      if (this.syncedTargetMap.has(link.target.pid)) {
+        tgt = this.syncedTargetMap.get(link.target.pid);
+        tgt.splice(src.indexOf(link.target.port), 1);
+        if (tgt.length === 0) {
+          this.syncedTargetMap.delete(link.target.pid);
+        }
+      }
+      if (this.pointerPorts.has(link.source.pid)) {
+        src = this.pointerPorts.get(link.source.pid);
+        src.splice(src.indexOf(link.source.port), 1);
+        if (src.length === 0) {
+          this.pointerPorts.delete(link.source.pid);
+        }
+      }
+      debug('%s: disconnected', link.ioid);
+      // prevents iip bug, where iip is still queued.
+      // disconnect does not correctly take queueing into account.
+      delete link.ioid;
 
-/**
- *
- * Handles the output of every node.
- *
- * If there is chi it will be passed along.
- *
- * @param {Object} dat
- * @private
- */
+      // used by actor to close ports
+      this.emit('disconnect', link);
+    }
 
-/*
- *  source.id
- *  source.port
- *  action should be in the source?
- *
- *  action is target information, but is the only setting used..
- *  so just have the third parameter be action for now.
- *
- *  source is the full source node.
- **/
-//  this.receive(dat.node, dat.port, dat.out, dat.action);
-IoMapHandler.prototype.receive = function(source, port, p, action) {
-  var i;
-  var match = 0;
+    /**
+     *
+     * Get all node ids that target this node.
+     *
+     * TODO: return .id's not .pid ah well..
+     *
+     * @param {String} pid
+     * @return {Array}
+     * @public
+     */
 
-  if (p.hasOwner()) {
-    // node should have released packet.
-    throw Error('Refusing to received owned packet');
-  } else {
-    // If the output of this node has any target nodes
-    if (this.targetMap.hasOwnProperty(source.pid)) {
-      // If there are any target nodes defined
-      if (this.targetMap[source.pid].length) {
-        // Iterate those targets
-        var length = this.targetMap[source.pid].length;
-        for (i = 0; i < length; i++) {
-          // Process this link
-          var xlink = this.targetMap[source.pid][i];
-          // If the link is about this source port
-          if (port === xlink.source.port) {
-            match++;
-            // did this output came from an action
-            // if so, is it an action we are listening for.
-            if (!action || xlink.source.action === action) {
-              if (xlink.source.get('collect')) {
-                debug('%s: collecting packets', xlink.ioid);
-                this.CHI.collect(xlink, p);
-                continue; // will be handled by event
-              }
-              //var noQueue = xlink.target.has('noqueue');
-              var noQueue = false;
-              this.emit('send', xlink);
+  }, {
+    key: 'getSourcePids',
+    value: function getSourcePids(pid) {
+      var src = undefined;
+      var ids = [];
+      if (this.sourceMap.has(pid)) {
+        for (var i = 0; i < this.sourceMap.get(pid).length; i++) {
+          src = this.sourceMap.get(pid)[i].source;
+          if (ids.indexOf(src.pid) === -1) {
+            ids.push(src.pid);
+          }
+        }
+      }
+      return ids;
+    }
 
-              p.setOwner(xlink);
+    /**
+     *
+     * Get all nodes that use this node as a source .
+     *
+     * @param {String} pid
+     * @return {Array}
+     * @public
+     */
 
-              // queue must always be used otherwise persist
-              // will not work..
-              if (noQueue) {
-                // must be sure, really no queue, also not after input.
-                this.send(xlink, p);
-              }
-              else {
-                debug('%s: queueing', xlink.ioid);
-                this.queueManager.queue(xlink.ioid, p);
-              }
+  }, {
+    key: 'getTargetPids',
+    value: function getTargetPids(pid) {
+      var ids = [];
+      if (this.targetMap.has(pid)) {
+        for (var i = 0; i < this.targetMap.get(pid).length; i++) {
+          ids.push(this.targetMap.get(pid)[i].target.pid);
+        }
+      }
+      return ids;
+    }
 
-              if (i + 1 < length) {
-                p = p.clone(xlink);
-                p.release(xlink);
+    /**
+     *
+     * Get all node ids this node depends on.
+     *
+     * @param {String} pid
+     * @return {Array}
+     * @public
+     */
+
+  }, {
+    key: 'getAncestorPids',
+    value: function getAncestorPids(pid) {
+      var ids = undefined;
+      var aIds = undefined;
+      var u = [];
+      aIds = ids = this.getSourcePids(pid);
+      for (var i = 0; i < ids.length; i++) {
+        aIds = aIds.concat(this.getAncestorPids(ids[i]));
+      }
+      for (var i = 0; i < aIds.length; i++) {
+        if (u.indexOf(aIds[i]) === -1) {
+          u.push(aIds[i]);
+        }
+      }
+      return u;
+    }
+  }, {
+    key: 'reset',
+    value: function reset(cb) {
+      var _this2 = this;
+
+      this._shutdown = true;
+      this.queueManager.reset(function () {
+        // All writes should stop, queuemanager resets.
+        // or maybe should wait for queuemanager to be empty.
+        if (cb) {
+          cb();
+        }
+        _this2._shutdown = false;
+      });
+    }
+  }, {
+    key: 'receiveFromQueue',
+    value: function receiveFromQueue(ioid, p) {
+      debug('%s: receive from queue', ioid);
+      if (this.connections.has(ioid)) {
+        this.send(this.connections.get(ioid), p);
+      }
+    }
+
+    /**
+     *
+     * The method to provide input to this io handler.
+     *
+     * @param {Link} link
+     * @param {Packet} p
+     *
+     */
+
+  }, {
+    key: 'send',
+    value: function send(link, p) {
+      if (!(p instanceof Packet)) {
+        throw Error('send expects a packet');
+      }
+
+      if (link.source.has('pointer')) {
+        // is just a boolean
+        debug('%s: handling pointer', link.ioid);
+        // THIS IS NOT THE PLACE TO CLONE, but let's try it.
+        // WILL BREAK ANYWAY WITH references.
+        //
+        // Ok, what is _the_ location to clone.
+        //
+        // A package going different routes must clone.
+        //
+        // p = p.clone();
+        // Create an identifier
+        var pp = this.getPointerPorts(link.source.pid);
+        pp.unshift(link.source.pid);
+        var identifier = pp.join('-');
+        // The source node+port are pointed to.
+        // The packet has it's chi updated with the
+        // source.pid as key and an assigned item id as value
+        //
+        this.CHI.pointer(link.source.pid, link.source.port, p, identifier);
+      }
+      if (link.target.has('sync')) {
+        debug('%s: handling sync port', link.ioid);
+        var syncPorts = this.getSyncedTargetPorts(link.target);
+        this.CHI.sync(
+        //link.target,
+        link, link.target.get('sync'), // originId
+        // TODO: should just only accept the packet
+        p, syncPorts);
+        // always return, react on CHI.on('synced')
+        return;
+      }
+      this.__sendData(link, p);
+    }
+
+    /**
+     *
+     * The method to provide input to this io handler.
+     *
+     * Ok, what misses here is info on how to find the actor
+     * Who needs the information
+     *
+     *
+     * Actor:
+     *
+     *  ioHandler.listenTo(Object.keys(this.nodes),
+     *
+     * @param {Connector} target
+     * @param {object} input
+     * @param {object} chi
+     * @private
+     */
+
+    /*
+     *
+     * Send Data
+     *
+     * @param {xLink} link - Link to write to
+     * @param {Any} data - The input data
+     * @private
+     */
+
+  }, {
+    key: '__sendData',
+    value: function __sendData(link, p) {
+      if (this._shutdown) {
+        // TODO:: probably does not both have to be dropped
+        // during __sendData *and* during output
+        p.release(link);
+        this.drop(p, link);
+      } else {
+        if (link.target.has('cyclic') && Array.isArray(p.read(link)) // second time it's not an array anymore
+        ) {
+            debug('%s: cycling', link.ioid);
+            // grouping
+            // The counter part will be 'collect'
+            var g = this.CHI.group();
+            if (p.read(link).length === 0) {
+              return false;
+            }
+            var data = JSON.parse(JSON.stringify(p.read(link)));
+            for (var i = 0; i < data.length; i++) {
+              // create new packet
+              var newp = new Packet(link, data[i], _typeof(data[i]) // not sure if this will always work.
+              );
+              // this is a copy taking place..
+              newp.set('chi', p.chi ? JSON.parse(JSON.stringify(p.chi)) : {});
+              g.item(newp.chi);
+              this.queueManager.queue(link.ioid, newp);
+            }
+            // we are done grouping now.
+            g.done();
+            return null; // RETURN
+          }
+        var cp = undefined; // current packet
+
+        // clone should not be needed, this is done elsewhere.
+        // cp is also not needed
+        // this.cloneData(link, cp, 'function');
+        // TODO: not sure if index should stay within the packet.
+        if (link.source.has('index') && !p.hasOwnProperty('index')) {
+          // already done during clone
+          //cp.chi = JSON.parse(JSON.stringify(cp.chi));
+          //const cp = p.clone(link); // important!
+          cp = p.clone(link); // important!
+          if (undefined === cp.read(link)[link.source.get('index')]) {
+            debug('%s: INDEX UNDEFINED %s', link.ioid, link.source, cp.read(link));
+            return null; // nop
+          } else {
+              handleIndex(link, cp.read(link), cp);
+              //cp.write(link, handleIndex(link, cp.read(link), cp));
+            }
+        } else {
+            cp = p;
+          }
+        // TODO: probably just remove this emit. (chix-runtime is using it)
+        this.emit('data', {
+          link: link,
+          data: cp.read(link) // only emit the data
+        });
+
+        debug('%s: writing packet', link.ioid);
+
+        link.write(cp);
+        this.emit('receive', link);
+      }
+    }
+
+    /**
+     *
+     * Handles the output of every node.
+     *
+     * This comes directly from the Actor, whom got it from the node.
+     *
+     * The emit should maybe come from the link write.
+     *
+     * If there is chi it will be passed along.
+     *
+     * @param {NodeEvent} event
+     * @public
+     */
+
+  }, {
+    key: 'output',
+    value: function output(event) {
+      // used by monitors
+      this.emit('output', event);
+      this.receive(event.node, event.port, event.out, event.action);
+    }
+
+    /**
+     *
+     * Monitor event types
+     *
+     * Optionally provided with a pid.
+     *
+     */
+
+  }, {
+    key: 'monitor',
+    value: function monitor(eventType, pid, cb) {
+      this.__monitor(eventType, pid, cb, 'on');
+    }
+  }, {
+    key: 'monitorOnce',
+    value: function monitorOnce(eventType, pid, cb) {
+      this.__monitor(eventType, pid, cb, 'once');
+    }
+  }, {
+    key: '__monitor',
+    value: function __monitor(eventType, pid, cb, how) {
+      debug('start monitoring %s', eventType);
+      if (!cb) {
+        cb = pid;
+        pid = undefined;
+      }
+      var monitor = (function (pid, eventType, cb) {
+        return function monitorCallback(event) {
+          if (event.port === eventType) {
+            if (!pid || event.node.pid === pid) {
+              cb(event.out);
+            }
+          }
+        };
+      })(pid, eventType, cb);
+      this[how]('output', monitor);
+    }
+
+    /**
+     *
+     * Handles the output of every node.
+     *
+     * If there is chi it will be passed along.
+     *
+     * @param {Object} dat
+     * @private
+     */
+
+    /*
+     *  source.id
+     *  source.port
+     *  action should be in the source?
+     *
+     *  action is target information, but is the only setting used..
+     *  so just have the third parameter be action for now.
+     *
+     *  source is the full source node.
+     **/
+    //  this.receive(dat.node, dat.port, dat.out, dat.action);
+
+  }, {
+    key: 'receive',
+    value: function receive(source, port, p, action) {
+      var match = 0;
+
+      if (p.hasOwner()) {
+        // node should have released packet.
+        this.emit('error', Error('Refusing to receive owned packet'), p);
+        return;
+      } else {
+        // If the output of this node has any target nodes
+        if (this.targetMap.has(source.pid)) {
+          // If there are any target nodes defined
+          if (this.targetMap.get(source.pid).length) {
+            // Iterate those targets
+            var length = this.targetMap.get(source.pid).length;
+            for (var i = 0; i < length; i++) {
+              // Process this link
+              var xlink = this.targetMap.get(source.pid)[i];
+              // If the link is about this source port
+              if (port === xlink.source.port) {
+                match++;
+                // did this output came from an action
+                // if so, is it an action we are listening for.
+                if (!action || xlink.source.action === action) {
+                  if (xlink.source.get('collect')) {
+                    debug('%s: collecting packets', xlink.ioid);
+                    this.CHI.collect(xlink, p);
+                    continue; // will be handled by event
+                  }
+                  //const noQueue = xlink.target.has('noqueue');
+                  var noQueue = false;
+                  this.emit('send', xlink);
+
+                  p.setOwner(xlink);
+
+                  // queue must always be used otherwise persist
+                  // will not work..
+                  if (noQueue) {
+                    // must be sure, really no queue, also not after input.
+                    this.send(xlink, p);
+                  } else {
+                    debug('%s: queueing', xlink.ioid);
+                    this.queueManager.queue(xlink.ioid, p);
+                  }
+
+                  if (i + 1 < length) {
+                    p = p.clone(xlink);
+                    p.release(xlink);
+                  }
+                }
               }
             }
           }
         }
+
+        if (port === 'error' && match === 0) {
+          throw Error(util.format('Unhandled port error for %s: %s', source.id, p.dump()));
+        }
       }
     }
 
-    if (port === 'error' && match === 0) {
-      throw Error(
-        util.format(
-          'Unhandled port error for %s: %s',
-          source.id,
-          p.dump()
-        )
-      );
+    // collected is about the link
+    // a group is collected for that link
+    // and is thus always an array.
+    // this means the target should be used to re-send
+    // the collected input.
+    // the group information is actually not interesting.
+    // we only know we want the data from the last group.
+    // and use it.
+
+  }, {
+    key: 'collected',
+    value: function collected() /*target, p*/{
+      /*
+       data.data
+       data.link
+       */
+    }
+  }, {
+    key: 'beginGroup',
+    value: function beginGroup() /*group*/{}
+  }, {
+    key: 'sendGroup',
+    value: function sendGroup() /*group, data*/{}
+    /*
+     data.data
+     data.link
+     */
+
+    /**
+     *
+     * Add Queue Manager.
+     *
+     * @param {QueueManager} qm
+     * @private
+     *
+     */
+
+  }, {
+    key: 'addQueueManager',
+    value: function addQueueManager(qm) {
+      this.queueManager = qm;
+    }
+  }, {
+    key: 'getSyncedTargetPorts',
+    value: function getSyncedTargetPorts(target) {
+      var originId = target.get('sync');
+      if (!this.syncedTargetMap.has(target.pid)) {
+        throw new Error(util.format('Unkown sync: `%s`', target.pid));
+      }
+      if (!this.syncedTargetMap.get(target.pid).hasOwnProperty(originId)) {
+        throw new Error(util.format('Unkown sync with: `%s`', originId));
+      }
+      // returns the ports array, those who wanna sync with originId
+      return this.syncedTargetMap.get(target.pid)[originId];
+    }
+  }, {
+    key: 'getPointerPorts',
+    value: function getPointerPorts(originId) {
+      if (this.pointerPorts.has(originId)) {
+        return this.pointerPorts.get(originId);
+      } else {
+        throw new Error(util.format('%s has no pointer ports', originId));
+      }
     }
 
-  }
-};
+    /**
+     *
+     * Send synchronized input
+     *
+     * TODO: Input is synced here then we
+     *   throw it into the input sender.
+     *   They probably stay synced, but
+     *   it's not enforced anywhere after this.
+     *
+     * @param {string} targetId
+     * @param {object} data
+     */
 
-// collected is about the link
-// a group is collected for that link
-// and is thus always an array.
-// this means the target should be used to re-send
-// the collected input.
-// the group information is actually not interesting.
-// we only know we want the data from the last group.
-// and use it.
-IoMapHandler.prototype.collected = function( /*target, p*/ ) {
-  /*
-  data.data
-  data.link
-  */
-};
-
-IoMapHandler.prototype.beginGroup = function( /*group*/ ) {};
-IoMapHandler.prototype.sendGroup = function( /*group, data*/ ) {
-  /*
-  data.data
-  data.link
-  */
-};
-
-/**
- *
- * Add Queue Manager.
- *
- * @param {QueueManager} qm
- * @api private
- *
- */
-IoMapHandler.prototype.addQueueManager = function(qm) {
-  this.queueManager = qm;
-};
-
-IoMapHandler.prototype.getSyncedTargetPorts = function(target) {
-  var originId = target.get('sync');
-  if (!this.syncedTargetMap.hasOwnProperty(target.pid)) {
-    throw new Error(util.format('Unkown sync: `%s`', target.pid));
-  }
-  if (!this.syncedTargetMap[target.pid].hasOwnProperty(originId)) {
-    throw new Error(util.format('Unkown sync with: `%s`', originId));
-  }
-  // returns the ports array, those who wanna sync with originId
-  return this.syncedTargetMap[target.pid][originId];
-};
-
-IoMapHandler.prototype.getPointerPorts = function(originId) {
-  if (this.pointerPorts.hasOwnProperty(originId)) {
-    return this.pointerPorts[originId];
-  }
-  else {
-    throw new Error(util.format('%s has no pointer ports', originId));
-  }
-};
-
-/**
- *
- * Send synchronized input
- *
- * TODO: Input is synced here then we
- *   throw it into the input sender.
- *   They probably stay synced, but
- *   it's not enforced anywhere after this.
- *
- * @param {string} targetId
- * @param {object} data
- */
-IoMapHandler.prototype.sendSynced = function(targetId, data) {
-  for (var targetPort in data) {
-    if (data.hasOwnProperty(targetPort)) {
-      var synced = data[targetPort];
-      // opens all queues, a it radical..
-      this.queueManager.flushAll();
-      // keep in sync, do not use setImmediate
-      debug('%s: sendSynced', synced.link.ioid);
-      this.__sendData(synced.link, synced.p);
+  }, {
+    key: 'sendSynced',
+    value: function sendSynced(targetId, data) {
+      for (var targetPort in data) {
+        if (data.hasOwnProperty(targetPort)) {
+          var synced = data[targetPort];
+          // opens all queues, a it radical..
+          this.queueManager.flushAll();
+          // keep in sync, do not use setImmediate
+          debug('%s: sendSynced', synced.link.ioid);
+          this.__sendData(synced.link, synced.p);
+        }
+      }
     }
-  }
-};
+  }, {
+    key: 'drop',
+    value: function drop(packet, origin) {
+      // TODO: drop data/packet gracefully
+      debug('IoMapHandler: Dropping packet %s %s', packet, origin);
+      this.emit('drop', packet);
+    }
+  }]);
 
-IoMapHandler.prototype.drop = function(packet, origin) {
-  // TODO: drop data/packet gracefully
-  debug('IoMapHandler: Dropping packet %s %s', packet, origin);
-  this.emit('drop', packet);
-};
-
-/*
-IoMapHandler.prototype.cloneData = function(link, p, type) {
-  if (type === 'function') {
-    return;
-  }
-  if (typeof p.read(link) === 'object' && isPlainObject(p.read(link))) {
-    p.write(link,
-      JSON.parse(
-        JSON.stringify(p.read(link))
-      )
-    );
-  }
-};
-*/
+  return IoMapHandler;
+})(EventEmitter);
 
 module.exports = IoMapHandler;
+//# sourceMappingURL=mapHandler.js.map
 
-},{"../packet":29,"../queue/defaultManager":33,"./indexHandler":22,"chix-chi":41,"debug":49,"events":11,"is-plain-object":54,"util":16,"uuid":62}],24:[function(require,module,exports){
+},{"../packet":31,"../queue/defaultManager":35,"./indexHandler":24,"chix-chi":44,"debug":"V4HZ/5","events":1,"util":6,"uuid":61}],26:[function(require,module,exports){
 'use strict';
 
-var util = require('util');
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
 var uuid = require('uuid').v4;
 var Connector = require('./connector');
 var Setting = require('./setting');
@@ -7311,223 +6949,297 @@ var validate = require('./validate');
  * @constructor
  * @public
  */
-function Link(id, ioid) {
 
-  this.fills = 0;
-  this.writes = 0;
-  this.rejects = 0;
-  this.id = id === undefined ? uuid() : id;
-  this.ioid = ioid || uuid();
-  this.metadata = {};
+var Link = (function (_Setting) {
+  _inherits(Link, _Setting);
 
-}
+  function Link(id, ioid) {
+    _classCallCheck(this, Link);
 
-util.inherits(Link, Setting);
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(Link).call(this));
 
-Link.create = function(ln) {
-
-  ln = ln || {};
-
-  var link = new Link(ln.id, ln.ioid);
-
-  if (ln.source || ln.target) {
-    link.build(ln);
+    _this.fills = 0;
+    _this.writes = 0;
+    _this.rejects = 0;
+    _this.id = id === undefined ? uuid() : id;
+    _this.ioid = ioid || uuid();
+    _this.metadata = {};
+    return _this;
   }
 
-  return link;
+  _createClass(Link, [{
+    key: 'build',
+    value: function build(ln) {
+      if (!ln.source) {
+        throw Error('Create link expects a source');
+      }
 
-};
+      if (!ln.target) {
+        throw Error('Create link expects a target');
+      }
 
-Link.prototype.build = function(ln) {
+      validate.link(ln);
 
-  if (!ln.source) {
-    throw Error('Create link expects a source');
-  }
+      this.setSource(ln.source.id, ln.source.port, ln.source.setting, ln.source.action);
 
-  if (!ln.target) {
-    throw Error('Create link expects a target');
-  }
+      if (ln.metadata) {
+        this.setMetadata(ln.metadata);
+      } else {
+        this.setMetadata({});
+      }
 
-  validate.link(ln);
+      this.setTarget(ln.target.id, ln.target.port, ln.target.setting, ln.target.action);
+    }
 
-  this.setSource(
-    ln.source.id,
-    ln.source.port,
-    ln.source.setting,
-    ln.source.action
-  );
+    /**
+     *
+     * Set target
+     *
+     * @param {String} targetId
+     * @param {String} port
+     * @param {Object} settings
+     * @param {String} action
+     * @public
+     */
 
-  if (ln.metadata) {
-    this.setMetadata(ln.metadata);
-  } else {
-    this.setMetadata({});
-  }
+  }, {
+    key: 'setTarget',
+    value: function setTarget(targetId, port, settings, action) {
+      this.target = new Connector(settings);
+      this.target.wire = this;
+      this.target.plug(targetId, port, action);
+    }
+  }, {
+    key: 'write',
+    value: function write(p) {
+      this.writes++;
 
-  this.setTarget(
-    ln.target.id,
-    ln.target.port,
-    ln.target.setting,
-    ln.target.action
-  );
+      // loose ownership
+      p.release(this);
 
-};
+      // just re-emit
+      this.emit('data', p);
+    }
 
-/**
- *
- * Set target
- *
- * @param {String} targetId
- * @param {String} port
- * @param {Object} settings
- * @param {String} action
- * @public
- */
-Link.prototype.setTarget = function(targetId, port, settings, action) {
+    /**
+     *
+     * Set Source
+     *
+     * @param {Object} sourceId
+     * @param {String} port
+     * @param {Object} settings
+     * @param {String} action
+     * @public
+     */
 
-  this.target = new Connector(settings);
-  this.target.wire = this;
-  this.target.plug(targetId, port, action);
+  }, {
+    key: 'setSource',
+    value: function setSource(sourceId, port, settings, action) {
+      this.source = new Connector(settings);
+      this.source.wire = this;
+      this.source.plug(sourceId, port, action);
+    }
 
-};
+    /**
+     *
+     * Setting of pid's is delayed.
+     * I would like them to be available during plug.
+     * but whatever.
+     *
+     */
 
-Link.prototype.write = function(p) {
+  }, {
+    key: 'setSourcePid',
+    value: function setSourcePid(pid) {
+      this.source.setPid(pid);
+    }
+  }, {
+    key: 'setTargetPid',
+    value: function setTargetPid(pid) {
+      this.target.setPid(pid);
+    }
+  }, {
+    key: 'setMetadata',
+    value: function setMetadata(metadata) {
+      this.metadata = metadata;
+    }
+  }, {
+    key: 'setMeta',
+    value: function setMeta(key, val) {
+      this.metadata[key] = val;
+    }
 
-  this.writes++;
+    /**
+     *
+     * Set Title
+     *
+     * @param {String} title
+     * @public
+     */
 
-  // loose ownership
-  p.release(this);
+  }, {
+    key: 'setTitle',
+    value: function setTitle(title) {
+      this.setMeta('title', title);
+      this.emit('change', this, 'metadata', this.metadata);
+    }
+  }, {
+    key: 'clear',
+    value: function clear() {
+      this.fills = 0;
+      this.writes = 0;
+      this.rejects = 0;
+      this.emit('clear', this);
+    }
 
-  // just re-emit
-  this.emit('data', p);
+    /**
+     *
+     * Update link by passing it a full object.
+     *
+     * Will only emit one change event.
+     *
+     */
 
-};
+  }, {
+    key: 'update',
+    value: function update(ln) {
+      this.build(ln);
+      this.emit('change', this);
+    }
+  }, {
+    key: 'toJSON',
+    value: function toJSON() {
+      // TODO: use schema validation for toJSON
+      if (!this.hasOwnProperty('source')) {
+        console.log(this);
+        throw Error('Link should have a source property');
+      }
+      if (!this.hasOwnProperty('target')) {
+        throw Error('Link should have a target property');
+      }
 
-/**
- *
- * Set Source
- *
- * @param {Object} sourceId
- * @param {String} port
- * @param {Object} settings
- * @param {String} action
- * @public
- */
-Link.prototype.setSource = function(sourceId, port, settings, action) {
+      var link = {
+        id: this.id,
+        source: this.source.toJSON(),
+        target: this.target.toJSON()
+      };
 
-  this.source = new Connector(settings);
-  this.source.wire = this;
-  this.source.plug(sourceId, port, action);
+      if (this.metadata) {
+        link.metadata = this.metadata;
+      }
 
-};
+      if (this.fills) {
+        link.fills = this.fills;
+      }
 
-/**
- *
- * Setting of pid's is delayed.
- * I would like them to be available during plug.
- * but whatever.
- *
- */
+      if (this.rejects) {
+        link.rejects = this.rejects;
+      }
 
-Link.prototype.setSourcePid = function(pid) {
-  this.source.setPid(pid);
-};
+      if (this.writes) {
+        link.writes = this.writes;
+      }
 
-Link.prototype.setTargetPid = function(pid) {
-  this.target.setPid(pid);
-};
+      if (this.data !== undefined) {
+        link.data = JSON.parse(JSON.stringify(this.data));
+      }
 
-Link.prototype.setMetadata = function(metadata) {
-  this.metadata = metadata;
-};
+      return link;
+    }
+  }], [{
+    key: 'create',
+    value: function create() {
+      var ln = arguments.length <= 0 || arguments[0] === undefined ? {} : arguments[0];
 
-Link.prototype.setMeta = function(key, val) {
-  this.metadata[key] = val;
-};
+      var link = new Link(ln.id, ln.ioid);
 
-/**
- *
- * Set Title
- *
- * @param {String} title
- * @public
- */
-Link.prototype.setTitle = function(title) {
+      if (ln.source || ln.target) {
+        link.build(ln);
+      }
 
-  this.setMeta('title', title);
+      return link;
+    }
+  }]);
 
-  this.emit('change', this, 'metadata', this.metadata);
-
-};
-
-Link.prototype.clear = function() {
-
-  this.fills = 0;
-  this.writes = 0;
-  this.rejects = 0;
-
-  this.emit('clear', this);
-
-};
-
-/**
- *
- * Update link by passing it a full object.
- *
- * Will only emit one change event.
- *
- */
-Link.prototype.update = function(ln) {
-
-  this.build(ln);
-
-  this.emit('change', this);
-
-};
-
-Link.prototype.toJSON = function() {
-
-  // TODO: use schema validation for toJSON
-  if (!this.hasOwnProperty('source')) {
-    console.log(this);
-    throw Error('Link should have a source property');
-  }
-  if (!this.hasOwnProperty('target')) {
-    throw Error('Link should have a target property');
-  }
-
-  var link = {
-    id: this.id,
-    source: this.source.toJSON(),
-    target: this.target.toJSON()
-  };
-
-  if (this.metadata) {
-    link.metadata = this.metadata;
-  }
-
-  if (this.fills) {
-    link.fills = this.fills;
-  }
-
-  if (this.rejects) {
-    link.rejects = this.rejects;
-  }
-
-  if (this.writes) {
-    link.writes = this.writes;
-  }
-
-  if (this.data !== undefined) {
-    link.data = JSON.parse(JSON.stringify(this.data));
-  }
-
-  return link;
-};
+  return Link;
+})(Setting);
 
 module.exports = Link;
+//# sourceMappingURL=link.js.map
 
-},{"./connector":19,"./setting":37,"./validate":38,"util":16,"uuid":62}],25:[function(require,module,exports){
-'use strict';
+},{"./connector":20,"./setting":40,"./validate":41,"uuid":61}],27:[function(require,module,exports){
+'use strict'
+
+/**
+ *
+ * Mixin
+ *
+ * Will invoke any init() methods immediately if they are defined.
+ *
+ * @param {Object} context instance
+ * @param {Array} mixins Array of mixins
+ */
+;
+module.exports = function mixin(context) {
+  for (var _len = arguments.length, mixins = Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
+    mixins[_key - 1] = arguments[_key];
+  }
+
+  var _iteratorNormalCompletion = true;
+  var _didIteratorError = false;
+  var _iteratorError = undefined;
+
+  try {
+    for (var _iterator = mixins[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+      var _mixin = _step.value;
+
+      var props = Object.getOwnPropertyNames(_mixin.prototype);
+      var _iteratorNormalCompletion2 = true;
+      var _didIteratorError2 = false;
+      var _iteratorError2 = undefined;
+
+      try {
+        for (var _iterator2 = props[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+          var prop = _step2.value;
+
+          if (prop !== 'constructor') {
+            context.prototype[prop] = _mixin.prototype[prop];
+          }
+        }
+      } catch (err) {
+        _didIteratorError2 = true;
+        _iteratorError2 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion2 && _iterator2.return) {
+            _iterator2.return();
+          }
+        } finally {
+          if (_didIteratorError2) {
+            throw _iteratorError2;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    _didIteratorError = true;
+    _iteratorError = err;
+  } finally {
+    try {
+      if (!_iteratorNormalCompletion && _iterator.return) {
+        _iterator.return();
+      }
+    } finally {
+      if (_didIteratorError) {
+        throw _iteratorError;
+      }
+    }
+  }
+};
+//# sourceMappingURL=mixin.js.map
+
+},{}],28:[function(require,module,exports){
+'use strict'
 
 /**
  * Function to sort multidimensional array
@@ -7543,9 +7255,13 @@ module.exports = Link;
  * @param {array} index
  * @returns {array}
  */
+;
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.multisort = multisort;
 function multisortRecursive(a, b, columns, orderBy, index) {
   var direction = orderBy[index] === 'DESC' ? 1 : 0;
-
   var x = a[columns[index]];
   var y = b[columns[index]];
 
@@ -7553,40 +7269,50 @@ function multisortRecursive(a, b, columns, orderBy, index) {
     return direction === 0 ? -1 : 1;
   }
 
-  if (x === y)  {
-    return columns.length - 1 > index ?
-      multisortRecursive(a, b, columns, orderBy, index + 1) : 0;
+  if (x === y) {
+    return columns.length - 1 > index ? multisortRecursive(a, b, columns, orderBy, index + 1) : 0;
   }
 
   return direction === 0 ? 1 : -1;
 }
 
-module.exports = function(arr, columns, orderBy) {
-
-  var x;
+function multisort(arr, columns, orderBy) {
   if (typeof columns === 'undefined') {
     columns = [];
-    for (x = 0; x < arr[0].length; x++) {
+    for (var x = 0; x < arr[0].length; x++) {
       columns.push(x);
     }
   }
 
   if (typeof orderBy === 'undefined') {
     orderBy = [];
-    for (x = 0; x < arr[0].length; x++) {
+    for (var x = 0; x < arr[0].length; x++) {
       orderBy.push('ASC');
     }
   }
 
-  return arr.sort(function(a, b) {
+  return arr.sort(function (a, b) {
     return multisortRecursive(a, b, columns, orderBy, 0);
   });
-};
+}
+//# sourceMappingURL=multisort.js.map
 
-},{}],26:[function(require,module,exports){
-'use strict';
+},{}],29:[function(require,module,exports){
+'use strict'
 
 /* jshint -W040 */
+
+;
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _typeof(obj) { return obj && typeof Symbol !== "undefined" && obj.constructor === Symbol ? "symbol" : typeof obj; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
 
 var Packet = require('./packet');
 var Connector = require('./connector');
@@ -7659,1654 +7385,1543 @@ var portFiller = require('./port/filler');
  * @constructor
  * @public
  */
-function xNode(id, node, identifier, CHI) {
 
-  if (!(this instanceof xNode)) {
-    return new xNode(id, node, identifier, CHI);
-  }
+var xNode = (function (_BaseNode) {
+  _inherits(xNode, _BaseNode);
 
-  // detection of async is still needed.
-  // Really should all just be different classes.
-  // Problem now, we have to run the nodebox to
-  // determine async, which is a super hacky way.
-  this.async = node.type === 'async' ? true : false;
-  this.async = node.async ? true : this.async;
+  function xNode(id, node, identifier, CHI) {
+    _classCallCheck(this, xNode);
 
-  xNode.super_.apply(this, [id, node, identifier, CHI]);
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(xNode).call(this, id, node, identifier, CHI));
+    // detection of async is still needed.
+    // Really should all just be different classes.
+    // Problem now, we have to run the nodebox to
+    // determine async, which is a super hacky way.
 
-  this.type = 'node';
-
-  this.state = {};
-
-  this.persist = {};
-
-  this.transit = {};
-
-  // remember def for .compile()
-  this.def = node;
-
-  /**
-   *
-   * Indicates whether this instance is active.
-   *
-   * This works together with the active state
-   * of the sandbox.
-   *
-   * When a blackbox sends async output done()
-   * should be used to inform us it is done.
-   *
-   * @member {Boolean} active
-   * @public
-   */
-  this.active = false;
-
-  /**
-   *
-   * Indicates whether this node expects async input.
-   *
-   * Async input listening is done by:
-   *
-   *   on.input.<port-name> = function() {}
-   *
-   * Any node can send async output.
-   *
-   * Async nodes are handled differently, their function body
-   * is only executed once, during startup.
-   *
-   * I think the port input function can be handled the same
-   * as a normal function body, we'll just have several
-   * functions to execute based on what input port is targeted.
-   *
-   * The common state is represented in the `state` object.
-   * This is the only variable which is accessible to all ports
-   * and during startup.
-   *
-   */
-  this.nodebox = new NodeBox();
-
-  // done() is added to the nodebox
-  this.nodebox.set('done', this.complete.bind(this));
-  this.nodebox.set('cb', this._asyncOutput.bind(this));
-  this.nodebox.set('state', this.state);
-
-  this._setup();
-
-  /** @member {Mixed} chi */
-  this.chi = {};
-
-  /** delay interval */
-  this.interval = 100;
-
-  /** @member {Object} input */
-  this.input = {};
-
-  /** @member {Object} context */
-  this.context = {};
-
-  /** @member {Object} dependencies */
-  this.dependencies = node.dependencies || {};
-
-  /** @member {Array} expose */
-  this.expose = node.expose;
-
-  /** @member {String} fn */
-  this.fn = node.fn;
-
-  /**
-   * @member {Numeric} nodeTimeout
-   * @default 3000
-   */
-  this.nodeTimeout = node.nodeTimeout || 3000;
-
-  /**
-   *
-   * inputTimeout in milliseconds
-   *
-   * If inputTimeout === `false` there will be no timeout
-   *
-   * @member {Mixed} inputTimeout
-   * @default 3000
-   */
-  this.inputTimeout = typeof node.inputTimeout === 'undefined' ?
-    3000 : node.inputTimeout;
-
-  /** @private */
-  this.__halted = false; // was halted by a hold
-
-  /** @private */
-  this._inputTimeout = null;
-
-  // Solving yet another `design` problem
-  // object containing the current connections in use
-  // will be reset during free Port.
-  // Also belongs to the port objects.
-  this._activeConnections = {};
-
-  this.status = 'init';
-
-  // setup the core
-  this._fillCore();
-
-  // If this node is async, run it once
-  // all ports will be setup and sandbox state will be filled.
-  if (this._isPreloaded()) {
-
-    // still need to add the precompiled function
-    if (this.fn) {
-      //this.nodebox.fill(this.fn);
-      // not tested..
-      this.nodebox.fill(this.fn);
+    if (_this.async !== true) {
+      // super might have set it
+      _this.async = node.type === 'async';
+      _this.async = node.async ? true : _this.async;
     }
 
-    if (this.async) {
-      // how about nodebox.state?
-      // state is now in the definition itself..
-      // this should really also be a deep copy.
-      this.nodebox.state = node.state;
-      this._loadAsync();
-    }
+    _this.type = 'node';
 
-  }
-  else {
+    _this.state = {};
 
-    this.nodebox.compile(this.fn);
+    _this.persist = {};
 
-    if (this.async) {
+    _this.transit = {};
 
-      // This collects the port definitions they
-      // attach to `on`
-      this.nodebox.run();
+    _this._delay = 0;
 
-      this._loadAsync();
-    }
-  }
-
-}
-
-util.inherits(xNode, BaseNode);
-
-// TODO: this generic, however options does not exists anymore, it's settings
-xNode.prototype._setup = function() {
-
-  for (var port in this.ports.input) {
-    if (this.ports.input.hasOwnProperty(port)) {
-      if (this.ports.input[port].options) {
-        for (var opt in this.ports.input[port].options) {
-          if (this.ports.input[port].options.hasOwnProperty(opt)) {
-            this.setPortOption(
-              'input',
-              port,
-              opt,
-              this.ports.input[port].options[opt]);
-          }
-        }
-      }
-    }
-  }
-
-};
-
-xNode.prototype.start = function() {
-
-  var sb;
-
-  if (this.status === 'created') {
-
-    this.setStatus('started');
-    debug('%s: running on start', this.identifier);
-    if (this.nodebox.on.start) {
-      // Run onStart functionality first
-      if (typeof this.nodebox.on.start === 'function') {
-        sb = this._createPortBox(this.nodebox.on.start);
-      } else {
-        sb = this._createPortBox(this.nodebox.on.start.toString());
-      }
-      sb.run(this);
-      this.nodebox.state = this.state = sb.state;
-    }
-
-    this.emit('started', {
-      node: this.export()
-    });
-
-  }
-
-};
-
-xNode.prototype.hasData = function(port) {
-  //return undefined !== this.input[port].data;
-  //return undefined !== this.input[port];
-  return this.input.hasOwnProperty(port);
-};
-
-xNode.prototype.fill = function(target, data, settings) {
-
-  var p;
-  if (data instanceof Packet) {
-    p = data;
-  } else {
-    p = new Packet(this, data, this.getPortType(target.port || target));
-  }
-
-  // allow for simple api
-  if (typeof target === 'string') {
-    var port = target;
-    target = new Connector(settings || {});
-    target.plug(this.id, port);
-    // target.set('dispose', true); should be on wire
-    if (settings) {
-      target.set('persist', true);
-    }
-    this.plug(target);
-  }
-
-  // better call it pointer
-  if (target.has('mask')) {
-    p.point(this, target.get('mask'));
-  }
-
-  var ret = this._receive(target, p);
-
-  debug('%s:%s receive  %s', this.identifier, target.port, ret);
-
-  if (ret !== true) { // Error or `false`
-    if (this.ports.input.hasOwnProperty(target.port)) {
-      this.ports.input[target.port].rejects++;
-      this.ports.input[target.port].lastError = ret;
-    }
-  }
-
-  return ret;
-
-};
-
-/**
- * Usage of `$`
- *
- * Idea is to do the reverse of super() all extending `classes`
- * only have $ methods.
- *
- * @param {type} port
- * @param {type} data
- * @returns {undefined}
- * @shielded
- */
-xNode.prototype.$setContextProperty = function(port, data) {
-  debug('%s:%s set context', this.identifier, port);
-  var p;
-  if (data instanceof Packet) {
-    p = data;
-  } else {
-    p = new Packet(this, data, this.getPortType(port));
-  }
-  this.context[port] = p;
-};
-
-
-// TODO: Array format is not used anymore I think.
-xNode.prototype.getPortType = function(port) {
-  var i;
-  var obj;
-  var type;
-  if (Array.isArray(port)) {
-    obj = this.ports.input;
-    for (i = 0 ; i < port.length; i++) {
-      if (i === 0) {
-        obj = obj[port[i]];
-      } else {
-        obj = obj.properties[port[i]];
-      }
-    }
-    type = obj.type;
-  } else {
-    type = this.ports.input[port].type;
-  }
-  if (type) {
-    return type;
-  } else {
-    throw Error('Unable to determine type for ' + port);
-  }
-};
-
-xNode.prototype.clearContextProperty = function(port) {
-
-  debug('%s:%s clear context', this.identifier, port);
-
-  // drop packet?
-  delete this.context[port];
-
-  this.event(':contextClear', {
-    node: this,
-    port: port
-  });
-};
-
-/**
- *
- * Starts the node
- *
- * TODO: dependencies are always the same, only input is different.
- * dependencies must be created during createScript.
- * also they must be wrapped within a function.
- * otherwise you cannot overwrite window and document etc.
- * ...Maybe statewise it's a good thing, dependencies are re-required.
- *
- * FIXME: this method does too much on it's own.
- *
- * Note: start is totally unprotected, it assumes the input is validated
- * and all required ports are filled.
- * Start should never really be called directly, the node starts when
- * input is ready.
- *
- * @param {Function} fn
- * @param {String} name
- * @fires Node#error
- * @fires Node#require
- * @fires Node#expose
- * @private
- */
-xNode.prototype._delay = 0;
-
-xNode.prototype.__start = function() {
-
-  if (this.active) {
-    // try again, note: this is different from input queueing..
-    // used for longer running processes.
-    debug('%s: node still active delaying', this.identifier);
-    this._delay = this._delay + this.interval;
-    setTimeout(this.start.bind(this), 500 + this._delay);
-    return false;
-  }
-
-  // set active state.
-  this.active = true;
-
-  // Note: moved to the beginning.
-  this.runCount++;
-
-  if (!this.async) {
-    if (this.nodebox.on) {
-      if (this.nodebox.on.shutdown) {
-        debug('%s: running shutdown', this.identifier);
-        this.shutdown();
-      }
-    }
-  }
-
-  this.nodebox.set('input', this.unwrapPackets(this.input));
-
-  // difference in notation, TODO: explain these constructions.
-  // done before compile.
-  // this.nodebox.output = this.async ? this._asyncOutput.bind(this) : {};
-
-  this._runOnce();
-
-};
-
-/**
- *
- * Runs the node
- *
- * @fires Node#nodeTimeout
- * @fires Node#start
- * @fires Node#executed
- * @private
- */
-xNode.prototype._runOnce = function() {
-
-  var t = setTimeout(function() {
-
-    debug('%s: node timeout', this.identifier);
+    // remember def for .compile()
+    _this.def = node;
 
     /**
-     * Timeout Event.
      *
-     * @event Node#nodeTimeout
-     * @type {object}
-     * @property {object} node - An export of this node
+     * Indicates whether this instance is active.
+     *
+     * This works together with the active state
+     * of the sandbox.
+     *
+     * When a blackbox sends async output done()
+     * should be used to inform us it is done.
+     *
+     * @property {Boolean} active
+     * @public
      */
-    this.event(':nodeTimeout', {
-      node: this.export()
+    _this.active = false;
+
+    /**
+     *
+     * Indicates whether this node expects async input.
+     *
+     * Async input listening is done by:
+     *
+     *   on.input.<port-name> = function() {}
+     *
+     * Any node can send async output.
+     *
+     * Async nodes are handled differently, their function body
+     * is only executed once, during startup.
+     *
+     * I think the port input function can be handled the same
+     * as a normal function body, we'll just have several
+     * functions to execute based on what input port is targeted.
+     *
+     * The common state is represented in the `state` object.
+     * This is the only variable which is accessible to all ports
+     * and during startup.
+     *
+     */
+    _this.nodebox = new NodeBox();
+
+    // done() is added to the nodebox
+    _this.nodebox.set('done', _this.complete.bind(_this));
+    _this.nodebox.set('cb', _this._asyncOutput.bind(_this));
+    _this.nodebox.set('state', _this.state);
+
+    _this._setup();
+
+    /** @property {Mixed} chi */
+    _this.chi = {};
+
+    /** delay interval */
+    _this.interval = 100;
+
+    /** @property {Object} input */
+    _this.input = {};
+
+    /** @property {Object} context */
+    _this.context = {};
+
+    /** @property {Object} dependencies */
+    _this.dependencies = node.dependencies || {};
+
+    /** @property {Array} expose */
+    _this.expose = node.expose;
+
+    /** @property {String} fn */
+    _this.fn = node.fn;
+
+    /**
+     * @property {Numeric} nodeTimeout
+     * @default 3000
+     */
+    _this.nodeTimeout = node.nodeTimeout || 3000;
+
+    /**
+     *
+     * inputTimeout in milliseconds
+     *
+     * If inputTimeout === `false` there will be no timeout
+     *
+     * @property {Mixed} inputTimeout
+     * @default 3000
+     */
+    _this.inputTimeout = typeof node.inputTimeout === 'undefined' ? 3000 : node.inputTimeout;
+
+    /** @private */
+    _this.__halted = false; // was halted by a hold
+
+    /** @private */
+    _this._inputTimeout = null;
+
+    /** @property {Numeric} filled */
+    Object.defineProperty(_this, 'filled', {
+      enumerable: true,
+      configurable: false,
+      get: function get() {
+        return Object.keys(this.input).length;
+      }
     });
 
-  }.bind(this), this.nodeTimeout);
+    // Solving yet another `design` problem
+    // object containing the current connections in use
+    // will be reset during free Port.
+    // Also belongs to the port objects.
+    _this._activeConnections = {};
 
-  /**
-   * Start Event.
-   *
-   * @event Node#start
-   * @type {object}
-   * @property {object} node - An export of this node
-   */
-  this.event(':start', {
-    node: this.export()
-  });
+    _this.status = 'init';
 
-  //this.nodebox.runInNewContext(this.sandbox);
-  //
-  // ok, this depends on what is the code whether it's running or not...
-  // that's why async should be definied per port.
-  this.setStatus('running');
+    // setup the core
+    _this._fillCore();
 
-  this.nodebox.run();
-  this.state = this.nodebox.state;
-
-  debug('%s: nodebox executed', this.identifier);
-
-  this.emit('executed', {
-    node: this
-  });
-  this.event(':executed', {
-    node: this
-  });
-
-  clearTimeout(t);
-
-  this._output(this.nodebox.output);
-};
-
-/**
- *
- * Fills the core of this node with functionality.
- *
- * @fires Node#fillCore
- * @private
- */
-xNode.prototype._fillCore = function() {
-
-  debug('%s: fill core', this.identifier);
-
-  /**
-   * Fill Core Event.
-   *
-   * @event Node#fillCore
-   * @type {object}
-   * @property {object} node - An export of this node
-   * @property {function} fn - The function being installed
-   * @property {string} fn - The name of the function
-   */
-  this.event(':fillCore', {
-    node: this.export(),
-    fn: this.fn,
-    name: this.name
-  });
-
-  this.nodebox.require(this.dependencies.npm);
-  this.nodebox.expose(this.expose, this.CHI);
-
-  this.nodebox.set('output', this.async ? this._asyncOutput.bind(this) : {});
-
-  this.setStatus('created');
-
-};
-
-/**
- *
- * Executes the async variant
- *
- * state is the only variable which will persist.
- *
- * @param {string} fn - Portbox Function Body
- * @returns {PortBox}
- * @private
- */
-xNode.prototype._createPortBox = function(fn, name) {
-
-  debug('%s: creating portbox `%s`', this.identifier, name);
-
-  var portbox = new PortBox(name);
-  portbox.set('state', this.nodebox.state);
-  portbox.set('output', this._asyncOutput.bind(this));
-
-  // also absorbes already required.
-  portbox.require(this.dependencies.npm, true);
-  portbox.expose(this.expose, this.CHI);
-
-  if (typeof fn !== 'function') {
-    fn = fn.slice(
-      fn.indexOf('{') + 1,
-      fn.lastIndexOf('}')
-    );
-    portbox.compile(fn);
-  } else {
-    portbox.fill(fn);
-  }
-
-  return portbox;
-
-};
-
-/**
- *
- * Test whether this is a preloaded node.
- *
- * @private
- */
-xNode.prototype._isPreloaded = function() {
-
-  var ret;
-
-  if (typeof this.fn === 'function') {
-    return true;
-  }
-
-  for (var port in this.ports.input) {
-    if (this.ports.input.hasOwnProperty(port)) {
-      ret = !!this.ports.input[port].fn;
-      if (ret) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-
-};
-
-/**
- *
- * @private
- */
-xNode.prototype._loadAsync = function() {
-
-  for (var port in this.ports.input) {
-
-    if (this.ports.input.hasOwnProperty(port)) {
-
-      // If there is a port function defined for this port
-      // it means it's async
-      if (this.nodebox.on.input.hasOwnProperty(port)) {
-
-        this.ports.input[port].fn = this._createPortBox(
-          this.nodebox.on.input[port].toString(), ('__' + port + '__')
-          .toUpperCase()
-        );
-
-        this.async = true;
-        this.ports.input[port].async = true;
-
-      } else if (this.ports.input[port].fn) {
-
-        // pre-compiled
-        this.ports.input[port].fn = this._createPortBox(
-          this.ports.input[port].fn, ('__' + port + '__').toUpperCase()
-        );
-
-        this.async = true;
-        this.ports.input[port].async = true;
-
-      }
-      else {
-
-        // It is a sync port
-
+    // If this node is async, run it once
+    // all ports will be setup and sandbox state will be filled.
+    if (_this._isPreloaded()) {
+      // still need to add the precompiled function
+      if (_this.fn) {
+        //this.nodebox.fill(this.fn);
+        // not tested..
+        _this.nodebox.fill(_this.fn);
       }
 
-    }
-  }
-
-  this.setStatus('created');
-
-  // could just act on general status change event, who uses this?
-  this.emit('created', {
-    node: this.export()
-  });
-
-  this.state = this.nodebox.state;
-
-};
-
-/**
- *
- * Generic Callback wrapper
- *
- * Will collect the arguments and pass them on to the next node
- *
- * So technically the next node is the callback.
- *
- * Parameters are defined on the output as ports.
- *
- * Each callback argument must be defined as output port in the callee's schema
- *
- * e.g.
- *
- *  node style callback:
- *
- *  ports.output: { err: ..., result: ... }
- *
- *  connect style callback:
- *
- *  ports.output: { req: ..., res: ..., next: ... }
- *
- * The order of appearance of arguments must match those of the ports within
- * the json schema.
- *
- * TODO: Within the schema you must define the correct type otherwise output
- * will be refused
- *
- *
- * @private
- */
-xNode.prototype._callbackWrapper = function() {
-
-  var i;
-  var obj = {};
-  var ports;
-
-  ports = this.outPorts;
-
-  for (i = 0; i < arguments.length; i++) {
-
-    if (!ports[i]) {
-
-      // TODO: eventemitter expects a new Error()
-      // not the object I send
-      // Not sure what to do here, it's not really fatal.
-      this.event(':error', {
-        msg: Error(
-          util.format('Unexpected extra port of type %s',
-            typeof arguments[i] === 'object' ?
-            arguments[i].constructor.name : typeof arguments[i]
-          )
-        )
-      });
-
-    }
-    else {
-
-      obj[ports[i]] = arguments[i];
-
-    }
-  }
-
-  this._output(obj);
-
-};
-
-/**
- *
- * Execute the delegated callback for this node.
- *
- * [fs, 'readFile', '/etc/passwd']
- *
- * will execute:
- *
- * fs['readFile']('/etc/passwd', this.callbackWrapper);
- *
- * @param {Object} output
- * @fires Node#branching
- * @private
- */
-xNode.prototype._delegate = function(output) {
-
-  var fn = output.splice(0, 1).pop();
-  var method = output.splice(0, 1).pop();
-
-  output.push(this._callbackWrapper.bind(this));
-  fn[method].apply(fn, output);
-};
-
-/**
- *
- * This node handles the output of the `blackbox`
- *
- * It is specific to the API of the internal Chix node function.
- *
- * out = { port1: data, port2: data }
- * out = [fs.readFile, arg1, arg2 ]
- *
- * Upon output the input will be freed.
- *
- * @param {Object} output
- * @param {Object} chi
- * @fires Node#output
- * @private
- */
-xNode.prototype._asyncOutput = function(output, chi) {
-
-  var port;
-
-  // Ok, delegate and object output has
-  // synchronous output on _all_ ports
-  // however we do not know if we we're called from
-  // the function type of output..
-  for (port in output) {
-    if (output.hasOwnProperty(port)) {
-      this.sendPortOutput(port, output[port], chi);
-    }
-  }
-
-};
-
-/**
- *
- * Output
- *
- * Directs the output to the correct handler.
- *
- * If output is a function it is handled by asyncOutput.
- *
- * If it's an array, it means it's the shorthand variant
- *
- * e.g. output = [fs, 'readFile']
- *
- * This will be handled by the delegate() method.
- *
- * Otherwise it is a normal output object containing the output for the ports.
- *
- * e.g. { out1: ...,  out2: ...,  error: ... } etc.
- *
- * TODO: not sure if this should always call complete.
- *
- * @param {Object} output
- * @private
- */
-xNode.prototype._output = function(output) {
-
-  var port;
-
-  if (typeof output === 'function') {
-    output.call(this, this._asyncOutput.bind(this));
-    return;
-  }
-
-  if (Array.isArray(output)) {
-    this._delegate(output);
-    return;
-  }
-
-  for (port in output) {
-    if (output.hasOwnProperty(port)) {
-      this.sendPortOutput(port, output[port]);
-    }
-  }
-
-  this.complete();
-
-};
-
-/**
- *
- * @param {string} port
- * @private
- */
-
-xNode.prototype._runPortBox = function(port) {
-
-  var sb = this.ports.input[port].fn;
-  // fill in the values
-
-  this.event(':start', {
-    node: this.export()
-  });
-
-  sb.set('data', this.input[port].read(this));
-  sb.set('x', this.chi);
-  sb.set('state', this.state);
-  // sb.set('source', source); is not used I hope
-
-  sb.set('input', this.unwrapPackets(this.input));
-  // add all (sync) input.
-
-  this.setStatus('running');
-
-  // remember last one for cloneing
-  this.transit[port] = this.input[port];
-
-  var ret = sb.run(this);
-
-  this.nodebox.state = this.state = sb.state;
-
-  if (ret === false) {
-    // if ret === false input should be revoked and re-queued.
-    // which means it must look like we didn't accept the packet in
-    // the first place.
-
-    // this.setStatus('idle');
-    var d = this.input[port];
-
-    // freePort somehow doesn't work
-    // only the below + unlock during unshift works.
-    // but has the danger of creating an infinite loop.
-    // if rejection is always false.
-    delete this.input[port];
-    delete this._activeConnections[port];
-
-    this.event(':portReject', {
-      node: this.export(),
-      port: port,
-      data: d // TODO: other portReject emits full packet instead of data.
-    });
-
-    return false;
-  }
-
-  this.runCount++;
-  this.ports.input[port].runCount++;
-
-  debug('%s:%s() executed', this.identifier, port);
-
-  this.emit('executed', {
-    node: this,
-    port: port
-  });
-
-  this.event(':executed', {
-    node: this,
-    port: port
-  });
-
-};
-
-/**
-*
-* Contains much of the port's logic, this should be abstracted out
-* into port objects.
-*
-* For now just add extra functionality overhere.
-*
-* TODO:
-*  - Detect if the input port is defined as Array.
-*  - If it is an array, detect what is it's behaviour
-*
-* Behaviours:
-*  - Multiple non-array ports are connected: wait until all have send
-*    their input and release the array of data.
-*  - One port is connect of the type Array, just accept it and run
-*  - Multiple array ports give input/are connected... same as the above
-*  Arrays will be handled one by one.
-*  - So basically, if we receive an array, we process it.
-*  If it is not we will join multiple connections.
-*  - If there is only one port connected and it is not of an array type
-*    We will just sit there and wait forever,
-*    because we cannot make an array out of it.
-* - I think the rules should be simple, if you want it more complex,
-*   just solve it within the flow by adding extra nodes.
-*   What a port does must be understandable.  So that's why it's also good if
-*   you can specify different kind of port behaviour.
-*   So if you do not like a certain kind of behaviour, just select another one.
-*   Yet all should be simple to grasp. You could also explain an array as being
-*   a port that expects multiple.
-*
-*   The filled concept stays the same, the only thing changing is when we
-*   consider something to be filled.
-*
-*   So.. where is the port type information.
-*
-// TODO: once a connection overwrites a setting.
-// it will not be put back, this is a choice.
-// at what point do we set persistent from a link btw?
-//
-// TODO: has become a bit of a weird method now.
-*/
-
-xNode.prototype.handlePortSettings = function(port) {
-  if (this.ports.input.hasOwnProperty(port)) {}
-};
-
-/**
- * Fill one of our ports.
- *
- * First the input data will be validated. A port
- * will only be filled if the data is of the correct type
- * or even structure.
- *
- * The following events will be emitted:
- *
- *   - `portFill`
- *   - `inputTimeout`
- *   - `clearTimeout` (TODO: remove this)
- *
- * FIXME:
- *  - options are set and overwritten on portFill
- *    which is probably undesired in most cases.
- *
- *  - portFill is the one who triggers the start of a node
- *    it's probably better to trigger an inputReady event.
- *    and start the node based on that.
- *
- * @param {Connector} target
- * @param {Packet} p
- * @returns {Node.error.error|Boolean}
- * #private
- */
-xNode.prototype._fillPort = function(target, p) {
-
-  var res;
-
-  if (undefined === p.read(this)) {
-    return Error('data may not be `undefined`');
-  }
-
-  // Not used
-  //this.handlePortSettings(target.port);
-
-  // PACKET WRITE, TEST THIS
-  // this is not good, it's too early.
-  p.write(this, this._handleFunctionType(target.port, p.read(this)));
-
-  res = this._validateInput(target.port, p.read(this));
-
-  if (util.isError(res)) {
-    return res;
-  }
-  else {
-
-    if (target.has('persist')) {
-      // do array index thing here also.
-      //this.persist[target.port] = p.data;
-      this.persist[target.port] = p;
-      return true;
+      if (_this.async) {
+        // how about nodebox.state?
+        // state is now in the definition itself..
+        // this should really also be a deep copy.
+        _this.nodebox.state = node.state;
+        _this._loadAsync();
+      }
     } else {
-      // this is too early, defaults do not get filled this way.
-      if (this.ports.input[target.port].async === true &&
-        !this._allConnectedSyncFilled()) {
+      _this.nodebox.compile(_this.fn);
 
-        this.event(':portReject', {
-          node: this.export(),
-          port: target.port,
-          data: p
+      if (_this.async) {
+        // This collects the port definitions they
+        // attach to `on`
+        _this.nodebox.run();
+
+        _this._loadAsync();
+      }
+    }
+    return _this;
+  }
+
+  _createClass(xNode, [{
+    key: 'start',
+    value: function start() {
+      var sb = undefined;
+      if (this.status === 'created') {
+        this.setStatus('started');
+        debug('%s: running on start', this.identifier);
+        if (this.nodebox.on.start) {
+          // Run onStart functionality first
+          if (typeof this.nodebox.on.start === 'function') {
+            sb = this._createPortBox(this.nodebox.on.start);
+          } else {
+            sb = this._createPortBox(this.nodebox.on.start.toString());
+          }
+          sb.run(this);
+          this.nodebox.state = this.state = sb.state;
+        }
+
+        this.emit('started', {
+          node: this.export()
         });
+      }
+    }
 
-        // do not accept
-        console.log('early block');
+    /***
+     *
+     * Async problem.
+     *
+     * start() -> isStartable()
+     *
+     * If links are not connected yet, this logic will not work.
+     * However, how to know we are complete.
+     * addnode addnode addlink addlink etk
+     *
+     *
+     *
+     */
+    // ok, nice, multiple ip's will not be possible?, yep..
+
+  }, {
+    key: 'isStartable',
+    value: function isStartable() {
+      if (this.hasConnections()) {
+        // should never happen with IIPs so fix that bug first
         return false;
       }
 
-      try {
-
-        // CHI MERGING check this.
-        // Or is this to early, can we still get a reject?
-        this.CHI.merge(this.chi, p.chi);
-      }
-      catch (e) {
-        // this means chi was not cleared,
-        // yet the input which caused the chi setting
-        // freed the port, so how is this possible.
-        return this.error(util.format(
-          '%s: chi item overlap during fill of port `%s`\n' +
-          'chi arriving:\n%s\nchi already collected:\n%s',
-          this.identifier,
-          target.port,
-          JSON.stringify(p.chi),
-          JSON.stringify(this.chi)
-        ));
+      var fillable = 0;
+      for (var port in this.ports.input) {
+        // null is possible..
+        if (this.ports.input[port].default !== undefined) {
+          fillable++;
+        } else if (this.context[port]) {
+          fillable++;
+        } else if (port === ':start') {
+          fillable++;
+          //} else if (!this.ports.input[port].required) {
+        } else if (this.ports.input[port].required === false) {
+            fillable++;
+          }
       }
 
+      return fillable === this.inPorts.length;
+    }
+  }, {
+    key: 'hasData',
+    value: function hasData(port) {
+      //return undefined !== this.input[port].data;
+      //return undefined !== this.input[port];
+      return this.input.hasOwnProperty(port);
+    }
+  }, {
+    key: 'fill',
+    value: function fill(target, data, settings) {
+      var p = undefined;
+      if (data instanceof Packet) {
+        p = data;
+      } else {
+
+        // TODO: duplicate error handling from plug()
+        // error definition should be in one place.
+        if (this.portExists('input', target.port || target)) {
+          p = new Packet(this, data, this.getPortType('input', target.port || target));
+        } else {
+          return Error(util.format('Process `%s` has no input port named `%s`\n\n\t' + 'Input ports available: %s\n\n\t', this.identifier, target.port, this._portsAvailable()));
+        }
+      }
+
+      // allow for simple api
+      if (typeof target === 'string') {
+        var port = target;
+        target = new Connector(settings || {});
+        target.plug(this.id, port);
+        // target.set('dispose', true); should be on wire
+        if (settings) {
+          target.set('persist', true);
+        }
+        this.plug(target);
+      }
+
+      // better call it pointer
+      if (target.has('mask')) {
+        p.point(this, target.get('mask'));
+      }
+
+      var ret = this._receive(target, p);
+
+      debug('%s:%s receive  %s', this.identifier, target.port, ret);
+
+      if (ret !== true) {
+        // Error or `false`
+        if (this.ports.input.hasOwnProperty(target.port)) {
+          this.ports.input[target.port].rejects++;
+          this.ports.input[target.port].lastError = ret;
+        }
+      }
+
+      return ret;
+    }
+  }, {
+    key: 'clearContextProperty',
+    value: function clearContextProperty(port) {
+      debug('%s:%s clear context', this.identifier, port);
+
+      // drop packet?
+      delete this.context[port];
+
+      this.event(':contextClear', {
+        node: this,
+        port: port
+      });
     }
 
-    // this.filled++;
+    /**
+     *
+     * Starts the node
+     *
+     * TODO: dependencies are always the same, only input is different.
+     * dependencies must be created during createScript.
+     * also they must be wrapped within a function.
+     * otherwise you cannot overwrite window and document etc.
+     * ...Maybe statewise it's a good thing, dependencies are re-required.
+     *
+     * FIXME: this method does too much on it's own.
+     *
+     * Note: start is totally unprotected, it assumes the input is validated
+     * and all required ports are filled.
+     * Start should never really be called directly, the node starts when
+     * input is ready.
+     *
+     * @param {Function} fn
+     * @param {String} name
+     * @emits Node#error
+     * @emits Node#require
+     * @emits Node#expose
+     * @private
+     */
 
-    if (!this._inputTimeout &&
-      this.inputTimeout &&
-      //!this.getPortOption('input', port, 'persist')
-      !target.has('persist')
-    ) {
+    /**
+     *
+     * Contains much of the port's logic, this should be abstracted out
+     * into port objects.
+     *
+     * For now just add extra functionality overhere.
+     *
+     * TODO:
+     *  - Detect if the input port is defined as Array.
+     *  - If it is an array, detect what is it's behaviour
+     *
+     * Behaviours:
+     *  - Multiple non-array ports are connected: wait until all have send
+     *    their input and release the array of data.
+     *  - One port is connect of the type Array, just accept it and run
+     *  - Multiple array ports give input/are connected... same as the above
+     *  Arrays will be handled one by one.
+     *  - So basically, if we receive an array, we process it.
+     *  If it is not we will join multiple connections.
+     *  - If there is only one port connected and it is not of an array type
+     *    We will just sit there and wait forever,
+     *    because we cannot make an array out of it.
+     * - I think the rules should be simple, if you want it more complex,
+     *   just solve it within the flow by adding extra nodes.
+     *   What a port does must be understandable.
+     *   So that's why it's also good if
+     *   you can specify different kind of port behaviour.
+     *   So if you do not like a certain kind of behaviour,
+     *   just select another one.
+     *   Yet all should be simple to grasp.
+     *   You could also explain an array as being a port that expects multiple.
+     *
+     *   The filled concept stays the same, the only thing changing is when we
+     *   consider something to be filled.
+     *
+     *   So.. where is the port type information.
+     *
+     // TODO: once a connection overwrites a setting.
+     // it will not be put back, this is a choice.
+     // at what point do we set persistent from a link btw?
+     //
+     */
 
-      this._inputTimeout = setTimeout(function() {
+  }, {
+    key: 'handlePortSettings',
+    value: function handlePortSettings(port) {
+      if (this.ports.input.hasOwnProperty(port)) {}
+    }
+
+    /* Unused?
+     syncFilled = function() {
+      var port;
+      for (port in this.input) {
+     if (!this.ports.input[port].async &&
+     typeof this.input[port] === 'undefined') {
+     return false;
+     }
+     }
+      return true;
+      };
+      syncFilledCount = function() {
+      var port;
+      var cnt = 0;
+     for (port in this.input) {
+     if (!this.ports.input[port].async &&
+     typeof this.input[port] !== 'undefined') {
+     cnt++;
+     }
+     }
+      return cnt;
+      };
+     */
+
+  }, {
+    key: 'clearInput',
+    value: function clearInput(port) {
+      delete this.input[port];
+    }
+
+    /**
+     *
+     * Checks whether all required ports are filled
+     *
+     * Used to determine if this node should start running.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'allConnectedFilled',
+    value: function allConnectedFilled() {
+      for (var port in this.openPorts) {
+        if (this.openPorts.hasOwnProperty(port)) {
+          if (!this.input.hasOwnProperty(port)) {
+            //if (this.input[port] === undefined) {
+            return xNode.ALL_CONNECTED_NOT_FILLED;
+          }
+        }
+      }
+      return true;
+    }
+
+    /**
+     *
+     * Holds all input until release is called
+     *
+     * @public
+     */
+
+  }, {
+    key: 'hold',
+    value: function hold() {
+      this.setStatus('hold');
+    }
+
+    /**
+     *
+     * Releases the node if it was on hold
+     *
+     * @public
+     */
+
+  }, {
+    key: 'release',
+    value: function release() {
+      this.setStatus('ready');
+
+      if (this.__halted) {
+        this.__halted = false;
+      }
+      return this._readyOrNot();
+    }
+  }, {
+    key: 'isHalted',
+    value: function isHalted() {
+      return this.__halted;
+    }
+
+    /**
+     *
+     * Node completion
+     *
+     * Sends an empty string to the :complete port.
+     * Each node automatically has one of those available.
+     *
+     * Emits the complete event and frees all input ports.
+     *
+     * @private
+     */
+
+  }, {
+    key: 'complete',
+    value: function complete() {
+      this.active = false;
+
+      // uses this.event() now.
+      // this.sendPortOutput(':complete', '', this.chi);
+
+      /**
+       * Complete Event.
+       *
+       * The node has completed.
+       *
+       * TODO: a node can set itself as being active
+       * active must be taken into account before calling
+       * a node complete. As long as a node is active
+       * it is not complete.
+       *
+       * @event Node#complete
+       * @type {object}
+       * @property {object} node - An export of this node
+       */
+
+      this.freeInput();
+
+      this.setStatus('complete');
+
+      this.event(':complete', {
+        node: this.export()
+      });
+    }
+
+    /**
+     *
+     * Runs the shutdown method of the blackbox
+     *
+     * An asynchronous node can define a shutdown function:
+     *
+     *   on.shutdown = function() {
+    *
+    *     // do shutdown stuff
+    *
+    *   }
+     *
+     * When a network shuts down, this function will be called.
+     * To make sure all nodes shutdown gracefully.
+     *
+     * e.g. A node starting a http server can use this
+     *      method to shutdown the server.
+     *
+     * @param {function} cb
+     * @returns {undefined}
+     * @public
+     */
+
+  }, {
+    key: 'shutdown',
+    value: function shutdown(cb) {
+      if (this.nodebox.on && this.nodebox.on.shutdown) {
+        // TODO: nodes now do nothing with the callback, they should..
+        // otherwise we will hang
+        this.nodebox.on.shutdown(cb);
+
+        // TODO: send the nodebox, or just the node export?
+        this.event(':shutdown', this.nodebox);
+      } else {
+        if (cb) {
+          cb();
+        }
+      }
+    }
+
+    /**
+     *
+     * Cleanup
+     *
+     * @public
+     */
+
+  }, {
+    key: 'destroy',
+    value: function destroy() {
+      for (var i = 0; i < xNode.events.length; i++) {
+        this.removeAllListeners(xNode.events[i]);
+      }
+    }
+
+    /**
+     *
+     * Live reset, connections, etc. stay alive.
+     *
+     */
+
+  }, {
+    key: 'reset',
+    value: function reset() {
+      debug('%s: reset', this.identifier);
+
+      // clear persistence
+      this.persist = {};
+
+      // clear any input
+      this.freeInput();
+
+      // reset status
+      // note: also will retrigger the .start thing on nodebox.
+      this.status = 'created';
+
+      // reset any internal state.
+      this.state = {};
+
+      this.runCount = 0;
+    }
+  }, {
+    key: 'unwrapPackets',
+    value: function unwrapPackets(input) {
+      var self = this;
+      return Object.keys(input).reduce(function (obj, k) {
+        obj[k] = input[k].read(self);
+        return obj;
+      }, {});
+    }
+
+    /**
+     *
+     * Frees the input
+     *
+     * After a node has run the input ports are freed,
+     * removing their reference.
+     *
+     * Exceptions:
+     *
+     *  - If the port is set to persistent, it will keep it's
+     *    reference to the variable and stay filled.
+     *
+     * NOTE: at the moment a port doesn't have a filled state.
+     *  we only count how many ports are filled to determine
+     *  if we are ready to run.
+     *
+     * if a node is still in active state it's input can also not
+     * be freed... at the moment it will do so, which is bad.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'freeInput',
+    value: function freeInput() {
+      // this.filled = 0;
+      // Reset this.chi.
+      // must be before freePort otherwise chi will overlap
+      this.chi = {};
+
+      var freed = [];
+      for (var i = 0; i < this.inPorts.length; i++) {
+        var port = this.inPorts[i];
+
+        // TODO: don't call freeInput in the first place if undefined
+        //if (this.input[port] !== undefined) {
+        if (this.input.hasOwnProperty(port)) {
+          this.freePort(port);
+          freed.push(port);
+        }
+      }
+    }
+  }, {
+    key: 'freePort',
+    value: function freePort(port) {
+      /*
+       var persist = this.getPortOption('input', port, 'persist');
+       if (persist) {
+       // persist, chi, hmz, seeze to exist.
+       // but wouldn't matter much, with peristent ports.
+       // TODO: this.filled is not used anymore.
+       debug('%s:%s persisting', this.identifier, port);
+        // indexes are persisted per index.
+       // store inside persit
+       if (Array.isArray(persist)) {
+       // TODO: means object is not supported..
+       this.persist[port] = [];
+       for (var k in this.input[port]) {
+       if (persist.indexOf(k) === -1) {
+       //debug('%s:%s[%s] persisting', this.identifier, port, k);
+       // remove
+       //delete this.input[port][k];
+       } else {
+       debug('%s:%s[%s] persisting', this.identifier, port, k);
+       this.perists[port][k] = this.input[port][k];
+       }
+       delete this.input[port][k];
+       }
+       } else {
+        this.persist[port] = this.input[port];
+       delete this.input[port];
+        }
+       }
+       */
+      //else {
+
+      // this also removes context and default..
+      this.clearInput(port);
+
+      debug('%s:%s :freePort event', this.identifier, port);
+      this.event(':freePort', {
+        node: this.export(),
+        link: this._activeConnections[port], // can be undefined, ok
+        port: port
+      });
+
+      this.emit('freePort', {
+        node: this.export(),
+        link: this._activeConnections[port],
+        port: port
+      });
+
+      // delete reference to active connection (if there was one)
+      // delete this._activeConnections[port];
+      this._activeConnections[port] = null;
+      //}
+    }
+
+    /**
+     * Usage of `$`
+     *
+     * Idea is to do the reverse of super() all extending `classes`
+     * only have $ methods.
+     *
+     * @param {type} port
+     * @param {type} data
+     * @returns {undefined}
+     * @shielded
+     */
+
+  }, {
+    key: '$setContextProperty',
+    value: function $setContextProperty(port, data) {
+      debug('%s:%s set context', this.identifier, port);
+      var p = undefined;
+      if (data instanceof Packet) {
+        p = data;
+      } else {
+        p = new Packet(this, data, this.getPortType('input', port));
+      }
+      this.context[port] = p;
+    }
+  }, {
+    key: '$portIsFilled',
+    value: function $portIsFilled(port) {
+      return this.input.hasOwnProperty(port);
+    }
+
+    // TODO: this generic, however options does not exists anymore, it's settings
+
+  }, {
+    key: '_setup',
+    value: function _setup() {
+      for (var port in this.ports.input) {
+        if (this.ports.input.hasOwnProperty(port)) {
+          if (this.ports.input[port].options) {
+            for (var opt in this.ports.input[port].options) {
+              if (this.ports.input[port].options.hasOwnProperty(opt)) {
+                this.setPortOption('input', port, opt, this.ports.input[port].options[opt]);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /**
+     *
+     * Determines whether we are ready to go.
+     * And starts the node accordingly.
+     *
+     * TODO: it's probably not so smart to consider default
+     * it means we can never send an IIP to a port with a default.
+     * Because the default will already trigger the node to run.
+     *
+     * @private
+     */
+
+  }, {
+    key: '_readyOrNot',
+    value: function _readyOrNot() {
+      // all connected ports are filled.
+      if (this._allConnectedSyncFilled()) {
+        if (this._inputTimeout) {
+          clearTimeout(this._inputTimeout);
+        }
+
+        // Check context/defaults etc. and fill it
+        // should only fill defaults for async ports..
+        // *if* the async port is not connected.
+        var ret = portFiller.fill(this);
+
+        // TODO: if all are async, just skip all the above
+        // async must be as free flow as possible.
+        if (util.isError(ret)) {
+          debug('%s: filler error `%s`', this.identifier, ret);
+
+          return ret;
+        } else {
+          // temp for debug
+          //this.ready = true;
+
+          // todo better to check for ready..
+          if (this.status !== 'hold') {
+            if (this.async) {
+              // really have no clue why these must run together
+              // and why I try to support 4 different ways of writing
+              // a component and sqeeze it into one class.
+              var asyncRan = 0;
+              for (var port in this.ports.input) {
+                // run all async which have input.
+                // persistent async will have input etc.
+                if ((this.ports.input[port].async || this.ports.input[port].fn) &&
+                // need to check packet or?
+                this.input.hasOwnProperty(port)) {
+                  //this.input[port] !== undefined) {
+
+                  ret = this._runPortBox(port);
+
+                  if (ret === false) {
+                    // revoke input
+                    if (asyncRan > 0) {
+                      // only problem now is the multpile async ports.
+                      //
+                      throw Error('Input revoked, yet one async already ran');
+                    }
+
+                    debug('%s:%s() revoked input', this.identifier, port);
+
+                    return Port.INPUT_REVOKED;
+                  }
+
+                  asyncRan++;
+                }
+              }
+
+              if (asyncRan > 0) {
+                this.freeInput();
+              }
+            } else {
+              // not async
+              if (Object.keys(this.input).length !== this.inPorts.length) {
+                //return this.error(util.format(
+                return Error(util.format('Input does not match, Input: %s, InPorts: %s', Object.keys(this.input).toString(), this.inPorts.toString()));
+              } else {
+                this.setStatus('running');
+                this.__start();
+              }
+            }
+          } else {
+            this.__halted = true;
+          }
+        }
+
+        return true;
+      }
+
+      // OK, this false has nothing to do with fill return codes..
+      // yet above for async I treat false as a failed fill.
+      // console.log('SYNC NOT FILLED!', ret, this.identifier);
+      //return false;
+      return true;
+    }
+  }, {
+    key: '__start',
+    value: function __start() {
+      if (this.active) {
+        // try again, note: this is different from input queueing..
+        // used for longer running processes.
+        debug('%s: node still active delaying', this.identifier);
+        this._delay = this._delay + this.interval;
+        setTimeout(this.start.bind(this), 500 + this._delay);
+        return false;
+      }
+
+      // set active state.
+      this.active = true;
+
+      // Note: moved to the beginning.
+      this.runCount++;
+
+      if (!this.async) {
+        if (this.nodebox.on) {
+          if (this.nodebox.on.shutdown) {
+            debug('%s: running shutdown', this.identifier);
+            this.shutdown();
+          }
+        }
+      }
+
+      this.nodebox.set('input', this.unwrapPackets(this.input));
+
+      // difference in notation, TODO: explain these constructions.
+      // done before compile.
+      // this.nodebox.output = this.async ? this._asyncOutput.bind(this) : {};
+
+      this._runOnce();
+    }
+
+    /**
+     *
+     * Runs the node
+     *
+     * @emits Node#nodeTimeout
+     * @emits Node#start
+     * @emits Node#executed
+     * @private
+     */
+
+  }, {
+    key: '_runOnce',
+    value: function _runOnce() {
+      var t = setTimeout((function () {
+        debug('%s: node timeout', this.identifier);
 
         /**
-         * Input Timeout Event.
+         * Timeout Event.
          *
-         * Occurs when there is an input timeout for this node.
-         *
-         * This depends on the inputTimeout property of the node.
-         * If inputTimeout is false, this event will never occur.
-         *
-         * @event Node#inputTimeout
+         * @event Node#nodeTimeout
          * @type {object}
          * @property {object} node - An export of this node
          */
-        this.event(':inputTimeout', {
+        this.event(':nodeTimeout', {
           node: this.export()
         });
+      }).bind(this), this.nodeTimeout);
 
-      }.bind(this), this.inputTimeout);
+      /**
+       * Start Event.
+       *
+       * @event Node#start
+       * @type {object}
+       * @property {object} node - An export of this node
+       */
+      this.event(':start', {
+        node: this.export()
+      });
+
+      //this.nodebox.runInNewContext(this.sandbox);
+      //
+      // ok, this depends on what is the code whether it's running or not...
+      // that's why async should be definied per port.
+      this.setStatus('running');
+
+      this.nodebox.run();
+      this.state = this.nodebox.state;
+
+      debug('%s: nodebox executed', this.identifier);
+
+      this.emit('executed', {
+        node: this
+      });
+      this.event(':executed', {
+        node: this
+      });
+
+      clearTimeout(t);
+
+      this._output(this.nodebox.output);
     }
-
-    // used during free port to find back our connections.
-    // Should belong to the port object (non existant yet)
-    if (target.wire) { // direct node.fill() does not have it
-
-      // does not really happen can be removed..
-      if (this._activeConnections[target.port]) {
-        throw Error('There still is a connection active');
-      }
-      else {
-        this._activeConnections[target.port] = target.wire;
-      }
-    }
-
-    // set input port data
-    // this could be changed to still contain the Packet.
-    this._fillInputPort(target.port, p);
 
     /**
-     * Port Fill Event.
      *
-     * Occurs when a port is filled with data
+     * Fills the core of this node with functionality.
      *
-     * At this point the data is already validated
-     *
-     * @event Node#portFill
-     * @type {object}
-     * @property {object} node - An export of this node
-     * @property {string} port - Name of the port
+     * @emits Node#fillCore
+     * @private
      */
-    //this.event(':portFill', {
-    //todo: not all events are useful to send as output
-    //TODO: just _do_ emit both
-    this.emit('portFill', {
-      node: this.export(),
-      link: target.wire,
-      port: target.port
-    });
 
-    this.event(':portFill', {
-      node: this.export(),
-      link: target.wire,
-      port: target.port
-    });
+  }, {
+    key: '_fillCore',
+    value: function _fillCore() {
+      debug('%s: fill core', this.identifier);
 
-    var ret = this._readyOrNot();
-    return ret;
+      /**
+       * Fill Core Event.
+       *
+       * @event Node#fillCore
+       * @type {object}
+       * @property {object} node - An export of this node
+       * @property {function} fn - The function being installed
+       * @property {string} fn - The name of the function
+       */
+      this.event(':fillCore', {
+        node: this.export(),
+        fn: this.fn,
+        name: this.name
+      });
 
-  }
+      this.nodebox.require(this.dependencies.npm);
+      this.nodebox.expose(this.expose, this.CHI);
 
-};
+      this.nodebox.set('output', this.async ? this._asyncOutput.bind(this) : {});
 
-/**
- *
- * @param {string} port
- * @param {Packet} p
- * @private
- */
-xNode.prototype._fillInputPort = function(port, p) {
+      this.setStatus('created');
+    }
 
-  debug('%s:%s fill', this.identifier, port);
+    /**
+     *
+     * Test whether this is a preloaded node.
+     *
+     * @private
+     */
 
-  this.input[port] = p;
+  }, {
+    key: '_isPreloaded',
+    value: function _isPreloaded() {
+      if (typeof this.fn === 'function') {
+        return true;
+      }
 
-  // increment fill counter
-  this.ports.input[port].fills++;
+      for (var port in this.ports.input) {
+        if (this.ports.input.hasOwnProperty(port)) {
+          if (this.ports.input[port].fn) {
+            return true;
+          }
+        }
+      }
 
-};
-
-/* Unused?
-xNode.prototype.syncFilled = function() {
-
-  var port;
-
-  for (port in this.input) {
-    if (!this.ports.input[port].async &&
-       typeof this.input[port] === 'undefined') {
       return false;
     }
-  }
 
-  return true;
+    /**
+     *
+     * @private
+     */
 
-};
+  }, {
+    key: '_loadAsync',
+    value: function _loadAsync() {
+      for (var port in this.ports.input) {
+        if (this.ports.input.hasOwnProperty(port)) {
+          // If there is a port function defined for this port
+          // it means it's async
+          if (this.nodebox.on.input.hasOwnProperty(port)) {
+            this.ports.input[port].fn = this._createPortBox(this.nodebox.on.input[port].toString(), ('__' + port + '__').toUpperCase());
 
-xNode.prototype.syncFilledCount = function() {
+            this.async = true;
+            this.ports.input[port].async = true;
+          } else if (this.ports.input[port].fn) {
+            // pre-compiled
+            this.ports.input[port].fn = this._createPortBox(this.ports.input[port].fn, ('__' + port + '__').toUpperCase());
 
-  var port;
+            this.async = true;
+            this.ports.input[port].async = true;
+          } else {
+            // It is a sync port
+          }
+        }
+      }
 
-  var cnt = 0;
-  for (port in this.input) {
-    if (!this.ports.input[port].async &&
-       typeof this.input[port] !== 'undefined') {
-      cnt++;
-    }
-  }
+      this.setStatus('created');
 
-  return cnt;
+      // could just act on general status change event, who uses this?
+      this.emit('created', {
+        node: this.export()
+      });
 
-};
-*/
-
-/***
- *
- * Async problem.
- *
- * start() -> isStartable()
- *
- * If links are not connected yet, this logic will not work.
- * However, how to know we are complete.
- * addnode addnode addlink addlink etk
- *
- *
- *
- */
-// ok, nice, multiple ip's will not be possible?, yep..
-xNode.prototype.isStartable = function() {
-
-  if (this.hasConnections()) {
-    // should never happen with IIPs so fix that bug first
-    return false;
-  }
-
-  var fillable = 0;
-  for (var port in this.ports.input) {
-    // null is possible..
-    if (this.ports.input[port].default !== undefined) {
-      fillable++;
-    }
-    else if (this.context[port]) {
-      fillable++;
-    }
-    else if (port === ':start') {
-      fillable++;
-      //} else if (!this.ports.input[port].required) {
-    }
-    else if (this.ports.input[port].required === false) {
-      fillable++;
-    }
-  }
-
-  return fillable === this.inPorts.length;
-
-};
-
-/**
- *
- * Determines whether we are ready to go.
- * And starts the node accordingly.
- *
- * TODO: it's probably not so smart to consider default
- * it means we can never send an IIP to a port with a default.
- * Because the default will already trigger the node to run.
- *
- * @private
- */
-xNode.prototype._readyOrNot = function() {
-
-  // all connected ports are filled.
-  if (this._allConnectedSyncFilled()) {
-
-    if (this._inputTimeout) {
-      clearTimeout(this._inputTimeout);
+      this.state = this.nodebox.state;
     }
 
-    // Check context/defaults etc. and fill it
-    // should only fill defaults for async ports..
-    // *if* the async port is not connected.
-    var ret = portFiller.fill(this);
+    /**
+     *
+     * Generic Callback wrapper
+     *
+     * Will collect the arguments and pass them on to the next node
+     *
+     * So technically the next node is the callback.
+     *
+     * Parameters are defined on the output as ports.
+     *
+     * Each callback argument must be defined as output port
+     * in the callee's schema
+     *
+     * e.g.
+     *
+     *  node style callback:
+     *
+     *  ports.output: { err: ..., result: ... }
+     *
+     *  connect style callback:
+     *
+     *  ports.output: { req: ..., res: ..., next: ... }
+     *
+     * The order of appearance of arguments must match those of the ports within
+     * the json schema.
+     *
+     * TODO: Within the schema you must define the correct type otherwise output
+     * will be refused
+     *
+     *
+     * @private
+     */
 
-    // TODO: if all are async, just skip all the above
-    // async must be as free flow as possible.
-    if (util.isError(ret)) {
+  }, {
+    key: '_callbackWrapper',
+    value: function _callbackWrapper() {
+      var obj = {};
+      var ports = this.outPorts;
 
-      debug('%s: filler error `%s`', this.identifier, ret);
+      for (var i = 0; i < arguments.length; i++) {
+        if (!ports[i]) {
+          // TODO: eventemitter expects a new Error()
+          // not the object I send
+          // Not sure what to do here, it's not really fatal.
+          this.event(':error', {
+            msg: Error(util.format('Unexpected extra port of type %s', _typeof(arguments[i]) === 'object' ? arguments[i].constructor.name : _typeof(arguments[i])))
+          });
+        } else {
+          obj[ports[i]] = arguments[i];
+        }
+      }
 
-      return ret;
-
+      this._output(obj);
     }
-    else {
 
-      // temp for debug
-      //this.ready = true;
+    /**
+     *
+     * Execute the delegated callback for this node.
+     *
+     * [fs, 'readFile', '/etc/passwd']
+     *
+     * will execute:
+     *
+     * fs['readFile']('/etc/passwd', this.callbackWrapper);
+     *
+     * @param {Object} output
+     * @emits Node#branching
+     * @private
+     */
 
-      // todo better to check for ready..
-      if (this.status !== 'hold') {
+  }, {
+    key: '_delegate',
+    value: function _delegate(output) {
+      var fn = output.splice(0, 1).pop();
+      var method = output.splice(0, 1).pop();
 
-        if (this.async) {
+      output.push(this._callbackWrapper.bind(this));
+      fn[method].apply(fn, output);
+    }
 
-          // really have no clue why these must run together
-          // and why I try to support 4 different ways of writing
-          // a component and sqeeze it into one class.
+    /**
+     *
+     * This node handles the output of the `blackbox`
+     *
+     * It is specific to the API of the internal Chix node function.
+     *
+     * out = { port1: data, port2: data }
+     * out = [fs.readFile, arg1, arg2 ]
+     *
+     * Upon output the input will be freed.
+     *
+     * @param {Object} output
+     * @param {Object} chi
+     * @emits Node#output
+     * @private
+     */
 
-          var async_ran = 0;
-          for (var port in this.ports.input) {
+  }, {
+    key: '_asyncOutput',
+    value: function _asyncOutput(output, chi) {
+      // Ok, delegate and object output has
+      // synchronous output on _all_ ports
+      // however we do not know if we we're called from
+      // the function type of output..
+      for (var port in output) {
+        if (output.hasOwnProperty(port)) {
+          this.sendPortOutput(port, output[port], chi);
+        }
+      }
+    }
 
-            // run all async which have input.
-            // persistent async will have input etc.
-            if ((this.ports.input[port].async ||
-              this.ports.input[port].fn) &&
-              // need to check packet or?
-              this.input.hasOwnProperty(port)) {
-              //this.input[port] !== undefined) {
+    /**
+     *
+     * @private
+     */
 
-              ret = this._runPortBox(port);
+  }, {
+    key: '_allConnectedSyncFilled',
+    value: function _allConnectedSyncFilled() {
+      for (var i = 0; i < this.openPorts.length; i++) {
+        var port = this.openPorts[i];
 
-              if (ret === false) {
-                // revoke input
-                if (async_ran > 0) {
-                  // only problem now is the multpile async ports.
-                  //
-                  throw Error('Input revoked, yet one async already ran');
-                }
-
-                debug('%s:%s() revoked input', this.identifier, port);
-
-                return Port.INPUT_REVOKED;
+        // .async test can be removed, .fn is enough
+        if (!this.ports.input[port].async || !this.ports.input[port].fn) {
+          // should be better index check perhaps
+          if (!this.persist.hasOwnProperty(port)) {
+            if (this.ports.input[port].indexed) {
+              if (/object/i.test(this.ports.input[port].type)) {
+                return this._objectPortIsFilled(port);
+              } else {
+                return this._arrayPortIsFilled(port);
               }
-
-              async_ran++;
-
+            } else if (!this.input.hasOwnProperty(port)) {
+              return xNode.SYNC_NOT_FILLED;
             }
           }
-
-          if (async_ran > 0) {
-            this.freeInput();
-          }
-
         }
-        else { // not async
-
-          if (Object.keys(this.input).length !== this.inPorts.length) {
-
-            //return this.error(util.format(
-            return Error(util.format(
-              'Input does not match, Input: %s, InPorts: %s',
-              Object.keys(this.input).toString(),
-              this.inPorts.toString()
-            ));
-
-          }
-          else {
-
-            this.setStatus('running');
-            this.__start();
-
-          }
-
-        }
-
-      }
-      else {
-        this.__halted = true;
       }
 
+      return true;
     }
 
-    return true;
-  }
+    /**
+     *
+     * Output
+     *
+     * Directs the output to the correct handler.
+     *
+     * If output is a function it is handled by asyncOutput.
+     *
+     * If it's an array, it means it's the shorthand variant
+     *
+     * e.g. output = [fs, 'readFile']
+     *
+     * This will be handled by the delegate() method.
+     *
+     * Otherwise it is a normal output object containing the output for the ports.
+     *
+     * e.g. { out1: ...,  out2: ...,  error: ... } etc.
+     *
+     * TODO: not sure if this should always call complete.
+     *
+     * @param {Object} output
+     * @private
+     */
 
-  // OK, this false has nothing to do with fill return codes..
-  // yet above for async I treat false as a failed fill.
-  // console.log('SYNC NOT FILLED!', ret, this.identifier);
-  //return false;
-  return true;
+  }, {
+    key: '_output',
+    value: function _output(output) {
+      if (typeof output === 'function') {
+        output.call(this, this._asyncOutput.bind(this));
+        return;
+      }
 
-};
+      if (Array.isArray(output)) {
+        this._delegate(output);
+        return;
+      }
 
-/**
- *
- * Frees the input
- *
- * After a node has run the input ports are freed,
- * removing their reference.
- *
- * Exceptions:
- *
- *  - If the port is set to persistent, it will keep it's
- *    reference to the variable and stay filled.
- *
- * NOTE: at the moment a port doesn't have a filled state.
- *  we only count how many ports are filled to determine
- *  if we are ready to run.
- *
- * if a node is still in active state it's input can also not
- * be freed... at the moment it will do so, which is bad.
- *
- * @public
- */
-xNode.prototype.freeInput = function() {
+      for (var port in output) {
+        if (output.hasOwnProperty(port)) {
+          this.sendPortOutput(port, output[port]);
+        }
+      }
 
-  var i;
-
-  // this.filled = 0;
-
-  // Reset this.chi.
-  // must be before freePort otherwise chi will overlap
-  this.chi = {};
-
-  var port;
-
-  var freed = [];
-  for (i = 0; i < this.inPorts.length; i++) {
-
-    port = this.inPorts[i];
-
-    // TODO: don't call freeInput in the first place if undefined
-    //if (this.input[port] !== undefined) {
-    if (this.input.hasOwnProperty(port)) {
-      this.freePort(port);
-      freed.push(port);
+      this.complete();
     }
-  }
 
-};
+    /**
+     *
+     * Executes the async variant
+     *
+     * state is the only variable which will persist.
+     *
+     * @param {string} fn - Portbox Function Body
+     * @returns {PortBox}
+     * @private
+     */
 
-xNode.prototype.$portIsFilled = function(port) {
-  return this.input.hasOwnProperty(port);
-};
+  }, {
+    key: '_createPortBox',
+    value: function _createPortBox(fn, name) {
+      debug('%s: creating portbox `%s`', this.identifier, name);
 
-xNode.prototype.clearInput = function(port) {
-  delete this.input[port];
-};
+      var portbox = new PortBox(name);
+      portbox.set('state', this.nodebox.state);
+      portbox.set('output', this._asyncOutput.bind(this));
 
-xNode.prototype.freePort = function(port) {
-/*
-  var persist = this.getPortOption('input', port, 'persist');
-  if (persist) {
-    // persist, chi, hmz, seeze to exist.
-    // but wouldn't matter much, with peristent ports.
-    // TODO: this.filled is not used anymore.
-    debug('%s:%s persisting', this.identifier, port);
+      // also absorbes already required.
+      portbox.require(this.dependencies.npm, true);
+      portbox.expose(this.expose, this.CHI);
 
-    // indexes are persisted per index.
-    // store inside persit
-    if (Array.isArray(persist)) {
-      // TODO: means object is not supported..
-      this.persist[port] = [];
-      for (var k in this.input[port]) {
-        if (persist.indexOf(k) === -1) {
-          //debug('%s:%s[%s] persisting', this.identifier, port, k);
-          // remove
-          //delete this.input[port][k];
+      if (typeof fn !== 'function') {
+        fn = fn.slice(fn.indexOf('{') + 1, fn.lastIndexOf('}'));
+        portbox.compile(fn);
+      } else {
+        portbox.fill(fn);
+      }
+
+      return portbox;
+    }
+
+    /**
+     *
+     * @param {string} port
+     * @private
+     */
+
+  }, {
+    key: '_runPortBox',
+    value: function _runPortBox(port) {
+      var sb = this.ports.input[port].fn;
+      // fill in the values
+
+      this.event(':start', {
+        node: this.export()
+      });
+
+      sb.set('data', this.input[port].read(this));
+      sb.set('x', this.chi);
+      sb.set('state', this.state);
+      // sb.set('source', source); is not used I hope
+
+      sb.set('input', this.unwrapPackets(this.input));
+      // add all (sync) input.
+
+      this.setStatus('running');
+
+      // remember last one for cloneing
+      this.transit[port] = this.input[port];
+
+      var ret = sb.run(this);
+
+      this.nodebox.state = this.state = sb.state;
+
+      if (ret === false) {
+        // if ret === false input should be revoked and re-queued.
+        // which means it must look like we didn't accept the packet in
+        // the first place.
+
+        // this.setStatus('idle');
+        var d = this.input[port];
+
+        // freePort somehow doesn't work
+        // only the below + unlock during unshift works.
+        // but has the danger of creating an infinite loop.
+        // if rejection is always false.
+        delete this.input[port];
+        delete this._activeConnections[port];
+
+        this.event(':portReject', {
+          node: this.export(),
+          port: port,
+          data: d // TODO: other portReject emits full packet instead of data.
+        });
+
+        return false;
+      }
+
+      this.runCount++;
+      this.ports.input[port].runCount++;
+
+      debug('%s:%s() executed', this.identifier, port);
+
+      this.emit('executed', {
+        node: this,
+        port: port
+      });
+
+      this.event(':executed', {
+        node: this,
+        port: port
+      });
+    }
+
+    /**
+     * Fill one of our ports.
+     *
+     * First the input data will be validated. A port
+     * will only be filled if the data is of the correct type
+     * or even structure.
+     *
+     * The following events will be emitted:
+     *
+     *   - `portFill`
+     *   - `inputTimeout`
+     *   - `clearTimeout` (TODO: remove this)
+     *
+     * FIXME:
+     *  - options are set and overwritten on portFill
+     *    which is probably undesired in most cases.
+     *
+     *  - portFill is the one who triggers the start of a node
+     *    it's probably better to trigger an inputReady event.
+     *    and start the node based on that.
+     *
+     * @param {Connector} target
+     * @param {Packet} p
+     * @returns {Node.error.error|Boolean}
+     * #private
+     */
+
+  }, {
+    key: '_fillPort',
+    value: function _fillPort(target, p) {
+      if (undefined === p.read(this)) {
+        return Error('data may not be `undefined`');
+      }
+
+      // Not used
+      //this.handlePortSettings(target.port);
+
+      // PACKET WRITE, TEST THIS
+      // this is not good, it's too early.
+      p.write(this, this._handleFunctionType(target.port, p.read(this)));
+
+      var res = this._validateInput(target.port, p.read(this));
+
+      if (util.isError(res)) {
+        return res;
+      } else {
+        if (target.has('persist')) {
+          // do array index thing here also.
+          //this.persist[target.port] = p.data;
+          this.persist[target.port] = p;
+          return true;
         } else {
-          debug('%s:%s[%s] persisting', this.identifier, port, k);
-          this.perists[port][k] = this.input[port][k];
+          // this is too early, defaults do not get filled this way.
+          if (this.ports.input[target.port].async === true && !this._allConnectedSyncFilled()) {
+
+            this.event(':portReject', {
+              node: this.export(),
+              port: target.port,
+              data: p
+            });
+
+            // do not accept
+            console.log('early block');
+            return false;
+          }
+
+          try {
+            // CHI MERGING check this.
+            // Or is this to early, can we still get a reject?
+            this.CHI.merge(this.chi, p.chi);
+          } catch (e) {
+            // this means chi was not cleared,
+            // yet the input which caused the chi setting
+            // freed the port, so how is this possible.
+            return this.error(util.format('%s: chi item overlap during fill of port `%s`\n' + 'chi arriving:\n%s\nchi already collected:\n%s', this.identifier, target.port, JSON.stringify(p.chi), JSON.stringify(this.chi)));
+          }
         }
-        delete this.input[port][k];
+
+        // this.filled++;
+
+        if (!this._inputTimeout && this.inputTimeout &&
+        //!this.getPortOption('input', port, 'persist')
+        !target.has('persist')) {
+          this._inputTimeout = setTimeout((function () {
+
+            /**
+             * Input Timeout Event.
+             *
+             * Occurs when there is an input timeout for this node.
+             *
+             * This depends on the inputTimeout property of the node.
+             * If inputTimeout is false, this event will never occur.
+             *
+             * @event Node#inputTimeout
+             * @type {object}
+             * @property {object} node - An export of this node
+             */
+            this.event(':inputTimeout', {
+              node: this.export()
+            });
+          }).bind(this), this.inputTimeout);
+        }
+
+        // used during free port to find back our connections.
+        // Should belong to the port object (non existant yet)
+        if (target.wire) {
+          // direct node.fill() does not have it
+          // does not really happen can be removed..
+          if (this._activeConnections[target.port]) {
+            throw Error('There still is a connection active');
+          } else {
+            this._activeConnections[target.port] = target.wire;
+          }
+        }
+
+        // set input port data
+        // this could be changed to still contain the Packet.
+        this._fillInputPort(target.port, p);
+
+        /**
+         * Port Fill Event.
+         *
+         * Occurs when a port is filled with data
+         *
+         * At this point the data is already validated
+         *
+         * @event Node#portFill
+         * @type {object}
+         * @property {object} node - An export of this node
+         * @property {string} port - Name of the port
+         */
+        //this.event(':portFill', {
+        //todo: not all events are useful to send as output
+        //TODO: just _do_ emit both
+        this.emit('portFill', {
+          node: this.export(),
+          link: target.wire,
+          port: target.port
+        });
+
+        this.event(':portFill', {
+          node: this.export(),
+          link: target.wire,
+          port: target.port
+        });
+
+        var ret = this._readyOrNot();
+        return ret;
       }
-    } else {
-
-      this.persist[port] = this.input[port];
-      delete this.input[port];
-
     }
-  }
-*/
-  //else {
 
-  // this also removes context and default..
-  this.clearInput(port);
+    /**
+     *
+     * @param {string} port
+     * @param {Packet} p
+     * @private
+     */
 
-  debug('%s:%s :freePort event', this.identifier, port);
-  this.event(':freePort', {
-    node: this.export(),
-    link: this._activeConnections[port], // can be undefined, ok
-    port: port
-  });
+  }, {
+    key: '_fillInputPort',
+    value: function _fillInputPort(port, p) {
+      debug('%s:%s fill', this.identifier, port);
 
-  this.emit('freePort', {
-    node: this.export(),
-    link: this._activeConnections[port],
-    port: port
-  });
+      this.input[port] = p;
 
-  // delete reference to active connection (if there was one)
-  // delete this._activeConnections[port];
-  this._activeConnections[port] = null;
-  //}
-
-};
-
-/**
- *
- * Checks whether all required ports are filled
- *
- * Used to determine if this node should start running.
- *
- * @public
- */
-xNode.prototype.allConnectedFilled = function() {
-  for (var port in this.openPorts) {
-    if (this.openPorts.hasOwnProperty(port)) {
-      if (!this.input.hasOwnProperty(port)) {
-      //if (this.input[port] === undefined) {
-        return xNode.ALL_CONNECTED_NOT_FILLED;
-      }
+      // increment fill counter
+      this.ports.input[port].fills++;
     }
-  }
-  return true;
-};
+  }]);
+
+  return xNode;
+})(BaseNode);
 
 xNode.SYNC_NOT_FILLED = false;
 xNode.ALL_CONNECTED_NOT_FILLED = false;
 
-/**
- *
- * @private
- */
-xNode.prototype._allConnectedSyncFilled = function() {
-
-  for (var i = 0; i < this.openPorts.length; i++) {
-    var port = this.openPorts[i];
-
-    // .async test can be removed, .fn is enough
-    if (!this.ports.input[port].async ||
-      !this.ports.input[port].fn) {
-
-      // should be better index check perhaps
-      if (!this.persist.hasOwnProperty(port)) {
-
-        if (this.ports.input[port].indexed) {
-          if (/object/i.test(this.ports.input[port].type)) {
-            return this._objectPortIsFilled(port);
-          }
-          else {
-            return this._arrayPortIsFilled(port);
-          }
-        }
-        //else if (this.input[port] === undefined) {
-        else if (!this.input.hasOwnProperty(port)) {
-          return xNode.SYNC_NOT_FILLED;
-        }
-
-      }
-    }
-  }
-
-  return true;
-};
-
-/**
- *
- * Wires a source port to one of our ports
- *
- * target is the target object of the connection.
- * which consist of a source and target object.
- *
- * So in this calink.se the target is _our_ port.
- *
- * If a connection is made to the virtual `:start` port
- * it will be created automatically if it does not exist already.
- *
- * The port will be set to the open state and the connection
- * will be registered.
- *
- * A port can have multiple connections.
- *
- * TODO: the idea was to also keep track of
- *       what sources are connected.
- *
- * @private
- */
-xNode.prototype._initStartPort = function() {
-  // add it to known ports
-  if (!this.portExists('input', ':start')) {
-    debug('%s:%s initialized', this.identifier, ':start');
-    this.addPort('input', ':start', {
-      type: 'any',
-      name: ':start',
-      rejects: 0,
-      fills: 0,
-      runCount: 0
-    });
-  }
-};
-
-/**
- *
- * Holds all input until release is called
- *
- * @public
- */
-xNode.prototype.hold = function() {
-  this.setStatus('hold');
-};
-
-/**
- *
- * Releases the node if it was on hold
- *
- * @public
- */
-xNode.prototype.release = function() {
-
-  this.setStatus('ready');
-
-  if (this.__halted) {
-    this.__halted = false;
-  }
-  return this._readyOrNot();
-};
-
-xNode.prototype.isHalted = function() {
-  return this.__halted;
-};
-
-/**
- *
- * Node completion
- *
- * Sends an empty string to the :complete port.
- * Each node automatically has one of those available.
- *
- * Emits the complete event and frees all input ports.
- *
- * @private
- */
-xNode.prototype.complete = function() {
-
-  this.active = false;
-
-  // uses this.event() now.
-  // this.sendPortOutput(':complete', '', this.chi);
-
-  /**
-   * Complete Event.
-   *
-   * The node has completed.
-   *
-   * TODO: a node can set itself as being active
-   * active must be taken into account before calling
-   * a node complete. As long as a node is active
-   * it is not complete.
-   *
-   * @event Node#complete
-   * @type {object}
-   * @property {object} node - An export of this node
-   */
-
-  this.freeInput();
-
-  this.setStatus('complete');
-
-  this.event(':complete', {
-    node: this.export()
-  });
-
-};
-
-/**
- *
- * Runs the shutdown method of the blackbox
- *
- * An asynchronous node can define a shutdown function:
- *
- *   on.shutdown = function() {
- *
- *     // do shutdown stuff
- *
- *   }
- *
- * When a network shuts down, this function will be called.
- * To make sure all nodes shutdown gracefully.
- *
- * e.g. A node starting a http server can use this
- *      method to shutdown the server.
- *
- * @param {function} cb
- * @returns {undefined}
- * @public
- */
-xNode.prototype.shutdown = function(cb) {
-  if (this.nodebox.on && this.nodebox.on.shutdown) {
-
-    // TODO: nodes now do nothing with the callback, they should..
-    // otherwise we will hang
-    this.nodebox.on.shutdown(cb);
-
-    // TODO: send the nodebox, or just the node export?
-    this.event(':shutdown', this.nodebox);
-
-  }
-  else {
-    if (cb) {
-      cb();
-    }
-  }
-};
-
-/**
- *
- * Cleanup
- *
- * @public
- */
-xNode.prototype.destroy = function() {
-  for (var i = 0; i < xNode.events.length; i++) {
-    this.removeAllListeners(xNode.events[i]);
-  }
-};
-
-/**
- *
- * Live reset, connections, etc. stay alive.
- *
- */
-xNode.prototype.reset = function() {
-
-  debug('%s: reset', this.identifier);
-
-  // clear persistence
-  this.persist = {};
-
-  // clear any input
-  this.freeInput();
-
-  // reset status
-  // note: also will retrigger the .start thing on nodebox.
-  this.status = 'created';
-
-  // reset any internal state.
-  this.state = {};
-
-  this.runCount = 0;
-
-};
-
-xNode.prototype.unwrapPackets = function(input) {
-  var self = this;
-  return Object.keys(input).reduce(function(obj, k) {
-    obj[k] = input[k].read(self);
-    return obj;
-  }, {});
-};
-
 module.exports = xNode;
+//# sourceMappingURL=node.js.map
 
-},{"./connector":19,"./node/interface":27,"./packet":29,"./port":30,"./port/filler":31,"./sandbox/node":35,"./sandbox/port":36,"debug":49,"util":16}],27:[function(require,module,exports){
-'use strict';
+},{"./connector":20,"./node/interface":30,"./packet":31,"./port":32,"./port/filler":33,"./sandbox/node":38,"./sandbox/port":39,"debug":"V4HZ/5","util":6}],30:[function(require,module,exports){
+'use strict'
 
 /* jshint -W040 */
 
-var EventEmitter = require('events').EventEmitter;
+;
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _typeof(obj) { return obj && typeof Symbol !== "undefined" && obj.constructor === Symbol ? "symbol" : typeof obj; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
+var EventEmitter = require('../events/after');
 var util = require('util');
 var X = require('chix-chi');
 var Port = require('../port');
@@ -9315,1940 +8930,1684 @@ var validate = require('../validate');
 var Connections = require('../ConnectionMap');
 var debug = require('debug')('chix:inode');
 
-function INode(id, node, identifier, CHI) {
+var BaseNode = (function (_EventEmitter) {
+  _inherits(BaseNode, _EventEmitter);
 
-  if (!(this instanceof INode)) {
-    return new INode(id, node, identifier, CHI);
-  }
+  function BaseNode(id, node, identifier, CHI) {
+    _classCallCheck(this, BaseNode);
 
-  this.pid = null;
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(BaseNode).call(this));
 
-  this.provider = node.provider;
+    _this.pid = null;
 
-  /**
-   * @member {String} status
-   * @public
-   */
-  this.status = 'unknown';
-
-  /**
-   * @member {String} id
-   * @public
-   */
-  this.id = id;
-
-  /**
-   * @member {String} name
-   * @public
-   */
-  this.name = node.name;
-
-  /**
-   * @member {String} ns
-   * @public
-   */
-  this.ns = node.ns;
-
-  /**
-   * @member {String} title
-   * @public
-   */
-  this.title = node.title;
-
-  /**
-   * @member {String} description
-   * @public
-   */
-  this.description = node.description;
-
-  /**
-   * @member {Object} metadata
-   * @public
-   */
-  this.metadata = node.metadata || {};
-
-  /**
-   * @member {String} identifier
-   * @public
-   */
-  this.identifier = identifier || node.ns + ':' + node.name;
-
-  if (!node.hasOwnProperty('ports')) {
-    throw Error('INodeDefinition does not declare any ports');
-  }
-
-  if (!node.ports.output) {
-    node.ports.output = {};
-  }
-
-  if (!node.ports.input) {
-    node.ports.input = {};
-  }
-
-  if (CHI && CHI.constructor.name !== 'CHI') {
-    throw Error('CHI should be instance of CHI');
-  }
-
-  this.CHI = CHI || new X();
-
-  // let the node `interface` instantiate all port objects.
-  // each extended will already have port object setup.
-
-  /**
-   *
-   * Ports which are opened by openPort.
-   *
-   * The Actor opens each port when it connects to it.
-   *
-   * Also for IIPs the port will have to be opened first.
-   *
-   * @private
-   **/
-  this.openPorts = [];
-
-  /**
-   *
-   * Will keep a list of connections to each port.
-   *
-   */
-  this._connections = new Connections();
-
-  /** @member {Object} ports */
-  this.ports = this._clonePorts(node.ports);
-
-  // how many times this node has run
-  /** @member {Numeric} runCount */
-  this.runCount = 0;
-
-  // how many times this node gave port output
-  /** @member {Numeric} outputCount */
-  this.outputCount = 0;
-
-  /** @member {Array} inPorts */
-  Object.defineProperty(this, 'inPorts', {
-    enumerable: true,
-    get: function() {
-      return Object.keys(this.ports.input);
-    }
-  });
-
-  /** @member {Array} outPorts */
-  Object.defineProperty(this, 'outPorts', {
-    enumerable: true,
-    get: function() {
-      return Object.keys(this.ports.output);
-    }
-  });
-
-  /** @member {Numeric} filled */
-  Object.defineProperty(this, 'filled', {
-    enumerable: true,
-    configurable: false,
-    get: function() {
-      return Object.keys(this.input).length;
-    }
-  });
-
-  // Always add complete port, :start port will be added
-  // dynamicaly
-  this.ports.output[':complete'] = {
-    name: ':complete',
-    type: 'any'
-  };
-
-  var key;
-  // TODO: should just be proper port objects.
-  for (key in this.ports.input) {
-    if (this.ports.input.hasOwnProperty(key)) {
-      this.ports.input[key].fills = 0;
-      this.ports.input[key].runCount = 0;
-      this.ports.input[key].rejects = 0;
-    }
-  }
-
-  for (key in this.ports.output) {
-    if (this.ports.output.hasOwnProperty(key)) {
-      this.ports.output[key].fills = 0;
-    }
-  }
-
-}
-
-util.inherits(INode, EventEmitter);
-
-/**
- *
- * Create a Node
- *
- * @api public
- */
-INode.create = function(id, def, identifier, CHI) {
-  return new INode(id, def, identifier, CHI);
-};
-
-INode.prototype.getPid = function() {
-  return this.pid;
-};
-
-INode.prototype._clonePorts = function(ports) {
-  var type;
-  var port;
-  var copy = JSON.parse(JSON.stringify(ports));
-
-  // keep fn in tact.
-  // all same `instances` share this function.
-  for (type in ports) {
-    if (ports.hasOwnProperty(type)) {
-      for (port in ports[type]) {
-        if (ports[type].hasOwnProperty(port)) {
-          if (ports[type][port].fn) {
-            copy[type][port].fn = ports[type][port].fn;
-            this.async = true; // TODO: remove the need of this flagging.
-          }
-        }
-      }
-    }
-  }
-
-  return copy;
-};
-
-/**
- *
- * @param {type} pid
- * @public
- */
-INode.prototype.setPid = function(pid) {
-  this.pid = pid;
-};
-
-/**
- *
- * Set Title
- *
- * Used to set the title of a node *within* a graph.
- * This property overwrites the setting of the node definition
- * and is returned during toJSON()
- *
- * @param {string} title
- * @public
- */
-INode.prototype.setTitle = function(title) {
-  this.title = title;
-};
-
-/**
- *
- * Set Description
- *
- * Used to set the description of a node *within* a graph.
- * This property overwrites the setting of the node definition
- * and is returned during toJSON()
- *
- * @param {string} description
- * @public
- */
-INode.prototype.setDescription = function(description) {
-  this.description = description;
-};
-
-/**
- *
- * Set metadata
- *
- * Currently:
- *
- *   x: x position hint for display
- *   y: y position hint for display
- *
- * These values are returned during toJSON()
- *
- * @param {object} metadata
- * @public
- */
-INode.prototype.setMetadata = function(metadata) {
-  for (var k in metadata) {
-    if (metadata.hasOwnProperty(k)) {
-      this.setMeta(k, metadata[k]);
-    }
-  }
-};
-
-/**
- *
- * Returns the node representation to be stored along
- * with the graph.
- *
- * This is not the full definition of the node itself.
- *
- * The full definition can be found using the ns/name pair
- * along with the provider property.
- *
- */
-INode.prototype.toJSON = function() {
-
-  var self = this;
-
-  var json = {
-    id: this.id,
-    ns: this.ns,
-    name: this.name
-  };
-
-  [
-    'title',
-    'description',
-    'metadata',
-    'provider'
-  ].forEach(function(prop) {
-    if (self[prop]) {
-      if (typeof self[prop] !== 'object' ||
-        Object.keys(self[prop]).length > 0) {
-        json[prop] = self[prop];
-      }
-    }
-  });
-
-  return json;
-
-};
-
-/**
- *
- * @returns {Object}
- * @public
- */
-
-INode.prototype.report = function() {
-
-  return {
-    id: this.id,
-    identifier: this.identifier,
-    title: this.title,
-    filled: this.filled,
-    runCount: this.runCount,
-    outputCount: this.outputCount,
-    status: this.status,
-    input: this._filteredInput(),
-    context: this.context,
-    ports: this.ports,
-    state: this.state,
-    openPorts: this.openPorts,
-    connections: this._connections.toJSON()
-  };
-
-};
-
-/**
- *
- * @param {string} key
- * @param {any} value
- */
-INode.prototype.setMeta = function(key, value) {
-  this.metadata[key] = value;
-};
-
-/**
- *
- * Set node status.
- *
- * This is unused at the moment.
- *
- * Should probably contain states like:
- *
- *  - Hold
- *  - Complete
- *  - Ready
- *  - Error
- *  - Timeout
- *  - etc.
- *
- * Maybe something like Idle could also be implemented.
- * This would probably only make sense if there are persistent ports
- * which hold a reference to an instance upon which we can call methods.
- *
- * Such an `idle` state would indicate the node is ready to accept new
- * input.
- *
- * @param {String} status
- * @private
- */
-INode.prototype.setStatus = function(status) {
-
-  this.status = status;
-
-  /**
-   * Status Update Event.
-   *
-   * Fired multiple times on output
-   *
-   * Once for every output port.
-   *
-   * @event INode#statusUpdate
-   * @type {object}
-   * @property {object} node - An export of this node
-   * @property {string} status - The status
-   */
-  this.event(':statusUpdate', {
-    node: this.export(),
-    status: this.status
-  });
-
-};
-
-/**
- *
- * Get the current node status.
- *
- * This is unused at the moment.
- *
- * @public
- */
-INode.prototype.getStatus = function() {
-
-  return this.status;
-
-};
-
-INode.prototype.getParent = function() {
-  return this.parent;
-};
-
-INode.prototype.setParent = function(node) {
-  this.parent = node;
-};
-
-INode.prototype.hasParent = function() {
-  return !!this.parent;
-};
-
-INode.events = [
-  ':closePort',
-  ':contextUpdate',
-  ':contextClear',
-  ':complete',
-  ':error',
-  ':executed',
-  ':expose',
-  ':fillCore',
-  ':freePort',
-  ':index',
-  ':inputTimeout',
-  ':inputValidated',
-  ':nodeTimeout',
-  ':openPort',
-  ':output',
-  ':plug',
-  ':unplug',
-  ':portFill',
-  ':portReject',
-  ':require',
-  ':statusUpdate',
-  ':start',
-  ':shutdown'
-];
-
-/**
- *
- * @param {string} port
- * @param {Mixed} data
- * @private
- */
-INode.prototype._handleFunctionType = function(port, data) {
-  var portObj = this.getPort('input', port);
-  // convert function if it's not already a function
-  if (portObj.type === 'function' &&
-    typeof data === 'string') {
-    // args, can be used as a hint for named parms
-    // if there are no arg names defined, use arguments
-    var args = portObj.args ? portObj.args : [];
-    data = new Function(args, data);
-  }
-
-  return data;
-};
-
-/**
- *
- * Fills the port.
- *
- * Does the same as fillPort, however it also checks:
- *
- *   - port availability
- *   - port settings
- *
- * FIXME: fill & fillPort can just be merged probably.
- *
- * @param {Object} target
- * @public
- */
-INode.prototype.handleLinkSettings = function(target) {
-
-  // FIX: hold is not handled anywhere as setting anymore
-  if (target.has('hold')) {
-    this.hold();
-  }
-  else if (target.has('persist')) {
-    // FIX ME: has become a weird construction now
-    //
-    // THIS IS NOW BROKEN, on purpose.. :-)
-    var index = target.get('index');
-
-    // specialized case, make this more clear.
-    // persist can be a boolean, or it becomes an array of
-    // indexes to persist.
-    if (index) {
-      if (!Array.isArray(this.ports.input[target.port].persist)) {
-        this.ports.input[target.port].persist = [];
-      }
-      this.ports.input[target.port].persist.push(index);
-    }
-    else {
-      this.ports.input[target.port].persist = true;
-    }
-  }
-};
-
-INode.prototype._receive = function(target, p) {
-
-  if (this.status === 'error') {
-    return new Error('Port fill refused process is in error state');
-  }
-
-  if (!this.portExists('input', target.port)) {
-
-    return new Error(util.format(
-      'Process %s has no input port named `%s`\n\n' +
-      '\tInput ports available:\n\n\t%s',
-      this.identifier,
-      target.port,
-      this._portsAvailable()
-    ));
-
-  }
-
-  if (!this.portIsOpen(target.port)) {
-    return Error(util.format(
-      'Trying to send to a closed port open it first: %s',
-      target.port
-    ));
-  }
-
-  // should probably moved somewhere later
-  this.handleLinkSettings(target);
-
-  var type = this.ports.input[target.port].type;
-
-  if (type === 'array' && target.has('index')) {
-    return this._handleArrayPort(target, p);
-  }
-
-  if (type === 'object' && target.has('index')) {
-    return this._handleObjectPort(target, p);
-  }
-
-  // queue manager could just act on the false return
-  // instead of checking inputPortAvailable by itself
-  var ret = this.inputPortAvailable(target);
-  if (!ret || util.isError(ret)) {
+    _this.provider = node.provider;
 
     /**
-     * Port Reject Event.
-     *
-     * Fired when input on a port is rejected.
-     *
-     * @event INode#portReject
-     * @type {object}
-     * @property {object} node - An export of this node
-     * @property {string} port - Name of the port this rejection occured
+     * @property {String} status
+     * @public
      */
-    this.event(':portReject', {
-      node: this.export(),
-      port: target.port,
-      data: p
+    _this.status = 'unknown';
+
+    /**
+     * @property {String} id
+     * @public
+     */
+    _this.id = id;
+
+    /**
+     * @property {String} name
+     * @public
+     */
+    _this.name = node.name;
+
+    /**
+     * @property {String} ns
+     * @public
+     */
+    _this.ns = node.ns;
+
+    /**
+     * @property {String} title
+     * @public
+     */
+    _this.title = node.title;
+
+    /**
+     * @property {String} description
+     * @public
+     */
+    _this.description = node.description;
+
+    /**
+     * @property {Object} metadata
+     * @public
+     */
+    _this.metadata = node.metadata || {};
+
+    /**
+     * @property {String} identifier
+     * @public
+     */
+    _this.identifier = identifier || node.ns + ':' + node.name;
+
+    if (!node.hasOwnProperty('ports')) {
+      throw Error('NodeDefinition does not declare any ports');
+    }
+
+    if (!node.ports.output) {
+      node.ports.output = {};
+    }
+
+    if (!node.ports.input) {
+      node.ports.input = {};
+    }
+
+    if (CHI && CHI.constructor.name !== 'CHI') {
+      throw Error('CHI should be instance of CHI');
+    }
+
+    _this.CHI = CHI || new X();
+
+    // let the node `interface` instantiate all port objects.
+    // each extended will already have port object setup.
+
+    /**
+     *
+     * Ports which are opened by openPort.
+     *
+     * The Actor opens each port when it connects to it.
+     *
+     * Also for IIPs the port will have to be opened first.
+     *
+     * @private
+     **/
+    _this.openPorts = [];
+
+    /**
+     *
+     * Will keep a list of connections to each port.
+     *
+     */
+    _this._connections = new Connections();
+
+    /** @property {Object} ports */
+    _this.ports = _this._clonePorts(node.ports);
+
+    // how many times this node has run
+    /** @property {Numeric} runCount */
+    _this.runCount = 0;
+
+    // how many times this node gave port output
+    /** @property {Numeric} outputCount */
+    _this.outputCount = 0;
+
+    /** @property {Array} inPorts */
+    Object.defineProperty(_this, 'inPorts', {
+      enumerable: true,
+      get: function get() {
+        return Object.keys(this.ports.input);
+      }
     });
 
-    return ret;
-
-  }
-  else {
-
-    ret = this._fillPort(target, p);
-    return ret;
-
-  }
-
-};
-
-/**
- *
- * Handles an Array port
- *
- * [0,1,2]
- *
- * When sending IIPs the following can also happen:
- * [undefined, undefined, 2]
- * IIPs in this way must be send as a group.
- * That group will be added in reverse order.
- * This way 2 will create an array of length 3
- * This is important because we will check the length
- * whether we are ready to go.
- *
- * If 0 was added first, the length will be 1 and
- * it seems like we are ready to go, then 1 comes
- * and finds the process is already running..
- *
- * [undefined, undefined, 2]
- *
- * Connections:
- * [undefined, undefined, 2]
- *
- * @param {Connector} target
- * @param {Packet} p
- * @private
- */
-INode.prototype._handleArrayPort = function(target, p) {
-
-  // start building the array.
-  if (target.has('index')) {
-
-    // Marked the port as being indexed
-    this.ports.input[target.port].indexed = true;
-
-    // we have an index.
-    // ok, one problem, with async, this.input
-    // is never really filled...
-    // look at that, will cause dangling data.
-    if (!this.input[target.port]) {
-      // becomes a new packet
-      this.input[target.port] = new Packet(
-        this,
-        [],
-        'array'
-      );
-    }
-
-    if (this.input[target.port].read(this)[target.get('index')] !== undefined) {
-      // input not available, it will be queued.
-      // (queue manager also stores [])
-      return Port.INDEX_NOT_AVAILABLE;
-    }
-    else {
-
-      this.event(':index', {
-        node: this.export(),
-        port: target.port,
-        index: target.get('index')
-      });
-      // merge chi
-      this.CHI.merge(this.input[target.port].chi, p.chi, false);
-      this.input[target.port].read(this)[target.get('index')] = p.read(this);
-      // drop packet..
-    }
-
-    // it should at least be our length
-    if (this._arrayPortIsFilled(target.port)) {
-
-      // packet writing, CHECK THIS.
-      // p.data = this.input[target.port]; // the array we've created.
-
-      // Unmark the port as being indexed
-      delete this.ports.input[target.port].indexed;
-
-      // ok, above all return true or false
-      // this one is either returning true or an error.
-      //return this._fillPort(target, p);
-      return this._fillPort(target, this.input[target.port]);
-
-    }
-    else {
-
-      // input length less than known connections length.
-      return Port.AWAITING_INDEX;
-    }
-
-  }
-  else {
-
-    throw Error(util.format(
-      '%s: `%s` value arriving at Array port `%s`, but no index[] is set',
-      this.identifier,
-      typeof p.data,
-      target.port
-    ));
-
-  }
-};
-
-/**
- *
- * Handles an Object port
- *
- * @param {String} port
- * @param {Object} data
- * @param {Object} chi
- * @param {Object} source
- * @private
- */
-// todo, the name of the variable should be target not source.
-// source is only handled during output.
-INode.prototype._handleObjectPort = function(target, p) {
-
-  // start building the array.
-  if (target.has('index')) {
-
-    // we have a key.
-
-    // Marked the port as being indexed
-    this.ports.input[target.port].indexed = true;
-
-    // Initialize empty object
-    if (!this.input[target.port]) {
-      this.input[target.port] = new Packet(
-        this,
-        {},
-        'object'
-      );
-    }
-
-    // input not available, it will be queued.
-    // (queue manager also stores [])
-    if (typeof this.input[target.port][target.get('index')] !== 'undefined') {
-      return false;
-    }
-    else {
-
-      this.event(':index', {
-        node: this.export(),
-        port: target.port,
-        index: target.get('index')
-      });
-
-      // define the key
-      this.CHI.merge(this.input[target.port].chi, p.chi, false);
-      this.input[target.port].read(this)[target.get('index')] = p.read(this);
-    }
-
-    // it should at least be our length
-    //
-    // Bug:
-    //
-    // This check is not executed when another port triggers
-    // execution. the input object is filled, so it will
-    // start anyway.
-    //
-    if (this._objectPortIsFilled(target.port)) {
-
-      // PACKET WRITING CHECK THIS.
-      // p.data = this.input[target.port];
-
-      // Unmark the port as being indexed
-      delete this.ports.input[target.port].indexed;
-
-      //return this._fillPort(target, p);
-      return this._fillPort(target, this.input[target.port]);
-
-    }
-    else {
-      // input length less than known connections length.
-      return Port.AWAITING_INDEX;
-    }
-
-  }
-  else {
-
-    throw Error(util.format(
-      '%s: `%s` value arriving at Object port `%s`, but no index[] is set',
-      this.identifier,
-      typeof p.data,
-      target.port
-    ));
-
-  }
-};
-
-/**
- *
- * @param {string} port
- * @private
- */
-INode.prototype._arrayPortIsFilled = function(port) {
-
-  // Not even initialized
-  //if (typeof this.input[port] === undefined) {
-  if (!this.input.hasOwnProperty(port)) {
-    return false;
-  }
-
-  if (this.input[port].read(this).length < this._connections[port].length) {
-    return false;
-  }
-
-  // Make sure we do not have undefined (unfulfilled ports)
-  // (Should not really happen)
-  for (var i = 0; i < this.input[port].read(this).length; i++) {
-    if (this.input[port].read(this)[i] === undefined) {
-      return false;
-    }
-  }
-
-  // Extra check for weird condition
-  if (this.input[port].read(this).length > this._connections[port].length) {
-
-    this.error(util.format(
-      '%s: Array length out-of-bounds for port',
-      this.identifier,
-      port
-    ));
-
-    return false;
-
-  }
-
-  return true;
-
-};
-
-/**
- *
- * @param {string} port
- * @private
- */
-INode.prototype._objectPortIsFilled = function(port) {
-
-  // Not even initialized
-  //if (typeof this.input[port] === undefined) {
-  if (!this.input.hasOwnProperty(port)) {
-    return false;
-  }
-
-  // Not all connections have provided input yet
-  if (Object.keys(this.input[port].read(this)).length <
-    this._connections[port].length) {
-    return false;
-  }
-
-  // Make sure we do not have undefined (unfulfilled ports)
-  // (Should not really happen)
-  for (var key in this.input[port]) {
-    //if (this.input[port][key] === undefined) {
-    if (this.input[port].read(this)[key] === undefined) {
-      return false;
-    }
-  }
-
-  // Extra check for weird condition
-  if (Object.keys(this.input[port].read(this)).length >
-    this._connections[port].length) {
-
-    this.error(util.format(
-      '%s: Object keys length out-of-bounds for port `%s`',
-      this.identifier,
-      port
-    ));
-
-    return false;
-
-  }
-
-  return true;
-
-};
-
-/**
- *
- * @param {string} port
- * @param {Mixed} data
- * @private
- */
-INode.prototype._validateInput = function(port, data) {
-
-  var type;
-
-  if (!this.ports.input.hasOwnProperty(port)) {
-
-    var msg = Error(util.format('no such port: **%s**', port));
-
-    return Error(msg);
-  }
-
-  type = this.getPortType(port);
-
-  if (!validate.data(type, data)) {
-
-    // TODO: emit these errors, with error constants
-    var real = Object.prototype.toString.call(data).match(/\s(\w+)/)[1];
-
-    if (data && typeof data === 'object' &&
-      data.constructor.name === 'Object') {
-      var tmp = Object.getPrototypeOf(data).constructor.name;
-
-      if (tmp) {
-        // not sure, sometimes there is no name?
-        // in witch case all you can do is type your name as being an 'object'
-        real = tmp;
+    /** @property {Array} outPorts */
+    Object.defineProperty(_this, 'outPorts', {
+      enumerable: true,
+      get: function get() {
+        return Object.keys(this.ports.output);
+      }
+    });
+    /*
+     Object.defineProperty(this, 'filled', {
+     enumerable: true,
+     configurable: false,
+     get: function() {
+     return Object.keys(this.input).length;
+     }
+     });
+     */
+
+    // Always add complete port, :start port will be added
+    // dynamicaly
+    _this.ports.output[':complete'] = {
+      name: ':complete',
+      type: 'any'
+    };
+
+    var key;
+    // TODO: should just be proper port objects.
+    for (key in _this.ports.input) {
+      if (_this.ports.input.hasOwnProperty(key)) {
+        _this.ports.input[key].fills = 0;
+        _this.ports.input[key].runCount = 0;
+        _this.ports.input[key].rejects = 0;
+        // auto detect async
+        if (_this.ports.input[key].fn) {
+          _this.async = true;
+        }
       }
     }
 
-    return Error(util.format(
-      'Expected `%s` got `%s` on port `%s`',
-      type, real, port));
+    for (key in _this.ports.output) {
+      if (_this.ports.output.hasOwnProperty(key)) {
+        _this.ports.output[key].fills = 0;
+      }
+    }
+    return _this;
   }
 
   /**
-   * Input Validated Event.
    *
-   * Occurs when a port was succesfully validated
+   * Create a Node
    *
-   * @event INode#inputValidated
-   * @type {object}
-   * @property {object} node - An export of this node
-   * @property {string} port - Name of the port
+   * @public
    */
-  this.event(':inputValidated', {
-    node: this.export(),
-    port: port
-  });
 
-  return true;
-};
+  _createClass(BaseNode, [{
+    key: 'getPid',
+    value: function getPid() {
+      return this.pid;
+    }
 
-INode.prototype.sendPortOutput = function(port, output, chi) {
+    /**
+     *
+     * @param {type} pid
+     * @public
+     */
 
-  if (!chi) {
-    chi = {};
-  }
+  }, {
+    key: 'setPid',
+    value: function setPid(pid) {
+      this.pid = pid;
+    }
 
-  this.CHI.merge(chi, this.chi, false);
+    /**
+     *
+     * Set Title
+     *
+     * Used to set the title of a node *within* a graph.
+     * This property overwrites the setting of the node definition
+     * and is returned during toJSON()
+     *
+     * @param {string} title
+     * @public
+     */
 
-  if (output === undefined) {
-    throw Error(
-      util.format(
-        '%s: Undefined output is not allowed `%s`', this.identifier, port
-      )
-    );
-  }
+  }, {
+    key: 'setTitle',
+    value: function setTitle(title) {
+      this.title = title;
+    }
 
-  if (port === 'error' && output === null) {
+    /**
+     *
+     * Set Description
+     *
+     * Used to set the description of a node *within* a graph.
+     * This property overwrites the setting of the node definition
+     * and is returned during toJSON()
+     *
+     * @param {string} description
+     * @public
+     */
 
-    // allow nodes to send null error, but don't trigger it as output.
+  }, {
+    key: 'setDescription',
+    value: function setDescription(description) {
+      this.description = description;
+    }
 
-  }
-  else {
+    /**
+     *
+     * Set metadata
+     *
+     * Currently:
+     *
+     *   x: x position hint for display
+     *   y: y position hint for display
+     *
+     * These values are returned during toJSON()
+     *
+     * @param {object} metadata
+     * @public
+     */
 
-    if (this.ports.output.hasOwnProperty(port) ||
-      INode.events.indexOf(port) !== -1 // system events
-    ) {
-
-      if (this.ports.output.hasOwnProperty(port)) {
-        this.ports.output[port].fills++;
-        this.outputCount++;
+  }, {
+    key: 'setMetadata',
+    value: function setMetadata(metadata) {
+      for (var k in metadata) {
+        if (metadata.hasOwnProperty(k)) {
+          this.setMeta(k, metadata[k]);
+        }
       }
+    }
 
-      var p = this.wrapPacket(port, output);
-      p.set('chi', chi);
+    /**
+     *
+     * @param {string} key
+     * @param {any} value
+     */
 
-      // loose the ownership
-      p.release(this);
+  }, {
+    key: 'setMeta',
+    value: function setMeta(key, value) {
+      this.metadata[key] = value;
+    }
 
-      debug('%s:%s output', this.identifier, port);
+    /**
+     *
+     * Set node status.
+     *
+     * This is unused at the moment.
+     *
+     * Should probably contain states like:
+     *
+     *  - Hold
+     *  - Complete
+     *  - Ready
+     *  - Error
+     *  - Timeout
+     *  - etc.
+     *
+     * Maybe something like Idle could also be implemented.
+     * This would probably only make sense if there are persistent ports
+     * which hold a reference to an instance upon which we can call methods.
+     *
+     * Such an `idle` state would indicate the node is ready to accept new
+     * input.
+     *
+     * @param {String} status
+     * @private
+     */
 
-      this.emit('output', {
+  }, {
+    key: 'setStatus',
+    value: function setStatus(status) {
+      this.status = status;
+
+      /**
+       * Status Update Event.
+       *
+       * Fired multiple times on output
+       *
+       * Once for every output port.
+       *
+       * @event BaseNode#statusUpdate
+       * @type {object}
+       * @property {object} node - An export of this node
+       * @property {string} status - The status
+       */
+      this.event(':statusUpdate', {
         node: this.export(),
-        port: port,
-        out: p
+        status: this.status
       });
-
-    }
-    else {
-      throw Error(this.identifier + ': no such output port ' + port);
     }
 
-  }
+    /**
+     *
+     * Fills the port.
+     *
+     * Does the same as fillPort, however it also checks:
+     *
+     *   - port availability
+     *   - port settings
+     *
+     * FIXME: fill & fillPort can just be merged probably.
+     *
+     * @param {Object} target
+     * @public
+     */
 
-};
+  }, {
+    key: 'handleLinkSettings',
+    value: function handleLinkSettings(target) {
+      // FIX: hold is not handled anywhere as setting anymore
+      if (target.has('hold')) {
+        this.hold();
+      } else if (target.has('persist')) {
+        // FIX ME: has become a weird construction now
+        //
+        // THIS IS NOW BROKEN, on purpose.. :-)
+        var index = target.get('index');
 
-/**
- *
- * Validate a single value
- *
- * TODO: Object (and function) validation could be expanded
- * to match an expected object structure, this information
- * is already available.
- *
- * @param {String} type
- * @param {Object} data
- * @private
- */
-
-/**
- *
- * Does both send events through output ports
- * and emits them.
- *
- * Not sure whether sending the chi is really necessary..
- *
- * @param {string} eventName
- * @param {Packet} p
- * @protected
- */
-INode.prototype.event = function(eventName, p) {
-
-  // event ports are prefixed with `:`
-  this.sendPortOutput(eventName, p);
-
-};
-
-/**
- *
- * Could be used to externally set a node into error state
- *
- * INode.error(node, Error('you are bad');
- *
- * @param {Error} err
- * @returns {Error}
- */
-INode.prototype.error = function(err) {
-
-  var error = util.isError(err) ? err : Error(err);
-
-  // Update our own status
-  this.setStatus('error');
-
-  // TODO: better to have full (custom) error objects
-  var eobj = {
-    //node: node.export(),
-    node: this, // do not export so soon.
-    msg: err
-  };
-
-  // Used for in graph sending
-  this.event(':error', eobj);
-
-  // Used by Process Manager or whoever handles the node
-  this.emit('error', eobj);
-
-  return error;
-};
-
-/**
- *
- * Add context.
- *
- * Must be set in one go.
- *
- * @param {Object} context
- * @public
- */
-INode.prototype.addContext = function(context) {
-  var port;
-  for (port in context) {
-    if (context.hasOwnProperty(port)) {
-      this.setContextProperty(port, context[port]);
-    }
-  }
-};
-
-/**
- *
- * Do a lightweight export of this node.
- *
- * Used in emit's to give node information
- *
- *
- * @return {Object}
- * @public
- */
-INode.prototype.export = function() {
-
-  return {
-
-    id: this.id,
-    ns: this.ns,
-    name: this.name,
-    title: this.title,
-    pid: this.pid,
-    identifier: this.identifier,
-    ports: this.ports,
-    cycles: this.cycles,
-    inPorts: this.inPorts,
-    outPorts: this.outPorts,
-    filled: this.filled,
-    context: this.context,
-    require: this.require,
-    status: this.status,
-    runCount: this.runCount,
-    expose: this.expose,
-    active: this.active,
-    metadata: this.metadata,
-    provider: this.provider,
-    input: this._filteredInput(),
-    openPorts: this.openPorts,
-    nodeTimeout: this.nodeTimeout,
-    inputTimeout: this.inputTimeout
-  };
-
-};
-
-/**
- *
- * Set context to a port.
- *
- * Can be changed during runtime, but will never trigger
- * a start.
- *
- * Adding the whole context in one go could trigger a start.
- *
- * Packet wise thise content is anonymous.
- *
- * @param {String} port
- * @param {Mixed} data
- * @fires INode#contextUpdate
- * @private
- */
-INode.prototype.setContextProperty = function(port, data) {
-
-  if (port === ':start') {
-    this.initStartPort();
-  }
-
-  if (this.portExists('input', port)) {
-
-    var res = this._validateInput(port, data);
-
-    if (util.isError(res)) {
-
-      this.event(':error', {
-        node: this.export(),
-        msg: Error('setContextProperty: ' + res.message)
-      });
-
-    }
-    else {
-
-      data = this._handleFunctionType(port, data);
-
-      this.$setContextProperty(port, data);
-
-      this.event(':contextUpdate', {
-        node: this,
-        port: port,
-        data: data
-      });
-
-    }
-
-  }
-  else {
-
-    throw Error('No such input port: ' + port);
-
-  }
-};
-
-INode.prototype.setContext = INode.prototype.setContextProperty;
-
-/**
- *
- * Filters the input for export.
- *
- * Leaving out everything defined as a function
- *
- * Note: depends on the stage of emit whether this value contains anything
- *
- * @return {Object} Filtered Input
- * @private
- */
-INode.prototype._filteredInput = function() {
-  var port;
-  var type;
-  var input = {};
-
-  for (port in this.input) {
-    if (this.portExists('input', port)) {
-      type = this.ports.input[port].type;
-
-      if (type === 'string' ||
-        type === 'number' ||
-        type === 'enum' ||
-        type === 'boolean') {
-        input[port] = this.input[port];
+        // specialized case, make this more clear.
+        // persist can be a boolean, or it becomes an array of
+        // indexes to persist.
+        if (index) {
+          if (!Array.isArray(this.ports.input[target.port].persist)) {
+            this.ports.input[target.port].persist = [];
+          }
+          this.ports.input[target.port].persist.push(index);
+        } else {
+          this.ports.input[target.port].persist = true;
+        }
       }
-      else {
-        // can't think of anything better right now
-        input[port] = Object.prototype.toString.call(this.input[port]);
+    }
+
+    /**
+     *
+     * Checks whether the input port is available
+     *
+     * @param {Connector}  target
+     * @public
+     */
+
+  }, {
+    key: 'inputPortAvailable',
+    value: function inputPortAvailable(target) {
+      if (target.has('index')) {
+        if (this.ports.input[target.port].type !== 'array' && this.ports.input[target.port].type !== 'object') {
+
+          return Error([this.identifier, 'Unexpected Index[] information on non array port:', target.port].join(' '));
+        }
+
+        // not defined yet
+        if (!this.input.hasOwnProperty(target.port)) {
+          return Port.AVAILABLE;
+        }
+
+        // only available if [] is not already filled.
+        if (this.input[target.port].read(this)[target.get('index')] !== undefined) {
+          return Port.INDEX_NOT_AVAILABLE;
+        }
+
+        if (this.input.length === this._connections[target.port].length) {
+          return Port.ARRAY_PORT_FULL;
+        }
+
+        return Port.INDEX_AVAILABLE;
       }
 
-    }
-    else {
-
-      // faulty but used during export so we want to know
-      input[port] = this.input[port];
-
-    }
-  }
-
-  return input;
-};
-
-// TODO: these port function only make sense for a graph
-//       or a dynamic node.
-
-INode.prototype.addPort = function(type, port, def) {
-  if (!this.portExists(type, port)) {
-    this.ports[type][port] = def;
-    return true;
-  }
-  else {
-    return Error('Port already exists');
-  }
-};
-
-INode.prototype.removePort = function(type, port) {
-  if (this.portExists(type, port)) {
-    delete this.ports[type][port];
-    if (type === 'input') {
-      this.clearInput(port);
-      this.clearContextProperty(port);
-      return true;
-    }
-  }
-  else {
-    //return Error(this, 'No such port');
-    return Error('No such port');
-  }
-};
-
-INode.prototype.renamePort = function(type, from, to) {
-  if (this.portExists(type, from)) {
-    this.ports[type][to] = this.ports[type][from];
-    delete this.ports[type][from];
-    return true;
-  }
-  else {
-    //return Error(this, 'No such port');
-    return Error('No such port');
-  }
-};
-
-INode.prototype.getPort = function(type, name) {
-  if (this.ports.hasOwnProperty(type) &&
-    this.ports[type].hasOwnProperty(name)) {
-    return this.ports[type][name];
-  }
-  else {
-    throw new Error('Port `' + name + '` does not exist');
-  }
-};
-
-INode.prototype.getPortOption = function(type, name, opt) {
-  var port = this.getPort(type, name);
-  if (port.hasOwnProperty(opt)) {
-    return port[opt];
-  }
-  else {
-    return undefined;
-  }
-};
-
-INode.prototype.portExists = function(type, port) {
-  return (this.ports[type] && this.ports[type].hasOwnProperty(port)) ||
-    (type === 'output' && INode.events.indexOf(port) >= 0);
-};
-
-/**
- *
- *
- * @param {String} port
- * @public
- */
-INode.prototype.openPort = function(port) {
-
-  if (this.portExists('input', port)) {
-
-    if (this.openPorts.indexOf(port) === -1) {
-
-      this.openPorts.push(port);
-
-      this.event(':openPort', {
-        node: this.export(),
-        port: port,
-        connections: this._connections.hasOwnProperty(port) ?
-          this._connections[port].length : // enough info for now
-          0 // set by context
-      });
-
+      var ret = this.$portIsFilled(target.port) ? Port.UNAVAILABLE : Port.AVAILABLE;
+      return ret;
     }
 
-    // opening twice is allowed.
-    return true;
+    /**
+     *
+     * @param {Connector} target
+     * @returns {Boolean}
+     * @public
+     */
 
-  }
-  else {
-
-    // TODO: make these error codes, used many times, etc.
-    return Error(util.format('no such port: **%s**', port));
-
-  }
-
-};
-
-/**
- *
- * @param {string} port
- * @returns {Boolean}
- */
-INode.prototype.closePort = function(port) {
-
-  if (this.portExists('input', port)) {
-
-    this.openPorts.splice(this.openPorts.indexOf(port), 1);
-
-    this.event(':closePort', {
-      node: this.export(),
-      port: port
-    });
-
-    return true;
-
-  }
-  else {
-
-    // TODO: make these error codes, used many times, etc.
-    //return Error(this, util.format('no such port: **%s**', port));
-    return Error(util.format('no such port: **%s**', port));
-
-  }
-
-};
-
-/**
- * Whether a port is currently opened
- *
- * @param {String} port
- * @return {Boolean}
- * @private
- */
-INode.prototype.portIsOpen = function(port) {
-  return this.openPorts.indexOf(port) >= 0;
-};
-
-/**
- *
- * Checks whether the input port is available
- *
- * @param {Connector}  target
- * @public
- */
-INode.prototype.inputPortAvailable = function(target) {
-
-  if (target.has('index')) {
-
-    if (this.ports.input[target.port].type !== 'array' &&
-      this.ports.input[target.port].type !== 'object') {
-
-      return Error([
-        this.identifier,
-        'Unexpected Index[] information on non array port:',
-        target.port
-      ].join(' '));
-    }
-
-    // not defined yet
-    if (!this.input.hasOwnProperty(target.port)) {
-      return Port.AVAILABLE;
-    }
-
-    // only available if [] is not already filled.
-    if (this.input[target.port].read(this)[target.get('index')] !== undefined) {
-      return Port.INDEX_NOT_AVAILABLE;
-    }
-
-    if (this.input.length === this._connections[target.port].length) {
-      return Port.ARRAY_PORT_FULL;
-    }
-
-    return Port.INDEX_AVAILABLE;
-
-  }
-
-  var ret = !this.$portIsFilled(target.port) ?
-    Port.AVAILABLE : Port.UNAVAILABLE;
-  return ret;
-
-};
-
-/**
- *
- * @param {Connector} target
- * @returns {Boolean}
- * @public
- */
-INode.prototype.plug = function(target) {
-
-  if (target.port === ':start') {
-    this._initStartPort();
-  }
-
-  if (this.portExists('input', target.port)) {
-
-    if (!this._connections[target.port]) {
-      this._connections[target.port] = [];
-    }
-
-    // direct node fill does not have it.
-    if (target.wire) {
-      this._connections[target.port].push(target.wire);
-    }
-
-    this.event(':plug', {
-      node: this.export(),
-      port: target.port,
-      connections: this._connections[target.port].length
-    });
-
-    this.openPort(target.port);
-
-    return true;
-
-  }
-  else {
-
-    // problem of whoever tries to attach
-    return Error(util.format(
-      'Process `%s` has no input port named `%s`\n\n\t' +
-      'Input ports available: %s\n\n\t',
-      this.identifier,
-      target.port,
-      this._portsAvailable()
-    ));
-
-  }
-
-};
-
-INode.prototype._portsAvailable = function() {
-  var ports = [];
-  var self = this;
-  Object.keys(this.ports.input).forEach(function(port) {
-    if (
-      (!self.ports.input[port].hasOwnProperty('required') ||
-        self.ports.input[port].required === true) &&
-      !self.ports.input[port].hasOwnProperty('default')) {
-      ports.push(port + '*');
-    }
-    else {
-      ports.push(port);
-    }
-  });
-  return ports.join(', ');
-};
-
-/**
- *
- * Determine whether this node has any connections
- *
- * FIX this.
- *
- * @return {Boolean}
- * @public
- */
-INode.prototype.hasConnections = function() {
-  //return this.openPorts.length;
-  var port;
-  for (port in this._connections) {
-    if (this._connections[port] &&
-      this._connections[port].length) {
-      return true;
-    }
-  }
-
-  return false;
-};
-
-/**
- *
- * Unplugs a connection from a port
- *
- * Will decrease the amount of connections to a port.
- *
- * TODO: make sure we remove the exact target
- *       right now it just uses pop()
- *
- * @param {Connector} target
- * @public
- */
-INode.prototype.unplug = function(target) {
-
-  if (this.portExists('input', target.port)) {
-
-    // direct node fill does not have it
-    if (target.wire) {
-
-      if (!this._connections[target.port] ||
-        !this._connections[target.port].length) {
-        return this.error('No such connection');
+  }, {
+    key: 'plug',
+    value: function plug(target) {
+      if (target.port === ':start') {
+        this._initStartPort();
       }
 
-      var pos = this._connections[target.port].indexOf(target.wire);
-      if (pos === -1) {
-        // problem of whoever tries to unplug it
-        //return Error(this, 'Link is not connected to this port');
-        return Error('Link is not connected to this port');
+      if (this.portExists('input', target.port)) {
+        if (!this._connections[target.port]) {
+          this._connections[target.port] = [];
+        }
+
+        // direct node fill does not have it.
+        if (target.wire) {
+          this._connections[target.port].push(target.wire);
+        }
+
+        this.event(':plug', {
+          node: this.export(),
+          port: target.port,
+          connections: this._connections[target.port].length
+        });
+
+        this.openPort(target.port);
+
+        return true;
+      } else {
+        // problem of whoever tries to attach
+        return Error(util.format('Process `%s` has no input port named `%s`\n\n\t' + 'Input ports available: %s\n\n\t', this.identifier, target.port, this._portsAvailable()));
+      }
+    }
+
+    /**
+     *
+     * Unplugs a connection from a port
+     *
+     * Will decrease the amount of connections to a port.
+     *
+     * TODO: make sure we remove the exact target
+     *       right now it just uses pop()
+     *
+     * @param {Connector} target
+     * @public
+     */
+
+  }, {
+    key: 'unplug',
+    value: function unplug(target) {
+      if (this.portExists('input', target.port)) {
+        // direct node fill does not have it
+        if (target.wire) {
+          if (!this._connections[target.port] || !this._connections[target.port].length) {
+            return this.error('No such connection');
+          }
+
+          var pos = this._connections[target.port].indexOf(target.wire);
+          if (pos === -1) {
+            // problem of whoever tries to unplug it
+            //return Error(this, 'Link is not connected to this port');
+            return Error('Link is not connected to this port');
+          }
+
+          this._connections[target.port].splice(pos, 1);
+        }
+
+        this.event(':unplug', {
+          node: this.export(),
+          port: target.port,
+          connections: this._connections[target.port].length
+        });
+
+        // ok port should only be closed if there are no connections to it
+        if (!this.portHasConnections(target.port)) {
+          this.closePort(target.port);
+        }
+
+        // if this is the :start port also remove it from inports
+        // this port is re-added next time during open port
+        // TODO: figure out what happens with multiple connections
+        // to a :start port because that's also possible,
+        // when true connections are made to it,
+        // not iip onces,
+        if (target.port === ':start' && target.wire.source.port === ':iip' && // start always has a wire.
+        this._connections[target.port].length === 0) {
+          this.removePort('input', ':start');
+        }
+
+        return true;
+      } else if (target.port !== ':start') {
+        // :start is dynamic, maybe the throw below is no necessary at all
+        // no harm in unplugging something non-existent
+        // problem of whoever tries to unplug
+        return Error(util.format('Process `%s` has no input port named `%s`\n\n\t' + 'Input ports available: \n\n\t%s', this.identifier, target.port, this._portsAvailable()));
+      }
+    }
+  }, {
+    key: 'sendPortOutput',
+    value: function sendPortOutput(port, output, chi) {
+      if (!chi) {
+        chi = {};
       }
 
-      this._connections[target.port].splice(pos, 1);
+      this.CHI.merge(chi, this.chi, false);
+
+      if (output === undefined) {
+        throw Error(util.format('%s: Undefined output is not allowed `%s`', this.identifier, port));
+      }
+
+      if (port === 'error' && output === null) {
+        // allow nodes to send null error, but don't trigger it as output.
+        return;
+      }
+
+      if (this.ports.output.hasOwnProperty(port) || BaseNode.events.indexOf(port) !== -1 // system events
+      ) {
+          if (this.ports.output.hasOwnProperty(port)) {
+            this.ports.output[port].fills++;
+            this.outputCount++;
+          }
+
+          var p = this.wrapPacket(port, output);
+          p.set('chi', chi);
+
+          // loose the ownership
+          p.release(this);
+
+          debug('%s:%s output', this.identifier, port);
+
+          this.emit('output', {
+            node: this.export(),
+            port: port,
+            out: p
+          });
+        } else {
+        throw Error(this.identifier + ': no such output port ' + port);
+      }
+    }
+  }, {
+    key: 'start',
+    value: function start() {
+      throw Error('Node needs to implement start() method');
     }
 
-    this.event(':unplug', {
-      node: this.export(),
-      port: target.port,
-      connections: this._connections[target.port].length
-    });
+    /**
+     *
+     * Validate a single value
+     *
+     * TODO: Object (and function) validation could be expanded
+     * to match an expected object structure, this information
+     * is already available.
+     *
+     * @param {String} type
+     * @param {Object} data
+     * @private
+     */
 
-    // ok port should only be closed if there are no connections to it
-    if (!this.portHasConnections(target.port)) {
-      this.closePort(target.port);
+    /**
+     *
+     * Does both send events through output ports
+     * and emits them.
+     *
+     * Not sure whether sending the chi is really necessary..
+     *
+     * @param {string} eventName
+     * @param {Packet} p
+     * @protected
+     */
+
+  }, {
+    key: 'event',
+    value: function event(eventName, p) {
+      // event ports are prefixed with `:`
+      this.sendPortOutput(eventName, p);
     }
 
-    // if this is the :start port also remove it from inports
-    // this port is re-added next time during open port
-    // TODO: figure out what happens with multiple connections to a :start port
-    // because that's also possible, when true connections are made to it,
-    // not iip onces,
-    if (target.port === ':start' &&
-      target.wire.source.port === ':iip' && // start always has a wire.
-      this._connections[target.port].length === 0) {
-      this.removePort('input', ':start');
+    /**
+     *
+     * Could be used to externally set a node into error state
+     *
+     * BaseNode.error(node, Error('you are bad');
+     *
+     * @param {Error} err
+     * @returns {Error}
+     */
+
+  }, {
+    key: 'error',
+    value: function error(err) {
+      var error = util.isError(err) ? err : Error(err);
+
+      // Update our own status
+      this.setStatus('error');
+
+      // TODO: better to have full (custom) error objects
+      var eobj = {
+        //node: node.export(),
+        node: this, // do not export so soon.
+        msg: err
+      };
+
+      // Used for in graph sending
+      this.event(':error', eobj);
+
+      // Used by Process Manager or whoever handles the node
+      this.emit('error', eobj);
+
+      return error;
     }
 
-    return true;
+    /**
+     *
+     * Add context.
+     *
+     * Must be set in one go.
+     *
+     * @param {Object} context
+     * @public
+     */
 
-  }
-  else {
-
-    // :start is dynamic, maybe the throw below is no necessary at all
-    // no harm in unplugging something non-existent
-    if (target.port !== ':start') {
-
-      // problem of whoever tries to unplug
-      return Error(util.format(
-        'Process `%s` has no input port named `%s`\n\n\t' +
-        'Input ports available: \n\n\t%s',
-        this.identifier,
-        target.port,
-        this._portsAvailable()
-      ));
-
+  }, {
+    key: 'addContext',
+    value: function addContext(context) {
+      var port;
+      for (port in context) {
+        if (context.hasOwnProperty(port)) {
+          this.setContextProperty(port, context[port]);
+        }
+      }
     }
 
-  }
+    /**
+     *
+     * Set context to a port.
+     *
+     * Can be changed during runtime, but will never trigger
+     * a start.
+     *
+     * Adding the whole context in one go could trigger a start.
+     *
+     * Packet wise thise content is anonymous.
+     *
+     * @param {String} port
+     * @param {Mixed} data
+     * @emits BaseNode#contextUpdate
+     * @private
+     */
 
-};
+  }, {
+    key: 'setContextProperty',
+    value: function setContextProperty(port, data) {
+      if (port === ':start') {
+        this._initStartPort();
+      }
 
-INode.prototype.start = function() {
-  throw Error('INode needs to implement start()');
-};
+      if (this.portExists('input', port)) {
+        var res = this._validateInput(port, data);
 
-/**
- *
- * Sets an input port option.
- *
- * The node schema for instance can specifiy whether a port is persistent.
- *
- * At the moment a connection can override these values.
- * It's a way of saying I give you this once so take care of it.
- *
- * @param {string} type
- * @param {string} name
- * @param {string} opt
- * @param {any} value
- * @returns {undefined}
- */
-INode.prototype.setPortOption = function(type, name, opt, value) {
-  var port = this.getPort(type, name);
-  port[opt] = value;
-};
+        if (util.isError(res)) {
+          this.event(':error', {
+            node: this.export(),
+            msg: Error('setContextProperty: ' + res.message)
+          });
+        } else {
+          data = this._handleFunctionType(port, data);
 
-INode.prototype.setPortOptions = function(type, options) {
-  var opt;
-  var port;
-  for (port in options) {
-    if (options.hasOwnProperty(port)) {
-      for (opt in options[port]) {
-        if (options[port].hasOwnProperty(opt)) {
-          if (options.hasOwnProperty(opt)) {
-            this.setPortOption(type, port, opt, options[opt]);
+          this.$setContextProperty(port, data);
+
+          this.event(':contextUpdate', {
+            node: this,
+            port: port,
+            data: data
+          });
+        }
+      } else {
+        throw Error('No such input port: ' + port);
+      }
+    }
+
+    /**
+     *
+     * Wires a source port to one of our ports
+     *
+     * target is the target object of the connection.
+     * which consist of a source and target object.
+     *
+     * So in this calink.se the target is _our_ port.
+     *
+     * If a connection is made to the virtual `:start` port
+     * it will be created automatically if it does not exist already.
+     *
+     * The port will be set to the open state and the connection
+     * will be registered.
+     *
+     * A port can have multiple connections.
+     *
+     * TODO: the idea was to also keep track of
+     *       what sources are connected.
+     *
+     * @private
+     */
+
+  }, {
+    key: '_initStartPort',
+    value: function _initStartPort() {
+      // add it to known ports
+      if (!this.portExists('input', ':start')) {
+        debug('%s:%s initialized', this.identifier, ':start');
+        this.addPort('input', ':start', {
+          type: 'any',
+          name: ':start',
+          rejects: 0,
+          fills: 0,
+          runCount: 0
+        });
+      }
+    }
+
+    // TODO: these port function only make sense for a graph
+    //       or a dynamic node.
+
+  }, {
+    key: 'addPort',
+    value: function addPort(type, port, def) {
+      if (this.portExists(type, port)) {
+        return Error('Port already exists');
+      } else {
+        this.ports[type][port] = def;
+        return true;
+      }
+    }
+  }, {
+    key: 'removePort',
+    value: function removePort(type, port) {
+      if (this.portExists(type, port)) {
+        delete this.ports[type][port];
+        if (type === 'input') {
+          this.clearInput(port);
+          this.clearContextProperty(port);
+          return true;
+        }
+      } else {
+        //return Error(this, 'No such port');
+        return Error('No such port');
+      }
+    }
+  }, {
+    key: 'renamePort',
+    value: function renamePort(type, from, to) {
+      if (this.portExists(type, from)) {
+        this.ports[type][to] = this.ports[type][from];
+        delete this.ports[type][from];
+        return true;
+      } else {
+        //return Error(this, 'No such port');
+        return Error('No such port');
+      }
+    }
+  }, {
+    key: 'getPort',
+    value: function getPort(type, name) {
+      if (this.ports.hasOwnProperty(type) && this.ports[type].hasOwnProperty(name)) {
+        return this.ports[type][name];
+      } else {
+        throw new Error('Port `' + name + '` does not exist');
+      }
+    }
+  }, {
+    key: 'getInputPort',
+    value: function getInputPort(name) {
+      return this.getPort('input', name);
+    }
+  }, {
+    key: 'getOutputPort',
+    value: function getOutputPort(name) {
+      return this.getPort('output', name);
+    }
+  }, {
+    key: 'getPortOption',
+    value: function getPortOption(type, name, opt) {
+      var port = this.getPort(type, name);
+      if (port.hasOwnProperty(opt)) {
+        return port[opt];
+      } else {
+        return undefined;
+      }
+    }
+  }, {
+    key: 'portExists',
+    value: function portExists(type, port) {
+      return this.ports[type] && this.ports[type].hasOwnProperty(port) || type === 'output' && BaseNode.events.indexOf(port) >= 0;
+    }
+
+    /**
+     *
+     *
+     * @param {String} port
+     * @public
+     */
+
+  }, {
+    key: 'openPort',
+    value: function openPort(port) {
+      if (this.portExists('input', port)) {
+        if (this.openPorts.indexOf(port) === -1) {
+          this.openPorts.push(port);
+
+          this.event(':openPort', {
+            node: this.export(),
+            port: port,
+            connections: this._connections.hasOwnProperty(port) ? this._connections[port].length : // enough info for now
+            0 // set by context
+          });
+        }
+
+        // opening twice is allowed.
+        return true;
+      } else {
+        // TODO: make these error codes, used many times, etc.
+        return Error(util.format('no such port: **%s**', port));
+      }
+    }
+
+    // Array format is used to get nested property type
+
+  }, {
+    key: 'getPortType',
+    value: function getPortType(kind, port) {
+      var i;
+      var obj;
+      var type;
+      if (Array.isArray(port)) {
+        obj = this.ports[kind];
+        for (i = 0; i < port.length; i++) {
+          if (i === 0) {
+            obj = obj[port[i]];
+          } else {
+            obj = obj.properties[port[i]];
+          }
+        }
+        type = obj.type;
+      } else {
+        if (this.ports[kind].hasOwnProperty(port)) {
+          type = this.ports[kind][port].type;
+        } else {
+          // same as...
+          return Error('No such input port: ' + port);
+        }
+      }
+      if (type) {
+        return type;
+      } else {
+        throw Error('Unable to determine type for ' + port);
+      }
+    }
+
+    /**
+     *
+     * @param {string} port
+     * @returns {Boolean}
+     */
+
+  }, {
+    key: 'closePort',
+    value: function closePort(port) {
+      if (this.portExists('input', port)) {
+
+        this.openPorts.splice(this.openPorts.indexOf(port), 1);
+
+        this.event(':closePort', {
+          node: this.export(),
+          port: port
+        });
+
+        return true;
+      } else {
+        // TODO: make these error codes, used many times, etc.
+        //return Error(this, util.format('no such port: **%s**', port));
+        return Error(util.format('no such port: **%s**', port));
+      }
+    }
+
+    /**
+     * Whether a port is currently opened
+     *
+     * @param {String} port
+     * @return {Boolean}
+     * @private
+     */
+
+  }, {
+    key: 'portIsOpen',
+    value: function portIsOpen(port) {
+      return this.openPorts.indexOf(port) >= 0;
+    }
+
+    /**
+     *
+     * Sets an input port option.
+     *
+     * The node schema for instance can specifiy whether a port is persistent.
+     *
+     * At the moment a connection can override these values.
+     * It's a way of saying I give you this once so take care of it.
+     *
+     * @param {string} type
+     * @param {string} name
+     * @param {string} opt
+     * @param {any} value
+     * @returns {undefined}
+     */
+
+  }, {
+    key: 'setPortOption',
+    value: function setPortOption(type, name, opt, value) {
+      var port = this.getPort(type, name);
+      port[opt] = value;
+    }
+  }, {
+    key: 'setPortOptions',
+    value: function setPortOptions(type, options) {
+      var opt;
+      var port;
+      for (port in options) {
+        if (options.hasOwnProperty(port)) {
+          for (opt in options[port]) {
+            if (options[port].hasOwnProperty(opt)) {
+              if (options.hasOwnProperty(opt)) {
+                this.setPortOption(type, port, opt, options[opt]);
+              }
+            }
           }
         }
       }
     }
-  }
-};
 
-// Connection Stuff, should be in the Port object
-INode.prototype.portHasConnection = function(port, link) {
-  return this._connections[port] && this._connections[port].indexOf(link) >= 0;
-};
-INode.prototype.portHasConnections = function(port) {
-  return !!(this._connections[port] && this._connections[port].length > 0);
-};
+    /**
+     *
+     * Determine whether this node has any connections
+     *
+     * FIX this.
+     *
+     * @return {Boolean}
+     * @public
+     */
 
-INode.prototype.portGetConnections = function(port) {
-  return this._connections[port] || [];
-};
+  }, {
+    key: 'hasConnections',
+    value: function hasConnections() {
+      //return this.openPorts.length;
+      var port;
+      for (port in this._connections) {
+        if (this._connections[port] && this._connections[port].length) {
+          return true;
+        }
+      }
 
-INode.prototype.getConnections = function() {
-  return this._connections;
-};
-
-INode.prototype.determineOutputType = function(port, output, origType) {
-  var type;
-  // preferably should be used and set, maybe enforce this.
-  if (this.ports.output[port].type) {
-    return this.ports.output[port].type;
-  }
-
-  type = typeof output;
-
-  if (type !== 'object') {
-    return type;
-  }
-
-  // do not modify type, keep packet type as is
-  return origType;
-
-};
-
-// TODO: many checks only have to be determined one time.
-INode.prototype.pickPacket = function(port) {
-  if (this.input.hasOwnProperty(port)) {
-    return this.input[port];
-  } else if (this.transit.hasOwnProperty(port)) {
-    // clone
-    var c = this.transit[port].clone(this);
-    c.c--; // adjust
-    return c;
-  } else {
-    return new Packet(this, null, this.ports.input[port].type);
-    //throw Error('Unable to determine source packet');
-  }
-};
-
-INode.prototype.wrapPacket = function(port, output)  {
-  var p;
-
-  if (port[0] === ':') {
-    return new Packet(
-      this,
-      output,
-      'string'
-    );
-  }
-
-  // check 1:1 (:start && :complete) are ignored
-  var ins = Object.keys(this.ports.input).filter(function(a) {
-    return a[0] !== ':';
-  });
-  var outs = Object.keys(this.ports.output).filter(function(a) {
-    return a[0] !== ':';
-  });
-
-  if (outs.length === 1 && ins.length === 1) {
-    // assume we are doing the same packet.
-    p = this.pickPacket(ins[0]);
-    if (p) {
-      p.write(
-        this,
-        output,
-        this.determineOutputType(
-          port,
-          output,
-          p.type
-        )
-      );
-
-      this.freePort(ins[0]);
-
-    } else {
-      throw Error(
-        util.format(
-          '%s: Cannot determine packet for port `%s`, `%s` is empty',
-          this.identifier,
-          port,
-          ins[0]
-        )
-      );
+      return false;
     }
-  } else if (port === 'out') {
-    if (this.ports.input.hasOwnProperty('in')) {
-      p = this.pickPacket('in');
-      if (p) {
-        p.write(
-          this,
-          output,
-          this.determineOutputType(
-            port,
-            output,
-            p.type
-          )
-        );
-        this.freePort('in');
+
+    // Connection Stuff, should be in the Port object
+
+  }, {
+    key: 'portHasConnection',
+    value: function portHasConnection(port, link) {
+      return this._connections[port] && this._connections[port].indexOf(link) >= 0;
+    }
+  }, {
+    key: 'portHasConnections',
+    value: function portHasConnections(port) {
+      return Boolean(this._connections[port] && this._connections[port].length > 0);
+    }
+  }, {
+    key: 'portGetConnections',
+    value: function portGetConnections(port) {
+      return this._connections[port] || [];
+    }
+  }, {
+    key: 'getConnections',
+    value: function getConnections() {
+      return this._connections;
+    }
+  }, {
+    key: 'determineOutputType',
+    value: function determineOutputType(port, output, origType) {
+      var type;
+      // preferably should be used and set, maybe enforce this.
+      if (this.ports.output[port].type) {
+        return this.ports.output[port].type;
+      }
+
+      type = typeof output === 'undefined' ? 'undefined' : _typeof(output);
+
+      if (type !== 'object') {
+        return type;
+      }
+
+      // do not modify type, keep packet type as is
+      return origType;
+    }
+
+    // TODO: many checks only have to be determined one time.
+
+  }, {
+    key: 'pickPacket',
+    value: function pickPacket(port) {
+      if (this.input.hasOwnProperty(port)) {
+        return this.input[port];
+      } else if (this.transit.hasOwnProperty(port)) {
+        // clone
+        var c = this.transit[port].clone(this);
+        c.c--; // adjust
+        return c;
       } else {
-        console.log(this.export());
-        throw Error(
-          util.format(
-            '%s: Cannot determine packet for port `out`',
-            this.identifier
-          )
-        );
+        return new Packet(this, null, this.ports.input[port].type);
+        //throw Error('Unable to determine source packet');
       }
-    } else {
-      // failing silently, no packet flow match
-      debug(
-        '%s: Unable to find corresponding `in` port for port `out`',
-        this.identifier
-      );
     }
-  } else if (this.inPorts.indexOf(port) >= 0) {
-    // same port name context/context
-    p = this.pickPacket(port);
-    if (p) {
-      p.write(
-        this,
-        output,
-        this.determineOutputType(
-          port,
-          output,
-          p.type
-        )
-      );
-      this.freePort(port);
-    } else {
-      throw Error(
-        util.format(
-          '%s: Cannot determine packet for outport `%s`',
-          this.identifier,
-          port
-        )
-      );
-    }
-  } else {
-    // TODO: test for ports.input.out = ['out1', 'out2']
-  }
-  if (!p) {
-    p = new Packet(
-      this,
-      output,
-      this.determineOutputType(
-        port,
-        output,
-        'any' // if all else fails
-      )
-    );
-  }
-  return p;
-};
+  }, {
+    key: 'wrapPacket',
+    value: function wrapPacket(port, output) {
+      var p;
 
-module.exports = INode;
+      if (port[0] === ':') {
+        return new Packet(this, output, 'string');
+      }
 
-},{"../ConnectionMap":17,"../packet":29,"../port":30,"../validate":38,"chix-chi":41,"debug":49,"events":11,"util":16}],28:[function(require,module,exports){
-'use strict';
-
-/* global document */
-
-var util = require('util');
-var Packet = require('../packet');
-var xNode = require('./interface');
-
-/**
- *
- * This whole context, default thing is handled differently here.
- * They only make sense on startup as defaults.
- *
- * Since all they are is attributes.
- *
- * For non attribute input ports context & default make no sense.
- * so are ignored.
- *
- * @param {type} id
- * @param {type} node
- * @param {type} identifier
- * @param {type} CHI
- * @returns {PolymerNode}
- */
-
-function PolymerNode(id, node, identifier, CHI) {
-
-  // not sure where to call this yet.
-  PolymerNode.super_.apply(this, arguments);
-
-  var self = this;
-
-  this.id = id;
-
-  this.ns = node.ns;
-  this.name = node.name;
-
-  this.type = 'polymer';
-
-  this.identifier = identifier;
-
-  this.chi = {};
-
-  this.CHI = CHI;
-
-  /* wanna use this with a Polymer node? */
-  this.input = {};
-
-  var da = this.id.split('');
-  da.forEach(function(v, i, arr) {
-    if (/[A-Z]/.test(v)) {
-      arr.splice(i, 1, (i > 0 ? '-' : '') + v.toLowerCase());
-    }
-  });
-
-  this.elementId = da.join('');
-
-  // TODO: will I use this.ports?
-  // for required, default, type etc I still need it.
-
-  /**
-   *
-   * Problem here is I use uuid's
-   * This can be solved by not generating them.
-   *
-   **/
-  this.wc = document.getElementById(this.elementId);
-  if (!this.wc) {
-    // automatically create the element
-    console.log('creating', this.name);
-    this.wc = document.createElement(this.name);
-    this.wc.setAttribute('id', this.elementId);
-    document.querySelector('body').appendChild(this.wc);
-  }
-
-  if (!this.wc) {
-    throw Error('Polymer Web Component could not be found');
-  }
-
-  // TODO: do some basic check whether this really is a polymer element
-
-  // there should be dynamic stuff for e.g. on-tap
-  // Ok it's also clear .fbp graphs become just as nested
-  // as the components itself, other wise it will not work.
-  // one graph means one component.
-  // Also if there are then template variable they need to be described.
-  // blargh. :-)
-  // Ok but these node definitions are so they are selectable within
-  // the .fbp that's kinda solved.
-  // I should not try to do to much logic for the UI itself.
-  // that's not necessary and undoable.
-  // So the best example is chix-configurator and the reason I've
-  // created it in the first place.
-  /*
-  Problem a component is composite, defines properties.
-
-  Graph is composite defines external ports.
-
-  Fbpx Graph !== Composite Webcomponent.
-
-  However I treat the composite component as a node Definition.
-  So then I have the problem of the same component.
-  representing a nodeDefinion but also a graph.
-
-  Which would almost indicate a webcomponent is always also
-  a graph, which could be possible, because a graph is also
-  a nodeDefinition in chix.
-
-  err, it is possible, but a bit complex.
-
-  which means a polymerNode is closer to xFlow then to xNode.
-
-  */
-  function sendPortOutput(port) {
-    return function(ev) {
-      self.emit('output', {
-        node: self.export(),
-        port: port,
-        out: new Packet(ev)
+      // check 1:1 (:start && :complete) are ignored
+      var ins = Object.keys(this.ports.input).filter(function (a) {
+        return a[0] !== ':';
       });
-    };
-  }
+      var outs = Object.keys(this.ports.output).filter(function (a) {
+        return a[0] !== ':';
+      });
 
-  if (Object.keys(node.ports.output).length) {
-    for (var port in node.ports.output) {
-      if (node.ports.output.hasOwnProperty(port)) {
-        this.wc.addEventListener(port, sendPortOutput(port));
+      if (outs.length === 1 && ins.length === 1) {
+        // assume we are doing the same packet.
+        p = this.pickPacket(ins[0]);
+        if (p) {
+          p.write(this, output, this.determineOutputType(port, output, p.type));
+
+          this.freePort(ins[0]);
+        } else {
+          throw Error(util.format('%s: Cannot determine packet for port `%s`, `%s` is empty', this.identifier, port, ins[0]));
+        }
+      } else if (port === 'out') {
+        if (this.ports.input.hasOwnProperty('in')) {
+          p = this.pickPacket('in');
+          if (p) {
+            p.write(this, output, this.determineOutputType(port, output, p.type));
+            this.freePort('in');
+          } else {
+            console.log(this.export());
+            throw Error(util.format('%s: Cannot determine packet for port `out`', this.identifier));
+          }
+        } else {
+          // failing silently, no packet flow match
+          debug('%s: Unable to find corresponding `in` port for port `out`', this.identifier);
+        }
+      } else if (this.inPorts.indexOf(port) >= 0) {
+        // same port name context/context
+        p = this.pickPacket(port);
+        if (p) {
+          p.write(this, output, this.determineOutputType(port, output, p.type));
+          this.freePort(port);
+        } else {
+          throw Error(util.format('%s: Cannot determine packet for outport `%s`', this.identifier, port));
+        }
+      } else {
+        // TODO: test for ports.input.out = ['out1', 'out2']
+      }
+      if (!p) {
+        p = new Packet(this, output, this.determineOutputType(port, output, 'any' // if all else fails
+        ));
+      }
+      return p;
+    }
+
+    /**
+     *
+     * Get the current node status.
+     *
+     * This is unused at the moment.
+     *
+     * @public
+     */
+
+  }, {
+    key: 'getStatus',
+    value: function getStatus() {
+      return this.status;
+    }
+  }, {
+    key: 'getParent',
+    value: function getParent() {
+      return this.parent;
+    }
+  }, {
+    key: 'setParent',
+    value: function setParent(node) {
+      this.parent = node;
+    }
+  }, {
+    key: 'hasParent',
+    value: function hasParent() {
+      return Boolean(this.parent);
+    }
+
+    /**
+     *
+     * Do a lightweight export of this node.
+     *
+     * Used in emit's to give node information
+     *
+     *
+     * @return {Object}
+     * @public
+     */
+
+  }, {
+    key: 'export',
+    value: function _export() {
+      return {
+        id: this.id,
+        ns: this.ns,
+        name: this.name,
+        title: this.title,
+        pid: this.pid,
+        identifier: this.identifier,
+        ports: this.ports,
+        cycles: this.cycles,
+        inPorts: this.inPorts,
+        outPorts: this.outPorts,
+        filled: this.filled,
+        context: this.context,
+        require: this.require,
+        status: this.status,
+        runCount: this.runCount,
+        expose: this.expose,
+        active: this.active,
+        metadata: this.metadata,
+        provider: this.provider,
+        input: this._filteredInput(),
+        openPorts: this.openPorts,
+        nodeTimeout: this.nodeTimeout,
+        inputTimeout: this.inputTimeout
+      };
+    }
+
+    /**
+     *
+     * @returns {Object}
+     * @public
+     */
+
+  }, {
+    key: 'report',
+    value: function report() {
+      return {
+        id: this.id,
+        identifier: this.identifier,
+        title: this.title,
+        filled: this.filled,
+        runCount: this.runCount,
+        outputCount: this.outputCount,
+        status: this.status,
+        input: this._filteredInput(),
+        context: this.context,
+        ports: this.ports,
+        state: this.state,
+        openPorts: this.openPorts,
+        connections: this._connections.toJSON()
+      };
+    }
+
+    /**
+     *
+     * Returns the node representation to be stored along
+     * with the graph.
+     *
+     * This is not the full definition of the node itself.
+     *
+     * The full definition can be found using the ns/name pair
+     * along with the provider property.
+     *
+     */
+
+  }, {
+    key: 'toJSON',
+    value: function toJSON() {
+      var self = this;
+
+      var json = {
+        id: this.id,
+        ns: this.ns,
+        name: this.name
+      };
+
+      ['title', 'description', 'metadata', 'provider'].forEach(function (prop) {
+        if (self[prop]) {
+          if (_typeof(self[prop]) !== 'object' || Object.keys(self[prop]).length > 0) {
+            json[prop] = self[prop];
+          }
+        }
+      });
+
+      return json;
+    }
+  }, {
+    key: '_receive',
+    value: function _receive(target, p) {
+      if (this.status === 'error') {
+        return new Error('Port fill refused process is in error state');
+      }
+
+      if (!this.portExists('input', target.port)) {
+
+        return new Error(util.format('Process %s has no input port named `%s`\n\n' + '\tInput ports available:\n\n\t%s', this.identifier, target.port, this._portsAvailable()));
+      }
+
+      if (!this.portIsOpen(target.port)) {
+        return Error(util.format('Trying to send to a closed port open it first: %s', target.port));
+      }
+
+      // should probably moved somewhere later
+      this.handleLinkSettings(target);
+
+      var type = this.ports.input[target.port].type;
+
+      if (type === 'array' && target.has('index')) {
+        return this._handleArrayPort(target, p);
+      }
+
+      if (type === 'object' && target.has('index')) {
+        return this._handleObjectPort(target, p);
+      }
+
+      // queue manager could just act on the false return
+      // instead of checking inputPortAvailable by itself
+      var ret = this.inputPortAvailable(target);
+      if (!ret || util.isError(ret)) {
+
+        /**
+         * Port Reject Event.
+         *
+         * Fired when input on a port is rejected.
+         *
+         * @event BaseNode#portReject
+         * @type {object}
+         * @property {object} node - An export of this node
+         * @property {string} port - Name of the port this rejection occured
+         */
+        this.event(':portReject', {
+          node: this.export(),
+          port: target.port,
+          data: p
+        });
+
+        return ret;
+      } else {
+        ret = this._fillPort(target, p);
+        return ret;
       }
     }
-  }
 
-  this.status = 'ready';
+    /**
+     *
+     * Handles an Array port
+     *
+     * [0,1,2]
+     *
+     * When sending IIPs the following can also happen:
+     * [undefined, undefined, 2]
+     * IIPs in this way must be send as a group.
+     * That group will be added in reverse order.
+     * This way 2 will create an array of length 3
+     * This is important because we will check the length
+     * whether we are ready to go.
+     *
+     * If 0 was added first, the length will be 1 and
+     * it seems like we are ready to go, then 1 comes
+     * and finds the process is already running..
+     *
+     * [undefined, undefined, 2]
+     *
+     * Connections:
+     * [undefined, undefined, 2]
+     *
+     * @param {Connector} target
+     * @param {Packet} p
+     * @private
+     */
 
-}
+  }, {
+    key: '_handleArrayPort',
+    value: function _handleArrayPort(target, p) {
+      // start building the array.
+      if (target.has('index')) {
 
-util.inherits(PolymerNode, xNode);
+        // Marked the port as being indexed
+        this.ports.input[target.port].indexed = true;
 
-PolymerNode.prototype.start = function() {
-  /* nothing to do really */
-  return true;
-};
+        // we have an index.
+        // ok, one problem, with async, this.input
+        // is never really filled...
+        // look at that, will cause dangling data.
+        if (!this.input[target.port]) {
+          // becomes a new packet
+          this.input[target.port] = new Packet(this, [], 'array');
+        }
 
-/**
- *
- * Must do the same kind of logic as xNode
- * Therefor having Ports at this point would be handy
- * Let's at least start by putting those methods in the `interface`.
- */
-PolymerNode.prototype.fill = function(target, p) {
+        if (this.input[target.port].read(this)[target.get('index')] !== undefined) {
+          // input not available, it will be queued.
+          // (queue manager also stores [])
+          return Port.INDEX_NOT_AVAILABLE;
+        } else {
 
-  /* input can be an attribute, or one of our methods */
-  if (typeof this.wc[target.port] === 'function') {
-    this.wc[target.port](p.data);
-  }
-  else {
-    // must be an attribute
-    this.wc.setAttribute(target.port, p.data);
-  }
+          this.event(':index', {
+            node: this.export(),
+            port: target.port,
+            index: target.get('index')
+          });
+          // merge chi
+          this.CHI.merge(this.input[target.port].chi, p.chi, false);
+          this.input[target.port].read(this)[target.get('index')] = p.read(this);
+          // drop packet..
+        }
 
-};
+        // it should at least be our length
+        if (this._arrayPortIsFilled(target.port)) {
+          // packet writing, CHECK THIS.
+          // p.data = this.input[target.port]; // the array we've created.
 
-PolymerNode.prototype.$portIsFilled = function( /*port*/ ) {
-  //return this.input.hasOwnProperty(port);
-  return false;
-};
+          // Unmark the port as being indexed
+          delete this.ports.input[target.port].indexed;
 
-/**
- *
- * Holds all input until release is called
- *
- * @public
- */
-PolymerNode.prototype.hold = function() {
-  this.setStatus('hold');
-};
+          // ok, above all return true or false
+          // this one is either returning true or an error.
+          //return this._fillPort(target, p);
+          return this._fillPort(target, this.input[target.port]);
+        } else {
+          // input length less than known connections length.
+          return Port.AWAITING_INDEX;
+        }
+      } else {
+        throw Error(util.format('%s: `%s` value arriving at Array port `%s`, but no index[] is set', this.identifier, _typeof(p.data), target.port));
+      }
+    }
 
-/**
- *
- * Releases the node if it was on hold
- *
- * @public
- */
-PolymerNode.prototype.release = function() {
+    /**
+     *
+     * Handles an Object port
+     *
+     * @param {String} port
+     * @param {Object} data
+     * @param {Object} chi
+     * @param {Object} source
+     * @private
+     */
+    // todo, the name of the variable should be target not source.
+    // source is only handled during output.
 
-  this.setStatus('ready');
+  }, {
+    key: '_handleObjectPort',
+    value: function _handleObjectPort(target, p) {
+      // start building the array.
+      if (target.has('index')) {
+        // we have a key.
+        // Marked the port as being indexed
+        this.ports.input[target.port].indexed = true;
 
-  if (this.__halted) {
-    this.__halted = false;
-    // not much to do
-  }
-};
+        // Initialize empty object
+        if (!this.input[target.port]) {
+          this.input[target.port] = new Packet(this, {}, 'object');
+        }
 
-module.exports = PolymerNode;
+        // input not available, it will be queued.
+        // (queue manager also stores [])
+        if (typeof this.input[target.port][target.get('index')] !== 'undefined') {
+          return false;
+        } else {
 
-},{"../packet":29,"./interface":27,"util":16}],29:[function(require,module,exports){
-'use strict';
+          this.event(':index', {
+            node: this.export(),
+            port: target.port,
+            index: target.get('index')
+          });
+
+          // define the key
+          this.CHI.merge(this.input[target.port].chi, p.chi, false);
+          this.input[target.port].read(this)[target.get('index')] = p.read(this);
+        }
+
+        // it should at least be our length
+        //
+        // Bug:
+        //
+        // This check is not executed when another port triggers
+        // execution. the input object is filled, so it will
+        // start anyway.
+        //
+        if (this._objectPortIsFilled(target.port)) {
+
+          // PACKET WRITING CHECK THIS.
+          // p.data = this.input[target.port];
+
+          // Unmark the port as being indexed
+          delete this.ports.input[target.port].indexed;
+
+          //return this._fillPort(target, p);
+          return this._fillPort(target, this.input[target.port]);
+        } else {
+          // input length less than known connections length.
+          return Port.AWAITING_INDEX;
+        }
+      } else {
+
+        throw Error(util.format('%s: `%s` value arriving at Object port `%s`, but no index[] is set', this.identifier, _typeof(p.data), target.port));
+      }
+    }
+
+    /**
+     *
+     * @param {string} port
+     * @private
+     */
+
+  }, {
+    key: '_arrayPortIsFilled',
+    value: function _arrayPortIsFilled(port) {
+
+      // Not even initialized
+      //if (typeof this.input[port] === undefined) {
+      if (!this.input.hasOwnProperty(port)) {
+        return false;
+      }
+
+      if (this.input[port].read(this).length < this._connections[port].length) {
+        return false;
+      }
+
+      // Make sure we do not have undefined (unfulfilled ports)
+      // (Should not really happen)
+      for (var i = 0; i < this.input[port].read(this).length; i++) {
+        if (this.input[port].read(this)[i] === undefined) {
+          return false;
+        }
+      }
+
+      // Extra check for weird condition
+      if (this.input[port].read(this).length > this._connections[port].length) {
+
+        this.error(util.format('%s: Array length out-of-bounds for port', this.identifier, port));
+
+        return false;
+      }
+
+      return true;
+    }
+
+    /**
+     *
+     * @param {string} port
+     * @private
+     */
+
+  }, {
+    key: '_objectPortIsFilled',
+    value: function _objectPortIsFilled(port) {
+      // Not even initialized
+      //if (typeof this.input[port] === undefined) {
+      if (!this.input.hasOwnProperty(port)) {
+        return false;
+      }
+
+      // Not all connections have provided input yet
+      if (Object.keys(this.input[port].read(this)).length < this._connections[port].length) {
+        return false;
+      }
+
+      // Make sure we do not have undefined (unfulfilled ports)
+      // (Should not really happen)
+      for (var key in this.input[port]) {
+        //if (this.input[port][key] === undefined) {
+        if (this.input[port].read(this)[key] === undefined) {
+          return false;
+        }
+      }
+
+      // Extra check for weird condition
+      if (Object.keys(this.input[port].read(this)).length > this._connections[port].length) {
+
+        this.error(util.format('%s: Object keys length out-of-bounds for port `%s`', this.identifier, port));
+
+        return false;
+      }
+
+      return true;
+    }
+
+    /**
+     *
+     * @param {string} port
+     * @param {Mixed} data
+     * @private
+     */
+
+  }, {
+    key: '_validateInput',
+    value: function _validateInput(port, data) {
+      var type;
+
+      if (!this.ports.input.hasOwnProperty(port)) {
+
+        var msg = Error(util.format('no such port: **%s**', port));
+
+        return Error(msg);
+      }
+
+      type = this.getPortType('input', port);
+
+      if (!validate.data(type, data)) {
+
+        // TODO: emit these errors, with error constants
+        var real = Object.prototype.toString.call(data).match(/\s(\w+)/)[1];
+
+        if (data && (typeof data === 'undefined' ? 'undefined' : _typeof(data)) === 'object' && data.constructor.name === 'Object') {
+          var tmp = Object.getPrototypeOf(data).constructor.name;
+
+          if (tmp) {
+            // not sure, sometimes there is no name?
+            // in witch case all you can do is type your name as being an 'object'
+            real = tmp;
+          }
+        }
+
+        return Error(util.format('Expected `%s` got `%s` on port `%s`', type, real, port));
+      }
+
+      /**
+       * Input Validated Event.
+       *
+       * Occurs when a port was succesfully validated
+       *
+       * @event BaseNode#inputValidated
+       * @type {object}
+       * @property {object} node - An export of this node
+       * @property {string} port - Name of the port
+       */
+      this.event(':inputValidated', {
+        node: this.export(),
+        port: port
+      });
+
+      return true;
+    }
+
+    /**
+     *
+     * @param {string} port
+     * @param {Mixed} data
+     * @private
+     */
+
+  }, {
+    key: '_handleFunctionType',
+    value: function _handleFunctionType(port, data) {
+      var portObj = this.getPort('input', port);
+      // convert function if it's not already a function
+      if (portObj.type === 'function' && typeof data === 'string') {
+        // args, can be used as a hint for named parms
+        // if there are no arg names defined, use arguments
+        var args = portObj.args ? portObj.args : [];
+        data = new Function(args, data);
+      }
+
+      return data;
+    }
+  }, {
+    key: '_clonePorts',
+    value: function _clonePorts(ports) {
+      var type;
+      var port;
+      var copy = JSON.parse(JSON.stringify(ports));
+
+      // keep fn in tact.
+      // all same `instances` share this function.
+      for (type in ports) {
+        if (ports.hasOwnProperty(type)) {
+          for (port in ports[type]) {
+            if (ports[type].hasOwnProperty(port)) {
+              if (ports[type][port].fn) {
+                copy[type][port].fn = ports[type][port].fn;
+                this.async = true; // TODO: remove the need of this flagging.
+              }
+            }
+          }
+        }
+      }
+
+      return copy;
+    }
+
+    /**
+     *
+     * Filters the input for export.
+     *
+     * Leaving out everything defined as a function
+     *
+     * Note: depends on the stage of emit whether this value contains anything
+     *
+     * @return {Object} Filtered Input
+     * @private
+     */
+
+  }, {
+    key: '_filteredInput',
+    value: function _filteredInput() {
+      var port;
+      var type;
+      var input = {};
+
+      for (port in this.input) {
+        if (this.portExists('input', port)) {
+          type = this.ports.input[port].type;
+
+          if (type === 'string' || type === 'number' || type === 'enum' || type === 'boolean') {
+            input[port] = this.input[port];
+          } else {
+            // can't think of anything better right now
+            input[port] = Object.prototype.toString.call(this.input[port]);
+          }
+        } else {
+
+          // faulty but used during export so we want to know
+          input[port] = this.input[port];
+        }
+      }
+
+      return input;
+    }
+  }, {
+    key: '_portsAvailable',
+    value: function _portsAvailable() {
+      var ports = [];
+      var self = this;
+      Object.keys(this.ports.input).forEach(function (port) {
+        if ((!self.ports.input[port].hasOwnProperty('required') || self.ports.input[port].required === true) && !self.ports.input[port].hasOwnProperty('default')) {
+          ports.push(port + '*');
+        } else {
+          ports.push(port);
+        }
+      });
+      return ports.join(', ');
+    }
+  }], [{
+    key: 'create',
+    value: function create(id, def, identifier, CHI) {
+      return new BaseNode(id, def, identifier, CHI);
+    }
+  }]);
+
+  return BaseNode;
+})(EventEmitter);
+
+BaseNode.events = [':closePort', ':contextUpdate', ':contextClear', ':complete', ':error', ':executed', ':expose', ':fillCore', ':freePort', ':index', ':inputTimeout', ':inputValidated', ':nodeTimeout', ':openPort', ':output', ':plug', ':unplug', ':portFill', ':portReject', ':require', ':statusUpdate', ':start', ':shutdown'];
+
+BaseNode.prototype.setContext = BaseNode.prototype.setContextProperty;
+
+module.exports = BaseNode;
+//# sourceMappingURL=interface.js.map
+
+},{"../ConnectionMap":11,"../events/after":22,"../packet":31,"../port":32,"../validate":41,"chix-chi":44,"debug":"V4HZ/5","util":6}],31:[function(require,module,exports){
+'use strict'
+
+// TODO: only has to be a pointer packet if it's actually used.
+;
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
 var JsonPointer = require('json-ptr');
 
@@ -11274,183 +10633,219 @@ var nr = 10000000000;
 function Container(data) {
   this['.'] = data;
 }
-function Packet(owner, data, type, n, c) {
 
-  this.owner = owner;
-  this.trail = [];
-  this.typeTrail = [];
+var Packet = (function () {
+  function Packet(owner, data, type, n, c) {
+    _classCallCheck(this, Packet);
 
-  if (type === undefined) {
-    throw Error('type not specified');
-  }
+    this.owner = owner;
+    this.trail = [];
+    this.typeTrail = [];
 
-  this.type = type;
-
-  // err ok, string must be assigned to? or {".": "string"}
-  // which means base is /. instead of ''
-  this.__data = data instanceof Container ? data : new Container(data);
-  this.chi = {};
-  this.nr = n ? n : nr++;
-  this.c = c ? c : 0; // clone version
-  this.pointer = JsonPointer.create('/.');
-
-  Object.defineProperty(this, 'data', {
-     get: function() {
-       throw Error('data property should not be accessed');
-     },
-     set: function() {
-       throw Error('data property should not be written to');
-     }
-  });
-
-  // probably too much info for a basic packet.
-  // this.created_at =
-  // this.updated_at =
-
-}
-
-/**
- *
- * Pointer is a JSON Pointer.
- *
- * If the pointer does not start with a slash
- * the pointer will be (forward) relative to the current position
- * If the pointer is empty the pointer will be to the root.
- *
- * @param owner
- * @param pointer JSON Pointer
- */
-Packet.prototype.point = function(owner, pointer) {
-  if (this.isOwner(owner)) {
-    if (pointer === undefined || pointer === '') {
-      this.pointer = JsonPointer.create('/.');
-    } else if (pointer[0] === '/') {
-      this.pointer = JsonPointer.create('/.' + pointer);
-    } else {
-      this.pointer = JsonPointer.create(
-        this.pointer.pointer + '/' + pointer
-      );
+    if (type === undefined) {
+      throw Error('type not specified');
     }
-  }
-};
 
-Packet.prototype.read = function(owner) {
-  if (this.isOwner(owner)) {
-    return this.pointer.get(this.__data);
-  }
-};
-
-Packet.prototype.write = function(owner, data, type) {
-  if (this.isOwner(owner)) {
-    this.pointer.set(this.__data, data);
-    if (type) {
-      this.type = type;
-    }
-  }
-};
-
-// clone can only take place on plain object data.
-
-/**
- * Clone the current packet
- *
- * In case of non plain objects it's mostly desired
- * not to clone the data itself, however do create a *new*
- * packet with the other cloned information.
- *
- * To enable this set cloneData to true.
- *
- * @param {Object} owner Owner of the packet
- * @param {Boolean} cloneData Whether or not to clone the data.
- */
-Packet.prototype.clone = function(owner) {
-  if (this.isOwner(owner)) {
-    var p = new Packet(owner,
-      null,
-      null,
-      this.nr,
-      ++this.c
-    );
-    if (!this.type) {
-      throw Error('Refusing to clone substance of unkown type');
-    }
-    // TODO: make sure String Object are always lowercase.
-    // I think they are..
-    if (this.type === 'function' || /[A-Z]/.test(this.type)) {
-      // do not clone, ownership will throw if things go wrong
-      // gah, this is hard.
-      var d = this.__data;
-      p.__data = d;
-    } else {
-      p.__data = JSON.parse(JSON.stringify(this.__data));
-    }
-    p.type = this.type;
-    p.pointer = JsonPointer.create(this.pointer.pointer);
-    p.set('chi', JSON.parse(JSON.stringify(this.chi)));
-    return p;
-  }
-};
-
-Packet.prototype.setType = function(owner, type) {
-  if (this.isOwner(owner)) {
-    this.typeTrail.push(this.type);
     this.type = type;
+
+    // err ok, string must be assigned to? or {".": "string"}
+    // which means base is /. instead of ''
+    this.__data = data instanceof Container ? data : new Container(data);
+    this.chi = {};
+    this.nr = n ? n : nr++;
+    this.c = c ? c : 0; // clone version
+    this.pointer = JsonPointer.create('/.');
+
+    Object.defineProperty(this, 'data', {
+      get: function get() {
+        throw Error('data property should not be accessed');
+      },
+      set: function set() {
+        throw Error('data property should not be written to');
+      }
+    });
+
+    // probably too much info for a basic packet.
+    // this.created_at =
+    // this.updated_at =
   }
-};
 
-Packet.prototype.release = function(owner) {
-  if (this.isOwner(owner)) {
-    this.trail.push(owner);
-    this.owner = undefined;
-  }
-};
+  /**
+   *
+   * Pointer is a JSON Pointer.
+   *
+   * If the pointer does not start with a slash
+   * the pointer will be (forward) relative to the current position
+   * If the pointer is empty the pointer will be to the root.
+   *
+   * @param {Object} owner
+   * @param {String} pointer JSON Pointer
+   */
 
-Packet.prototype.setOwner = function(newOwner) {
-  if (this.owner === undefined) {
-    this.owner = newOwner;
-  } else {
-    throw Error('Refusing to overwrite owner');
-  }
-};
+  _createClass(Packet, [{
+    key: 'point',
+    value: function point(owner, pointer) {
+      if (this.isOwner(owner)) {
+        if (pointer === undefined || pointer === '') {
+          this.pointer = JsonPointer.create('/.');
+        } else if (pointer[0] === '/') {
+          this.pointer = JsonPointer.create('/.' + pointer);
+        } else {
+          this.pointer = JsonPointer.create(this.pointer.pointer + '/' + pointer);
+        }
+        return this;
+      }
+    }
+  }, {
+    key: 'read',
+    value: function read(owner) {
+      if (this.isOwner(owner)) {
+        return this.pointer.get(this.__data);
+      }
+    }
+  }, {
+    key: 'write',
+    value: function write(owner, data, type) {
+      if (this.isOwner(owner)) {
+        this.pointer.set(this.__data, data);
+        if (type) {
+          this.type = type;
+        }
+        return this;
+      }
+    }
 
-Packet.prototype.hasOwner = function() {
-  return this.owner !== undefined;
-};
+    // clone can only take place on plain object data.
 
-Packet.prototype.isOwner = function(owner) {
-  if (owner === this.owner) {
-    return true;
-  } else {
-    console.log(owner, this.owner);
-    throw Error('Packet is not owned by this instance.');
-  }
-};
+    /**
+     * Clone the current packet
+     *
+     * In case of non plain objects it's mostly desired
+     * not to clone the data itself, however do create a *new*
+     * packet with the other cloned information.
+     *
+     * To enable this set cloneData to true.
+     *
+     * @param {Object} owner Owner of the packet
+     * @param {Boolean} cloneData Whether or not to clone the data.
+     */
 
-Packet.prototype.dump = function() {
-  return JSON.stringify(this, null, 2);
-};
+  }, {
+    key: 'clone',
+    value: function clone(owner) {
+      if (this.isOwner(owner)) {
+        var p = new Packet(owner, null, null, this.nr, ++this.c);
+        if (!this.type) {
+          throw Error('Refusing to clone substance of unkown type');
+        }
+        // TODO: make sure String Object are always lowercase.
+        // I think they are..
+        if (this.type === 'function' || /[A-Z]/.test(this.type)) {
+          // do not clone, ownership will throw if things go wrong
+          // gah, this is hard.
+          var d = this.__data;
+          p.__data = d;
+        } else {
+          p.__data = JSON.parse(JSON.stringify(this.__data));
+        }
+        p.type = this.type;
+        p.pointer = JsonPointer.create(this.pointer.pointer);
+        p.set('chi', JSON.parse(JSON.stringify(this.chi)));
+        return p;
+      }
+    }
+  }, {
+    key: 'setType',
+    value: function setType(owner, type) {
+      if (this.isOwner(owner)) {
+        this.typeTrail.push(this.type);
+        this.type = type;
+        return this;
+      }
+    }
+  }, {
+    key: 'release',
+    value: function release(owner) {
+      if (this.isOwner(owner)) {
+        this.trail.push(owner);
+        this.owner = undefined;
+        return this;
+      }
+    }
+  }, {
+    key: 'setOwner',
+    value: function setOwner(newOwner) {
+      if (this.owner === undefined) {
+        this.owner = newOwner;
+        return this;
+      } else {
+        if (newOwner === this.owner) {
+          throw Error('Packet already owned by this owner');
+        } else {
+          throw Error('Refusing to overwrite owner');
+        }
+      }
+    }
+  }, {
+    key: 'hasOwner',
+    value: function hasOwner() {
+      return this.owner !== undefined;
+    }
+  }, {
+    key: 'isOwner',
+    value: function isOwner(owner) {
+      if (owner === this.owner) {
+        return true;
+      } else {
+        if (!owner) {
+          throw Error('Packet expects an owner object as parameter');
+        } else if (this.owner === undefined) {
+          throw Error('Packet is unclaimed, claim it first');
+        } else {
+          console.log('REQUESTOR:', owner.identifier || owner);
+          console.log('OWNER', this.owner.identifier || this.owner);
+          throw Error('Packet is not owned by this instance.');
+        }
+      }
+    }
+  }, {
+    key: 'dump',
+    value: function dump() {
+      return JSON.stringify(this, null, 2);
+    }
 
-// Are these used?
-Packet.prototype.set = function(prop, val) {
-  this[prop] = val;
-};
+    // Are these used?
 
-Packet.prototype.get = function(prop) {
-  return this[prop];
-};
+  }, {
+    key: 'set',
+    value: function set(prop, val) {
+      this[prop] = val;
+    }
+  }, {
+    key: 'get',
+    value: function get(prop) {
+      return this[prop];
+    }
+  }, {
+    key: 'del',
+    value: function del(prop) {
+      delete this[prop];
+    }
+  }, {
+    key: 'has',
+    value: function has(prop) {
+      return this.hasOwnProperty(prop);
+    }
+  }]);
 
-Packet.prototype.del = function(prop) {
-  delete this[prop];
-};
-
-Packet.prototype.has = function(prop) {
-  return this.hasOwnProperty(prop);
-};
+  return Packet;
+})();
 
 module.exports = Packet;
+//# sourceMappingURL=packet.js.map
 
-},{"json-ptr":60}],30:[function(require,module,exports){
-'use strict';
+},{"json-ptr":59}],32:[function(require,module,exports){
+'use strict'
 
 /**
  *
@@ -11469,221 +10864,229 @@ module.exports = Packet;
  *  port.receive(p);
  *
  */
-function Port() {
+;
 
-  //if (!(this instanceof Port)) return new Port(options);
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
 
-  // important to just name it input for refactor.
-	// eventually can be renamed to something else.
-  //
-	// node.input[port] becomes node.getPort(port).input
-  //
-  this.input = undefined;
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
-  this._open = false;
+var Port = (function () {
+  function Port() {
+    _classCallCheck(this, Port);
 
-  // If async the value will pass right through a.k.a. non-blocking
-	// If there are multiple async ports, the code implementation
-	// consequently must be a state machine.
-	// async + sync is still possible. One async port is just one
-	// function call and thus not a state machine.
-  this.async = false;
-  this._connections = [];
+    // important to just name it input for refactor.
+    // eventually can be renamed to something else.
+    //
+    // node.input[port] becomes node.getPort(port).input
+    //
+    this.input = undefined;
 
-}
+    this._open = false;
 
-// Important to make clear for debugging
-// during port fill the message comes back.
-// these names though are confusing.
-// I want these to be like Errors but not errors.
+    // If async the value will pass right through a.k.a. non-blocking
+    // If there are multiple async ports, the code implementation
+    // consequently must be a state machine.
+    // async + sync is still possible. One async port is just one
+    // function call and thus not a state machine.
+    this.async = false;
+    this._connections = [];
+  }
 
-// requeue
-Port.INPUT_REVOKED       = false; // removed by a portbox
-Port.NOT_FILLED          = false; // ??
+  /**
+   *
+   * Used from within a component to receive the port data
+   *
+   */
 
-// ok there is a mixture of functionality here.
-// Port.AVAILABLE for example is just a return code for availability
-// and does not indicate whether the port was filled.
-/*
-  Port.AVAILABLE;
-  Port.INDEX_NOT_AVAILABLE;
-  Port.ARRAY_PORT_FULL;
-  Port.INDEX_AVAILABLE;
- Port.AVAILABLE : Port.UNAVAILABLE;
-*/
+  _createClass(Port, [{
+    key: 'receive',
+    value: function receive() {}
 
-// success
+    /**
+     *
+     * Used from within a component to close the port
+     *
+     * A component receives an open port.
+     * When the port closes it's ready to be filled.
+     * This also means there are two sides on a port
+     * Open for input and open for output to the component.
+     *
+     */
 
-// used in input port available
-Port.AVAILABLE           = true; // non index port was set
-Port.UNAVAILABLE         = false; // not an index port but input is already set
-Port.INDEX_AVAILABLE     = true; // index was set
-Port.INDEX_NOT_AVAILABLE = false; // index already filled
-// could be the same as index not available,
-// this just tells it's full and will be processed
-Port.ARRAY_PORT_FULL     = false;
+  }, {
+    key: 'close',
+    value: function close() {
+      this._open = false;
+    }
+  }, {
+    key: 'open',
+    value: function open() {
+      this._open = true;
+    }
 
-// index was set, but waiting others to be filled
-Port.AWAITING_INDEX      = true;
+    // TODO: after refactor these will end up elsewhere
 
-// this is a weird return code,
-// because it's probably not about the filled port itself
-Port.CONTEXT_SET         = true;
-Port.PERSISTED_SET       = true; // idem
-Port.DEFAULT_SET         = true; // idem
-Port.NOT_REQUIRED        = true; // idem
-Port.FILLED              = true; // port was filled.
+  }, {
+    key: 'hasConnection',
+    value: function hasConnection(link) {
+      return this._connections && this._connections.indexOf(link) >= 0;
+    }
+  }, {
+    key: 'hasConnections',
+    value: function hasConnections() {
+      return this._connections.length > 0;
+    }
+  }, {
+    key: 'getConnections',
+    value: function getConnections() {
+      return this._connections;
+    }
 
-/**
- *
- * Used from within a component to receive the port data
- *
- */
-Port.prototype.receive = function() {
-};
+    // this seems to be a wrong check?
+    // ah no, no property means not filled.
+    // but this is just wrong. array port for example is not filled, if it's set.
+    // it's being taken care of, but only causes more code to be necessary
 
-/**
- *
- * Used from within a component to close the port
- *
- * A component receives an open port.
- * When the port closes it's ready to be filled.
- * This also means there are two sides on a port
- * Open for input and open for output to the component.
- *
- */
-Port.prototype.close = function() {
-  this._open = false;
-};
+  }, {
+    key: 'isFilled',
+    value: function isFilled() {
+      return this.input !== undefined;
+    }
+  }, {
+    key: 'clearInput',
+    value: function clearInput() {
+      this.input = undefined;
+    }
+  }, {
+    key: 'isAvailable',
+    value: function isAvailable() {}
 
-Port.prototype.open = function() {
-  this._open = true;
-};
+    // Node freePort
 
-// TODO: after refactor these will end up elsewhere
-Port.prototype.hasConnection = function(link) {
-  return this._connections && this._connections.indexOf(link) >= 0;
-};
-Port.prototype.hasConnections = function() {
-  return this._connections.length > 0;
-};
+  }, {
+    key: 'free',
+    value: function free() {
+      var persist = this.getOption('persist');
+      if (persist) {
+        // persist, chi, hmz, seeze to exist.
+        // but wouldn't matter much, with peristent ports.
+        // TODO: this.filled is not used anymore.
 
-Port.prototype.getConnections = function() {
-  return this._connections;
-};
-
-// this seems to be a wrong check?
-// ah no, no property means not filled.
-// but this is just wrong. array port for example is not filled, if it's set.
-// it's being taken care of, but only causes more code to be necessary
-Port.prototype.isFilled = function() {
-  return this.input !== undefined;
-};
-
-Port.prototype.clearInput = function() {
-  this.input = undefined;
-};
-
-Port.prototype.isAvailable = function() {
-};
-
-// Node freePort
-Port.prototype.free = function() {
-
-  var persist = this.getOption('persist');
-  if (persist) {
-    // persist, chi, hmz, seeze to exist.
-    // but wouldn't matter much, with peristent ports.
-    // TODO: this.filled is not used anymore.
-
-    // indexes are persisted per index.
-    if (Array.isArray(persist)) {
-      for (var k in this.input) {
-        if (persist.indexOf(k) === -1) {
-          // remove
-          delete this.input[k];
+        // indexes are persisted per index.
+        if (Array.isArray(persist)) {
+          for (var k in this.input) {
+            if (persist.indexOf(k) === -1) {
+              // remove
+              delete this.input[k];
+            }
+          }
         }
+      } else {
+        // not sure, activeConnections could stay a node thing.
+
+        // this also removes context and default..
+        this.clearInput();
+
+        this.event(':freePort', {
+          node: this.export(),
+          link: this._activeConnections,
+          port: this.name
+        });
+
+        this.emit('freePort', {
+          node: this.export(),
+          link: this._activeConnections,
+          port: this.name
+        });
+
+        // delete reference to active connection (if there was one)
+        delete this._activeConnections;
+      }
+    }
+  }, {
+    key: 'getOption',
+    value: function getOption(opt) {
+      if (this.hasOwnProperty(opt)) {
+        return this[opt];
+      } else {
+        return undefined;
       }
     }
 
-  } else {
+    /**
+     *
+     * Sets an input port option.
+     *
+     * The node schema for instance can specifiy whether a port is persistent.
+     *
+     * At the moment a connection can override these values.
+     * It's a way of saying I give you this once so take care of it.
+     *
+     */
 
-    // not sure, activeConnections could stay a node thing.
-
-    // this also removes context and default..
-    this.clearInput();
-
-    this.event(':freePort', {
-      node: this.export(),
-      link: this._activeConnections,
-      port: this.name
-    });
-
-    this.emit('freePort', {
-      node: this.export(),
-      link: this._activeConnections,
-      port: this.name
-    });
-
-    // delete reference to active connection (if there was one)
-    delete this._activeConnections;
-  }
-
-};
-
-//Node.prototype.getPortOption = function(type, name, opt) {
-
-// could become this.setting[opt], but that will change things too much
-Port.prototype.getOption = function(opt) {
-  if (this.hasOwnProperty(opt)) {
-    return this[opt];
-  } else {
-    return undefined;
-  }
-};
-
-/**
- *
- * Sets an input port option.
- *
- * The node schema for instance can specifiy whether a port is persistent.
- *
- * At the moment a connection can override these values.
- * It's a way of saying I give you this once so take care of it.
- *
- */
-//Node.prototype.setPortOption = function(type, name, opt, value) {
-Port.prototype.setOption = function(opt, value) {
-  this[opt] = value;
-};
-
-//Node.prototype.setPortOptions = function(type, options) {
-Port.prototype.setOptions = function(options) {
-  var opt;
-  var port;
-  for (port in options) {
-    if (options.hasOwnProperty(port)) {
-      for (opt in options[port]) {
-        if (options[port].hasOwnProperty(opt)) {
-          if (options.hasOwnProperty(opt)) {
-            this.setOption(opt, options[opt]);
+  }, {
+    key: 'setOption',
+    value: function setOption(opt, value) {
+      this[opt] = value;
+    }
+  }, {
+    key: 'setOptions',
+    value: function setOptions(options) {
+      var opt;
+      var port;
+      for (port in options) {
+        if (options.hasOwnProperty(port)) {
+          for (opt in options[port]) {
+            if (options[port].hasOwnProperty(opt)) {
+              if (options.hasOwnProperty(opt)) {
+                this.setOption(opt, options[opt]);
+              }
+            }
           }
         }
       }
     }
-  }
-};
+  }]);
+
+  return Port;
+})();
+
+// requeue
+
+Port.INPUT_REVOKED = false; // removed by a portbox
+Port.NOT_FILLED = false; // ??
+
+// used in input port available
+Port.AVAILABLE = true; // non index port was set
+Port.UNAVAILABLE = false; // not an index port but input is already set
+Port.INDEX_AVAILABLE = true; // index was set
+Port.INDEX_NOT_AVAILABLE = false; // index already filled
+// could be the same as index not available,
+// this just tells it's full and will be processed
+Port.ARRAY_PORT_FULL = false;
+
+// index was set, but waiting others to be filled
+Port.AWAITING_INDEX = true;
+
+// this is a weird return code,
+// because it's probably not about the filled port itself
+Port.CONTEXT_SET = true;
+Port.PERSISTED_SET = true; // idem
+Port.DEFAULT_SET = true; // idem
+Port.NOT_REQUIRED = true; // idem
+Port.FILLED = true; // port was filled.
 
 module.exports = Port;
+//# sourceMappingURL=port.js.map
 
-},{}],31:[function(require,module,exports){
+},{}],33:[function(require,module,exports){
 'use strict';
 
 var Port = require('../port');
 var util = require('util');
 var Packet = require('../packet');
 
-var portFill;
+var portFill = undefined;
 
 module.exports = portFill = exports;
 
@@ -11705,56 +11108,39 @@ module.exports = portFill = exports;
  * @param {Object} context Context
  * @param {Object} persist Input to be persisted
  **/
-exports.fill = function(node) {
-
-  var ret;
-
+exports.fill = function fill(node) {
   var ports = node.ports.input;
   // For every non-connceted port fill the defaults
+
   for (var port in ports) {
     if (ports.hasOwnProperty(port)) {
-      if (node.portHasConnections(port) &&
-        !node.persist.hasOwnProperty(port)) {
+      if (node.portHasConnections(port) && !node.persist.hasOwnProperty(port)) {
         // mainly to not fill async ports with connects
         // but do have defaults
         // nop
       } else {
-
-        // seems the return is not correct no more also.
-        ret = portFill.defaulter(
-          node,
-          port,
-          []
-        );
-        if (util.isError(ret)) {
-          return ret;
+          // seems the return is not correct no more also.
+          var ret = portFill.defaulter(node, port, []);
+          if (util.isError(ret)) {
+            return ret;
+          }
         }
-      }
     }
   }
 
   return true;
-
 };
 
 // also fill the defaults one level deep..
 /**
  *
- * @param {string} port
+ * @param {xNode} node
+ * @param {String} port
+ * @param {String} path
  * @private
  */
-exports.defaulter = function(node, port, path) {
-
-  if (!portFill.check(
-      node,
-      node.ports.input,
-      port,
-      node.input,
-      node.context,
-      node.persist,
-      path
-    ) && !node.ports.input[port].async) {
-
+exports.defaulter = function defaulter(node, port, path) {
+  if (!portFill.check(node, node.ports.input, port, node.input, node.context, node.persist, path) && !node.ports.input[port].async) {
     if (port[0] !== ':') {
       return Port.SYNC_PORTS_UNFULFILLED;
       /*
@@ -11776,19 +11162,16 @@ exports.defaulter = function(node, port, path) {
  * Note how context and persist make no sense here...
  * It's already filled.
  *
- * @param node Node
+ * @param {xNode} node Node
  * @param {Object} def Current object schema
  * @param {Object} input the input to be filled
- * @param {Object} context Current level context
- * @param {Object} persist Current level persist
  * @param {String} port The port
  */
-exports.checkProperties = function(node, def, input, port) {
-  var ret;
+exports.checkProperties = function checkProperties(node, def, input, port) {
   for (var prop in def.properties) {
     if (def.properties.hasOwnProperty(prop)) {
-      var property =  def.properties[prop];
-        // check the existance of default (a value of null is also valid)
+      var property = def.properties[prop];
+      // check the existance of default (a value of null is also valid)
       if (!input.hasOwnProperty(prop)) {
         if (property.hasOwnProperty('default')) {
           input[prop] = property.default;
@@ -11797,25 +11180,20 @@ exports.checkProperties = function(node, def, input, port) {
           // input[key] = null; // undefined not possible at this level.
           input[prop] = undefined; // undefined not possible at this level.
         } else {
-
-          if (property.type === 'object') {
-            if (property.hasOwnProperty('properties')) {
-              if (!input.hasOwnProperty(prop)) {
-                // always fill with empty object?
-                input[prop] = {};
+            if (property.type === 'object') {
+              if (property.hasOwnProperty('properties')) {
+                if (!input.hasOwnProperty(prop)) {
+                  // always fill with empty object?
+                  input[prop] = {};
+                }
+                return this.checkProperties(node, property, input[prop], port);
               }
-              return this.checkProperties(node, property, input[prop], port);
             }
+            // fail check
+            // return or throw?
+            // return throw Error(util.format(
+            throw Error(util.format('%s: Cannot determine input for port `%s`', node.identifier, port));
           }
-          // fail check
-          // return or throw?
-          // return throw Error(util.format(
-          throw Error(util.format(
-            '%s: Cannot determine input for port `%s`',
-            node.identifier,
-            port
-          ));
-        }
       }
     }
   }
@@ -11824,20 +11202,18 @@ exports.checkProperties = function(node, def, input, port) {
 // first level
 /**
  *
- * @param node Node
+ * @param {xNode} node Node
  * @param {Object} def Current object schema
  * @param {String} port Port
  * @param {Object} input the input to be filled
  * @param {Object} context Current level context
  * @param {Object} persist Current level persist
  */
-exports.check = function(node, def, port, input, context, persist) {
-
-  var ret;
+exports.check = function check(node, def, port, input, context, persist) {
+  var ret = undefined;
 
   // check whether input was defined for this port
   if (!input.hasOwnProperty(port)) {
-
     // This will not really work for persisted indexes
     // or at least it should check whether the array is full after
     // this fill
@@ -11851,25 +11227,18 @@ exports.check = function(node, def, port, input, context, persist) {
       ret = Port.CONTEXT_SET;
       // check the existance of default (a value of null is also valid)
     } else if (def[port].hasOwnProperty('default')) {
-      input[port] = new Packet(
-        node,
-        def[port].default,
-        node.getPortType(port)
-      );
-      ret = Port.DEFAULT_SET;
-    } else if (def[port].required === false) {
-      // filled with packet, but the value is undefined.
-      input[port] = new Packet(
-        node,
-        undefined,
-        node.getPortType(port)
-      );
-      ret = Port.NOT_REQUIRED;
-    }
+        input[port] = new Packet(node, def[port].default, node.getPortType('input', port));
+        ret = Port.DEFAULT_SET;
+      } else if (def[port].required === false) {
+        // filled with packet, but the value is undefined.
+        input[port] = new Packet(node, undefined, node.getPortType('input', port));
+        ret = Port.NOT_REQUIRED;
+      }
 
     // if it's an object, fill in defaults
-    if (def[port].properties) { //
-      var init;
+    if (def[port].properties) {
+      //
+      var init = undefined;
       var obj = {};
 
       // initialize packet on the first level
@@ -11890,44 +11259,44 @@ exports.check = function(node, def, port, input, context, persist) {
       } else {
         ret = Port.FILLED;
       }
-
     }
 
     return ret;
-
-  }
-  else {
+  } else {
     return Port.FILLED;
   }
-
 };
+//# sourceMappingURL=filler.js.map
 
-},{"../packet":29,"../port":30,"util":16}],32:[function(require,module,exports){
+},{"../packet":31,"../port":32,"util":6}],34:[function(require,module,exports){
 (function (process){
 'use strict';
 
-var util = require('util');
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _typeof(obj) { return obj && typeof Symbol !== "undefined" && obj.constructor === Symbol ? "symbol" : typeof obj; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
 var uuid = require('uuid').v4;
 var EventEmitter = require('events').EventEmitter;
 
 var onExit = [];
-if (process.on) { // old browserify
+if (process.on) {
+  // old browserify
   process.on('exit', function onExitHandlerProcessManager() {
-    onExit.forEach(function(instance) {
-
-      var key;
-      var process;
-      var report;
+    onExit.forEach(function (instance) {
       var reports = {};
 
-      for (key in instance.processes) {
-        if (instance.processes.hasOwnProperty(key)) {
-          process = instance.processes[key];
-          if (process.type === 'flow') {
-            report = process.report();
-            if (!report.ok) {
-              reports[key] = report;
-            }
+      for (var _process in instance.processes.values()) {
+        if (_process.type === 'flow') {
+          var report = _process.report();
+          if (!report.ok) {
+            reports[_process] = report;
           }
         }
       }
@@ -11935,7 +11304,6 @@ if (process.on) { // old browserify
       if (Object.keys(reports).length) {
         instance.emit('report', reports);
       }
-
     });
   });
 }
@@ -11948,292 +11316,342 @@ if (process.on) { // old browserify
  * @public
  *
  */
-function ProcessManager() {
 
-  this.processes = {};
+var ProcessManager = (function (_EventEmitter) {
+  _inherits(ProcessManager, _EventEmitter);
 
-  onExit.push(this);
+  function ProcessManager() {
+    _classCallCheck(this, ProcessManager);
 
-}
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(ProcessManager).call(this));
 
-util.inherits(ProcessManager, EventEmitter);
+    _this.processes = new Map();
+    onExit.push(_this);
+    return _this;
+  }
 
-ProcessManager.prototype.getMainGraph = function() {
-  return this.getMainGraphs().pop();
-};
-
-ProcessManager.prototype.getMainGraphs = function() {
-
-  var main = [];
-  var key;
-  var p;
-
-  for (key in this.processes) {
-    if (this.processes.hasOwnProperty(key)) {
-      p = this.processes[key];
-      if (p.type === 'flow' && !p.hasParent()) {
-        main.push(p);
-      }
+  _createClass(ProcessManager, [{
+    key: 'getMainGraph',
+    value: function getMainGraph() {
+      return this.getMainGraphs().pop();
     }
-  }
+  }, {
+    key: 'getMainGraphs',
+    value: function getMainGraphs() {
+      var main = [];
+      var _iteratorNormalCompletion = true;
+      var _didIteratorError = false;
+      var _iteratorError = undefined;
 
-  return main;
+      try {
+        for (var _iterator = this.processes.values()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+          var _process2 = _step.value;
 
-};
-
-ProcessManager.prototype.onProcessStartHandler = function(event) {
-  this.emit('startProcess', event.node);
-};
-ProcessManager.prototype.onProcessStopHandler = function(event) {
-  this.emit('stopProcess', event.node);
-};
-ProcessManager.prototype.register = function(node) {
-
-  if (node.pid) {
-    throw new Error('Refusing to add node with existing process id');
-  }
-
-  var pid = uuid();
-  node.setPid(pid);
-  this.processes[pid] = node;
-
-  // Note: at the moment only subgraphs emit the start event.
-  // and only subgraphs can be stopped, this is good I think.
-  // The process manager itself holds *all* nodes.
-  // Start is a push on the actor.
-  // However, when we start a network we only care about
-  // the push on the main actor, not the subgraphs.
-  // So this is something to think about when you listen
-  // for startProcess.
-  // Maybe for single stop and start of nodes the actor should be used
-  // and the actor emits the stop & start events, with the node info
-  // To stop a node: this.get(graphId).hold(nodeId);
-  // Ok you just do not stop single nodes, you hold them.
-  // Stop a node and your network is borked.
-  this.processes[pid].on('start', this.onProcessStartHandler.bind(this));
-  this.processes[pid].on('stop', this.onProcessStopHandler.bind(this));
-
-  // Process manager handles all errors.
-  // or in fact, ok we have to add a errorHandler ourselfes also
-  // but the process manager will be able to do maintainance?
-  node.on('error', this.processErrorHandler.bind(this));
-
-  // pid is in node.pid
-  this.emit('addProcess', node);
-
-};
-
-/**
- *
- * Process Error Handler.
- *
- * The only errors we receive come from the nodes themselves.
- * It's also garanteed if we receive an error the process itself
- * Is already within an error state.
- *
- */
-ProcessManager.prototype.processErrorHandler = function(event) {
-
-  if (event.node.status !== 'error') {
-    console.log('STATUS', event.node.status);
-    throw Error('Process is not within error state', event.node.status);
-  }
-
-  // Emit it, humans must solve this.
-  this.emit('error', event);
-
-};
-
-ProcessManager.prototype.changePid = function(from, to) {
-
-  if (this.processes.hasOwnProperty(from)) {
-    this.processes[to] = this.processes[from];
-    delete this.processes[from];
-  }
-  else {
-    throw Error('Process id not found');
-  }
-
-  this.emit('changePid', {
-    from: from,
-    to: to
-  });
-
-};
-
-// TODO: improve start, stop, hold, release logic..
-ProcessManager.prototype.start = function(node) {
-
-  // allow by pid and by node object
-  var pid = typeof node === 'object' ? node.pid : node;
-
-  if (this.processes.hasOwnProperty(pid)) {
-    if (this.processes[pid].type === 'flow') {
-      this.processes[pid].start();
-    }
-    else {
-      this.processes[pid].release();
-    }
-  }
-  else {
-    throw Error('Process id not found');
-  }
-};
-
-ProcessManager.prototype.stop = function(node, cb) {
-
-  // allow by pid and by node object
-  var pid = typeof node === 'object' ? node.pid : node;
-
-  if (this.processes.hasOwnProperty(pid)) {
-    if (this.processes[pid].type === 'flow') {
-      this.processes[pid].stop(cb);
-    }
-    else {
-      this.processes[pid].hold(cb);
-    }
-  }
-  else {
-    throw Error('Process id not found');
-  }
-};
-
-// TODO: just deleting is not enough.
-// links also contains the pids
-// on remove process those links should also be removed.
-ProcessManager.prototype.unregister = function(node, cb) {
-
-  var self = this;
-
-  if (!node.pid) {
-    throw new Error('Process id not found');
-  }
-
-  function onUnregister(node, cb) {
-
-    /*
-    node.removeListener('start', self.onProcessStartHandler);
-    node.removeListener('stop', self.onProcessStopHandler);
-    node.removeListener('error', self.processErrorHandler);
-    */
-
-    node.removeAllListeners('start');
-    node.removeAllListeners('stop');
-    node.removeAllListeners('error');
-
-    delete self.processes[node.pid];
-
-    // remove pid
-    delete node.pid;
-
-    // todo maybe normal nodes should also use stop + cb?
-    if (cb) {
-      cb(node);
-    }
-
-    self.emit('removeProcess', node);
-
-  }
-
-  if (this.processes[node.pid].type === 'flow') {
-
-    // wait for `subnet` to be finished
-    self.stop(node, onUnregister.bind(this, node, cb));
-
-  }
-  else {
-
-    node.shutdown(onUnregister.bind(this, node, cb));
-
-  }
-
-};
-
-/**
- *
- * Get Process
- * Either by id or it's pid.
- *
- */
-ProcessManager.prototype.get = function(pid) {
-
-  return this.processes[pid];
-
-};
-
-/**
- *
- * Using the same subgraph id for processes can work for a while.
- *
- * This method makes it possible to find graphs by id.
- *
- * Will throw an error if there is a process id conflict.
- *
- * If a containing actor is passed as second parameter
- * the uniqueness of the node is garanteed.
- *
- */
-ProcessManager.prototype.getById = function(id, actor) {
-  return this.findBy('id', id, actor);
-};
-
-ProcessManager.prototype.findBy = function(prop, value, actor) {
-  var found;
-  var process;
-  var node;
-  for (process in this.processes) {
-    if (this.processes.hasOwnProperty(process)) {
-      node = this.processes[process];
-      if (node[prop] === value &&
-        (!actor || actor.hasNode(node.id))) {
-        if (found) {
-          console.log(this.processes);
-          throw Error(
-            'conflict: multiple ' + prop + 's matching ' + value
-          );
+          if (_process2.type === 'flow' && !_process2.hasParent()) {
+            main.push(_process2);
+          }
         }
-        found = node;
+      } catch (err) {
+        _didIteratorError = true;
+        _iteratorError = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion && _iterator.return) {
+            _iterator.return();
+          }
+        } finally {
+          if (_didIteratorError) {
+            throw _iteratorError;
+          }
+        }
+      }
+
+      return main;
+    }
+  }, {
+    key: 'onProcessStartHandler',
+    value: function onProcessStartHandler(event) {
+      this.emit('startProcess', event.node);
+    }
+  }, {
+    key: 'onProcessStopHandler',
+    value: function onProcessStopHandler(event) {
+      this.emit('stopProcess', event.node);
+    }
+  }, {
+    key: 'register',
+    value: function register(node) {
+      if (node.pid) {
+        throw new Error('Refusing to add node with existing process id');
+      }
+
+      var pid = uuid();
+      node.setPid(pid);
+      this.processes.set(pid, node);
+
+      // Note: at the moment only subgraphs emit the start event.
+      // and only subgraphs can be stopped, this is good I think.
+      // The process manager itself holds *all* nodes.
+      // Start is a push on the actor.
+      // However, when we start a network we only care about
+      // the push on the main actor, not the subgraphs.
+      // So this is something to think about when you listen
+      // for startProcess.
+      // Maybe for single stop and start of nodes the actor should be used
+      // and the actor emits the stop & start events, with the node info
+      // To stop a node: this.get(graphId).hold(nodeId);
+      // Ok you just do not stop single nodes, you hold them.
+      // Stop a node and your network is borked.
+      node.on('start', this.onProcessStartHandler.bind(this));
+      node.on('stop', this.onProcessStopHandler.bind(this));
+
+      // Process manager handles all errors.
+      // or in fact, ok we have to add a errorHandler ourselfes also
+      // but the process manager will be able to do maintainance?
+      node.on('error', this.processErrorHandler.bind(this));
+
+      // pid is in node.pid
+      this.emit('addProcess', node);
+    }
+
+    /**
+     *
+     * Process Error Handler.
+     *
+     * The only errors we receive come from the nodes themselves.
+     * It's also garanteed if we receive an error the process itself
+     * Is already within an error state.
+     *
+     */
+
+  }, {
+    key: 'processErrorHandler',
+    value: function processErrorHandler(event) {
+      if (event.node.status !== 'error') {
+        console.log('STATUS', event.node.status);
+        throw Error('Process is not within error state', event.node.status);
+      }
+
+      // Emit it, humans must solve this.
+      this.emit('error', event);
+    }
+  }, {
+    key: 'changePid',
+    value: function changePid(from, to) {
+      if (this.processes.has(from)) {
+        this.processes.set(to, this.processes.get(from));
+        this.processes.delete(from);
+      } else {
+        throw Error('Process id not found');
+      }
+
+      this.emit('changePid', {
+        from: from,
+        to: to
+      });
+    }
+  }, {
+    key: 'getProcess',
+    value: function getProcess(pid) {
+      if (this.processes.has(pid)) {
+        return this.processes.get(pid);
+      }
+      throw Error('Process id not found');
+    }
+
+    // TODO: improve start, stop, hold, release logic..
+
+  }, {
+    key: 'start',
+    value: function start(node) {
+      // allow by pid and by node object
+      var pid = (typeof node === 'undefined' ? 'undefined' : _typeof(node)) === 'object' ? node.pid : node;
+      var process = this.getProcess(pid);
+      if (process.type === 'flow') {
+        process.start();
+      } else {
+        process.release();
       }
     }
-  }
-  return found;
-};
+  }, {
+    key: 'stop',
+    value: function stop(node, cb) {
+      // allow by pid and by node object
+      var pid = (typeof node === 'undefined' ? 'undefined' : _typeof(node)) === 'object' ? node.pid : node;
 
-ProcessManager.prototype.filterByStatus = function(status) {
-  return this.filterBy('status', status);
-};
-
-ProcessManager.prototype.filterBy = function(prop, value) {
-
-  var id;
-  var filtered = [];
-
-  for (id in this.processes) {
-    if (this.processes.hasOwnProperty(id)) {
-      if (this.processes[id][prop] === value) {
-        filtered.push(this.processes[id]);
+      var process = this.getProcess(pid);
+      if (process.type === 'flow') {
+        process.stop(cb);
+      } else {
+        process.hold(cb);
       }
     }
-  }
 
-  return filtered;
+    // TODO: just deleting is not enough.
+    // links also contains the pids
+    // on remove process those links should also be removed.
 
-};
+  }, {
+    key: 'unregister',
+    value: function unregister(node, cb) {
+      if (!node.pid) {
+        throw new Error('Process id not found');
+      }
+
+      var _onUnregister = (function onUnregister(node, cb) {
+        node.removeAllListeners('start');
+        node.removeAllListeners('stop');
+        node.removeAllListeners('error');
+
+        this.processes.delete(node.pid);
+
+        // remove pid
+        delete node.pid;
+
+        // todo maybe normal nodes should also use stop + cb?
+        if (cb) {
+          cb(node);
+        }
+
+        this.emit('removeProcess', node);
+      }).bind(this, node, cb);
+
+      var process = this.getProcess(node.pid);
+
+      if (process.type === 'flow') {
+        // wait for `subgraph` to be finished
+        this.stop(node, _onUnregister);
+      } else {
+        node.shutdown(_onUnregister);
+      }
+    }
+
+    /**
+     *
+     * Get Process
+     * Either by id or it's pid.
+     *
+     */
+
+  }, {
+    key: 'get',
+    value: function get(pid) {
+      return this.processes.get(pid);
+    }
+
+    /**
+     *
+     * Using the same subgraph id for processes can work for a while.
+     *
+     * This method makes it possible to find graphs by id.
+     *
+     * Will throw an error if there is a process id conflict.
+     *
+     * If a containing actor is passed as second parameter
+     * the uniqueness of the node is garanteed.
+     *
+     */
+
+  }, {
+    key: 'getById',
+    value: function getById(id, actor) {
+      return this.findBy('id', id, actor);
+    }
+  }, {
+    key: 'findBy',
+    value: function findBy(prop, value, actor) {
+      var found = undefined;
+      var _iteratorNormalCompletion2 = true;
+      var _didIteratorError2 = false;
+      var _iteratorError2 = undefined;
+
+      try {
+        for (var _iterator2 = this.processes.values()[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+          var _process3 = _step2.value;
+
+          if (_process3[prop] === value && (!actor || actor.hasNode(_process3.id))) {
+            if (found) {
+              console.log(this.processes);
+              throw Error('conflict: multiple ' + prop + 's matching ' + value);
+            }
+            found = _process3;
+          }
+        }
+      } catch (err) {
+        _didIteratorError2 = true;
+        _iteratorError2 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion2 && _iterator2.return) {
+            _iterator2.return();
+          }
+        } finally {
+          if (_didIteratorError2) {
+            throw _iteratorError2;
+          }
+        }
+      }
+
+      return found;
+    }
+  }, {
+    key: 'filterByStatus',
+    value: function filterByStatus(status) {
+      return this.filterBy('status', status);
+    }
+  }, {
+    key: 'filterBy',
+    value: function filterBy(prop, value) {
+      var filtered = [];
+
+      var _iteratorNormalCompletion3 = true;
+      var _didIteratorError3 = false;
+      var _iteratorError3 = undefined;
+
+      try {
+        for (var _iterator3 = this.processes.values()[Symbol.iterator](), _step3; !(_iteratorNormalCompletion3 = (_step3 = _iterator3.next()).done); _iteratorNormalCompletion3 = true) {
+          var _process4 = _step3.value;
+
+          if (_process4[prop] === value) {
+            filtered.push(_process4);
+          }
+        }
+      } catch (err) {
+        _didIteratorError3 = true;
+        _iteratorError3 = err;
+      } finally {
+        try {
+          if (!_iteratorNormalCompletion3 && _iterator3.return) {
+            _iterator3.return();
+          }
+        } finally {
+          if (_didIteratorError3) {
+            throw _iteratorError3;
+          }
+        }
+      }
+
+      return filtered;
+    }
+  }]);
+
+  return ProcessManager;
+})(EventEmitter);
 
 module.exports = ProcessManager;
+//# sourceMappingURL=defaultManager.js.map
 
-}).call(this,require("uojqOp"))
-},{"events":11,"uojqOp":14,"util":16,"uuid":62}],33:[function(require,module,exports){
+}).call(this,require("z02cDi"))
+},{"events":1,"uuid":61,"z02cDi":4}],35:[function(require,module,exports){
 'use strict';
 
-var util = require('util');
-var debug = require('debug')('chix:queue');
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
 
-function Queue() {
-  this.lock = false;
-  this.queue = [];
-  this.pounders = 0;
-}
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var format = require('util').format;
+var debug = require('debug')('chix:queue');
+var Queue = require('./queue');
 
 /**
  *
@@ -12243,349 +11661,371 @@ function Queue() {
  * @public
  *
  */
-function QueueManager(dataHandler) {
 
-  this.queues = {};
-  this._shutdown = false;
+var QueueManager = (function () {
+  function QueueManager(dataHandler) {
+    _classCallCheck(this, QueueManager);
 
-  this.locks = {}; /* node locks */
+    this.queues = {};
+    this._shutdown = false;
 
-  this.pounders = 0; /* cumulative count */
+    this.locks = {}; /* node locks */
 
-  Object.defineProperty(this, 'inQueue', {
-    enumerable: true,
-    get: function() {
-      // snapshot of queueLength
-      var id;
-      var inQ = 0;
-      for (id in this.queues) {
+    this.pounders = 0; /* cumulative count */
+
+    Object.defineProperty(this, 'inQueue', {
+      enumerable: true,
+      get: function get() {
+        // snapshot of queueLength
+        var inQ = 0;
+        for (var id in this.queues) {
+          if (this.queues.hasOwnProperty(id)) {
+            inQ += this.queues[id].queue.length;
+          }
+        }
+        return inQ;
+      }
+    });
+
+    this.onData(dataHandler);
+  }
+
+  _createClass(QueueManager, [{
+    key: 'onData',
+    value: function onData(handler) {
+      this.sendData = handler;
+    }
+  }, {
+    key: 'pounder',
+    value: function pounder() {
+      var self = this.self;
+      if (!self.queues.hasOwnProperty(this.id)) {
+        throw Error('Unclean shutdown: Pounding on non-exist substance');
+      }
+
+      var queue = self.queues[this.id];
+      queue.pounders--;
+      self.pounders--;
+
+      var inQueue = queue.queue.length;
+      if (inQueue === 0) {
+        throw Error('nothing in queue this should not happen!');
+      }
+
+      var p = self.pick(this.id);
+
+      if (self._shutdown) {
+        self.drop('queued', this.id, p);
+      } else if (self.isLocked(this.id)) {
+        self.unshift(this.id, p);
+      }
+
+      debug('%s:%s.%s send data', this.id, p.nr, p.c);
+      self.sendData(this.id, p);
+    }
+  }, {
+    key: 'getQueue',
+    value: function getQueue(id) {
+      if (this.queues.hasOwnProperty(id)) {
+        return this.queues[id];
+      }
+
+      throw Error(format('queue id: `%s` is unmanaged', id));
+    }
+  }, {
+    key: 'pound',
+    value: function pound(id) {
+      if (!id) {
+        throw Error('no id!');
+      }
+
+      this.getQueue(id).pounders++;
+      this.pounders++;
+
+      setTimeout(this.pounder.bind({
+        id: id,
+        self: this
+      }), 0);
+    }
+  }, {
+    key: 'get',
+    value: function get(id) {
+      return this.getQueue(id).queue;
+    }
+
+    /**
+     *
+     * Queue data for the link given
+     *
+     * @param {string} id
+     * @param {Packet} p
+     * @public
+     */
+
+  }, {
+    key: 'queue',
+    value: function queue(id, p) {
+      if (p.constructor.name !== 'Packet') {
+        throw Error('not an instance of Packet');
+      }
+
+      if (this._shutdown) {
+        this.drop('queue', id, p);
+      } else {
+        this.init(id);
+        this.getQueue(id).queue.push(p);
+
+        // as many pounds as there are items within queue.
+        // the callback is just picking the last item not per se
+        // the item we have just put within queue.
+        this.pound(id);
+      }
+    }
+  }, {
+    key: 'init',
+    value: function init(id) {
+      if (!this.queues.hasOwnProperty(id)) {
+        this.queues[id] = new Queue();
+      }
+    }
+  }, {
+    key: 'unshift',
+    value: function unshift(id, p) {
+      this.getQueue(id).queue.unshift(p);
+    }
+
+    /**
+     *
+     * Pick an item from the queue.
+     *
+     * @param {id} id
+     * @public
+     */
+
+  }, {
+    key: 'pick',
+    value: function pick(id) {
+      if (this.hasQueue(id)) {
+        return this.queues[id].queue.shift();
+      }
+    }
+
+    /**
+     *
+     * Determine whether there is a queue for this link.
+     *
+     * @param {string} id
+     * @public
+     */
+
+  }, {
+    key: 'hasQueue',
+    value: function hasQueue(id) {
+      return this.queues[id] && this.queues[id].queue.length > 0;
+    }
+  }, {
+    key: 'isManaged',
+    value: function isManaged(id) {
+      return this.queues.hasOwnProperty(id);
+    }
+  }, {
+    key: 'size',
+    value: function size(id) {
+      return this.getQueue(id).queue.length;
+    }
+
+    /**
+     *
+     * Reset this queue manager
+     *
+     * @public
+     */
+
+  }, {
+    key: 'reset',
+    value: function reset(cb) {
+      var self = this;
+      var retries = 10;
+
+      this._shutdown = true;
+
+      // all unlocked
+      this.unlockAll();
+
+      var countdown = retries;
+
+      var func = function ShutdownQueManager() {
+        if (countdown === 0) {
+          debug('Failed to stop queue after %s cycles', retries);
+        }
+
+        if (self.inQueue === 0 || countdown === 0) {
+          self.queues = {};
+
+          self._shutdown = false;
+
+          if (cb) {
+            cb();
+          }
+        } else {
+          countdown--;
+          setTimeout(func, 0);
+        }
+      };
+
+      // put ourselves at the back of all unlocks.
+      setTimeout(func, 0);
+    }
+  }, {
+    key: 'isLocked',
+    value: function isLocked(id) {
+      // means whether it has queue length..
+      if (!this.isManaged(id)) {
+        return false;
+      }
+      return this.getQueue(id).lock;
+    }
+  }, {
+    key: 'lock',
+    value: function lock(id) {
+      debug('%s: lock', id);
+      this.init(id);
+      this.getQueue(id).lock = true;
+    }
+  }, {
+    key: 'flushAll',
+    value: function flushAll() {
+      debug('flush all');
+      for (var id in this.queues) {
         if (this.queues.hasOwnProperty(id)) {
-          inQ += this.queues[id].queue.length;
+          this.flush(id);
         }
       }
-      return inQ;
     }
-  });
-
-  this.onData(dataHandler);
-}
-
-QueueManager.prototype.onData = function(handler) {
-  this.sendData = handler;
-};
-
-QueueManager.prototype.pounder = function() {
-
-  var self = this.self;
-  if (!self.queues.hasOwnProperty(this.id)) {
-    throw Error('Unclean shutdown: Pounding on non-exist substance');
-  }
-
-  var queue = self.queues[this.id];
-  queue.pounders--;
-  self.pounders--;
-
-  var inQueue = queue.queue.length;
-  if (inQueue === 0) {
-    throw Error('nothing in queue this should not happen!');
-  }
-
-  var p = self.pick(this.id);
-
-  if (self._shutdown) {
-
-    self.drop('queued', this.id, p);
-
-  }
-  else if (self.isLocked(this.id)) {
-    self.unshift(this.id, p);
-
-  }
-  else {
-    debug('%s:%s.%s send data', this.id, p.nr, p.c);
-    self.sendData(this.id, p);
-  }
-
-};
-
-QueueManager.prototype.getQueue = function(id) {
-
-  if (this.queues.hasOwnProperty(id)) {
-    return this.queues[id];
-  }
-
-  throw Error(util.format('queue id: `%s` is unmanaged', id));
-
-};
-
-QueueManager.prototype.pound = function(id) {
-
-  if (!id) {
-    throw Error('no id!');
-  }
-
-  this.getQueue(id).pounders++;
-  this.pounders++;
-
-  setTimeout(
-    this.pounder.bind({
-      id: id,
-      self: this
-    }), 0
-  );
-
-};
-
-QueueManager.prototype.get = function(id) {
-  return this.getQueue(id).queue;
-};
-
-/**
- *
- * Queue data for the link given
- *
- * @param {string} id
- * @param {Packet} p
- * @public
- */
-QueueManager.prototype.queue = function(id, p) {
-
-  if (p.constructor.name !== 'Packet') {
-    throw Error('not an instance of Packet');
-  }
-
-  if (this._shutdown) {
-    this.drop('queue', id, p);
-  }
-  else {
-
-    this.init(id);
-    this.getQueue(id).queue.push(p);
-
-    // as many pounds as there are items within queue.
-    // the callback is just picking the last item not per se
-    // the item we have just put within queue.
-    this.pound(id);
-
-  }
-
-};
-
-QueueManager.prototype.init = function(id) {
-  if (!this.queues.hasOwnProperty(id)) {
-    this.queues[id] = new Queue();
-  }
-};
-
-QueueManager.prototype.unshift = function(id, p) {
-
-  var queue = this.getQueue(id);
-  queue.queue.unshift(p);
-
-};
-
-/**
- *
- * Pick an item from the queue.
- *
- * @param {id} id
- * @public
- */
-QueueManager.prototype.pick = function(id) {
-  if (this.hasQueue(id)) {
-    return this.queues[id].queue.shift();
-  }
-};
-
-/**
- *
- * Determine whether there is a queue for this link.
- *
- * @param {string} id
- * @public
- */
-QueueManager.prototype.hasQueue = function(id) {
-  return this.queues[id] && this.queues[id].queue.length > 0;
-};
-
-QueueManager.prototype.isManaged = function(id) {
-  return this.queues.hasOwnProperty(id);
-};
-
-QueueManager.prototype.size = function(id) {
-  return this.getQueue(id).queue.length;
-};
-
-/**
- *
- * Reset this queue manager
- *
- * @public
- */
-QueueManager.prototype.reset = function(cb) {
-
-  var self = this;
-  var retries;
-  var countdown;
-
-  this._shutdown = true;
-
-  // all unlocked
-  this.unlockAll();
-
-  countdown = retries = 10; // 1000;
-
-  var func = function ShutdownQueManager() {
-
-    if (countdown === 0) {
-      debug('Failed to stop queue after %s cycles', retries);
-    }
-
-    if (self.inQueue === 0 || countdown === 0) {
-
-      self.queues = {};
-
-      self._shutdown = false;
-
-      if (cb) {
-        cb();
-      }
-
-    }
-    else {
-
-      countdown--;
-      setTimeout(func, 0);
-
-    }
-
-  };
-
-  // put ourselves at the back of all unlocks.
-  setTimeout(func, 0);
-
-};
-
-QueueManager.prototype.isLocked = function(id) {
-  // means whether it has queue length..
-  if (!this.isManaged(id)) {
-    return false;
-  }
-  var q = this.getQueue(id);
-  return q.lock;
-};
-
-QueueManager.prototype.lock = function(id) {
-  debug('%s: lock', id);
-  this.init(id);
-  var q = this.getQueue(id);
-  q.lock = true;
-
-};
-
-QueueManager.prototype.flushAll = function() {
-  debug('flush all');
-  var id;
-  for (id in this.queues) {
-    if (this.queues.hasOwnProperty(id)) {
-      this.flush(id);
-    }
-  }
-};
-
-QueueManager.prototype.purgeAll = function() {
-  debug('purge all');
-  var id;
-  for (id in this.queues) {
-    if (this.queues.hasOwnProperty(id)) {
-      this.purge(this.queues[id]);
-    }
-  }
-};
-
-QueueManager.prototype.purge = function(q) {
-  debug('%s: purge', q.id);
-  while (q.queue.length) {
-    this.drop('purge', q.queue.pop());
-  }
-};
-
-QueueManager.prototype.unlockAll = function() {
-  debug('unlock all');
-  var id;
-  for (id in this.queues) {
-    if (this.queues.hasOwnProperty(id)) {
-      this.unlock(id);
-    }
-  }
-};
-
-QueueManager.prototype.unlock = function(id) {
-  debug('%s: unlock', id);
-  if (this.isLocked(id)) {
-    this.flush(id);
-  }
-};
-
-QueueManager.prototype.flush = function(id) {
-
-  debug('%s: flush', id);
-  var i;
-  var q = this.getQueue(id);
-
-  // first determine current length
-  var currentLength = (q.queue.length - q.pounders);
-
-  q.lock = false;
-
-  for (i = 0; i < currentLength; i++) {
-    this.pound(id);
-  }
-};
-
-// not sure, maybe make only the ioHandler responsible for this?
-QueueManager.prototype.drop = function(type) {
-  debug('dropping packet: %s %s', type, this.inQueue);
-};
-
-/**
- *
- * Used to get all queues which have queues.
- * Maybe I should just remove queues.
- * But queues reappear so quickly it's not
- * worth removing it.
- *
- * Something to fix later, in that case this.queues
- * would always be queues which have items.
- *
- * Anyway for debugging it's also much easier
- * because there will not be a zillion empty queues.
- *
- * Usage:
- *
- * if (qm.inQueue()) {
- *   var queued = qm.getQueued();
- * }
- *
- */
-QueueManager.prototype.getQueues = function() {
-
-  var id;
-  var queued = {};
-  for (id in this.queues) {
-    if (this.queues.hasOwnProperty(id)) {
-      if (this.queues[id].queue.length > 0) {
-        queued[id] = this.queues[id];
+  }, {
+    key: 'purgeAll',
+    value: function purgeAll() {
+      debug('purge all');
+      for (var id in this.queues) {
+        if (this.queues.hasOwnProperty(id)) {
+          this.purge(this.queues[id]);
+        }
       }
     }
-  }
-  return queued;
-};
+  }, {
+    key: 'purge',
+    value: function purge(q) {
+      debug('%s: purge', q.id);
+      while (q.queue.length) {
+        this.drop('purge', q.queue.pop());
+      }
+    }
+  }, {
+    key: 'unlockAll',
+    value: function unlockAll() {
+      debug('unlock all');
+      for (var id in this.queues) {
+        if (this.queues.hasOwnProperty(id)) {
+          this.unlock(id);
+        }
+      }
+    }
+  }, {
+    key: 'unlock',
+    value: function unlock(id) {
+      debug('%s: unlock', id);
+      if (this.isLocked(id)) {
+        this.flush(id);
+      }
+    }
+  }, {
+    key: 'flush',
+    value: function flush(id) {
+      debug('%s: flush', id);
+      var q = this.getQueue(id);
+
+      // first determine current length
+      var currentLength = q.queue.length - q.pounders;
+
+      q.lock = false;
+
+      for (var i = 0; i < currentLength; i++) {
+        this.pound(id);
+      }
+    }
+
+    // not sure, maybe make only the ioHandler responsible for this?
+
+  }, {
+    key: 'drop',
+    value: function drop(type) {
+      debug('dropping packet: %s %s', type, this.inQueue);
+    }
+
+    /**
+     *
+     * Used to get all queues which have queues.
+     * Maybe I should just remove queues.
+     * But queues reappear so quickly it's not
+     * worth removing it.
+     *
+     * Something to fix later, in that case this.queues
+     * would always be queues which have items.
+     *
+     * Anyway for debugging it's also much easier
+     * because there will not be a zillion empty queues.
+     *
+     * Usage:
+     *
+     * if (qm.inQueue()) {
+    *   var queued = qm.getQueued();
+    * }
+     *
+     */
+
+  }, {
+    key: 'getQueues',
+    value: function getQueues() {
+      var queued = {};
+      for (var id in this.queues) {
+        if (this.queues.hasOwnProperty(id)) {
+          if (this.queues[id].queue.length > 0) {
+            queued[id] = this.queues[id];
+          }
+        }
+      }
+      return queued;
+    }
+  }]);
+
+  return QueueManager;
+})();
 
 module.exports = QueueManager;
+//# sourceMappingURL=defaultManager.js.map
 
-},{"debug":49,"util":16}],34:[function(require,module,exports){
+},{"./queue":36,"debug":"V4HZ/5","util":6}],36:[function(require,module,exports){
+"use strict";
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var Queue = function Queue() {
+  _classCallCheck(this, Queue);
+
+  this.lock = false;
+  this.queue = [];
+  this.pounders = 0;
+};
+
+module.exports = Queue;
+//# sourceMappingURL=queue.js.map
+
+},{}],37:[function(require,module,exports){
 'use strict';
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
 var DefaultContextProvider = require('./context/defaultProvider');
 
@@ -12597,118 +12037,135 @@ var DefaultContextProvider = require('./context/defaultProvider');
  * TODO: which fails hard
  *
  */
-function Run(actor, callback) {
 
-  var iId;
+var Run = (function () {
+  function Run(actor, callback) {
+    _classCallCheck(this, Run);
 
-  this.actor = actor;
+    this.actor = actor;
 
-  // Used with callback handling
-  // Keeps track of the number of exposed output ports
-  this.outputPorts = [];
+    // Used with callback handling
+    // Keeps track of the number of exposed output ports
+    this.outputPorts = [];
 
-  // data we will give to the callback
-  this.output = {};
-  this.outputCount = 0;
+    // data we will give to the callback
+    this.output = {};
+    this.outputCount = 0;
 
-  this.callback = callback;
+    this.callback = callback;
 
-  if (!actor.contextProvider) {
-    actor.contextProvider = new DefaultContextProvider();
-  }
+    if (!actor.contextProvider) {
+      actor.contextProvider = new DefaultContextProvider();
+    }
 
-  for (iId in actor.nodes) {
-    if (actor.nodes.hasOwnProperty(iId)) {
+    var _iteratorNormalCompletion = true;
+    var _didIteratorError = false;
+    var _iteratorError = undefined;
 
-      // Als deze node in onze view zit
-      if (actor.view.indexOf(iId) >= 0) {
+    try {
+      for (var _iterator = actor.nodes.values()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+        var node = _step.value;
 
-        if (
-          this.callback &&
-          actor.nodes[iId].ports &&
-          actor.nodes[iId].ports.output
-          ) {
-
-          for (var key in actor.nodes[iId].ports.output) {
-            // this is related to actions.
-            // not sure If I want to keep that..
-            // Anyway expose is gone, so this is never
-            // called now.
-            //
-            // expose bestaat niet meer, de integrerende flow
-            // krijgt gewoon de poorten nu.
-            if (actor.nodes[iId].ports.output[key].expose) {
-              this.outputPorts.push(key);
+        // Als deze node in onze view zit
+        if (actor.view.indexOf(node.id) >= 0) {
+          if (this.callback && node.ports && node.ports.output) {
+            for (var key in node.ports.output) {
+              // this is related to actions.
+              // not sure If I want to keep that..
+              // Anyway expose is gone, so this is never
+              // called now.
+              //
+              // expose bestaat niet meer, de integrerende flow
+              // krijgt gewoon de poorten nu.
+              if (node.ports.output.hasOwnProperty(key)) {
+                if (node.ports.output[key].expose) {
+                  this.outputPorts.push(key);
+                }
+              }
             }
+
+            node.on('output', this.handleOutput.bind(this));
           }
-
-          actor.nodes[iId].on(
-            'output',
-            this.handleOutput.bind(this)
-          );
-
         }
       }
-
+    } catch (err) {
+      _didIteratorError = true;
+      _iteratorError = err;
+    } finally {
+      try {
+        if (!_iteratorNormalCompletion && _iterator.return) {
+          _iterator.return();
+        }
+      } finally {
+        if (_didIteratorError) {
+          throw _iteratorError;
+        }
+      }
     }
 
-  }
-
-  if (this.callback && !this.outputPorts.length) {
-
-    throw new Error('No exposed output ports available for callback');
-
-  }
-
-  if (actor.trigger) {
-    actor.sendIIP(actor.trigger, '');
-  }
-
-}
-
-Run.prototype.handleOutput = function(data) {
-
-  if (this.outputPorts.indexOf(data.port) >= 0) {
-
-    if (!this.output.hasOwnProperty(data.node.id)) {
-      this.output[data.node.id] = {};
+    if (this.callback && !this.outputPorts.length) {
+      throw new Error('No exposed output ports available for callback');
     }
 
-    this.output[data.node.id][data.port] = data.out;
-
-    this.outputCount++;
-
-    if (this.outputPorts.length === this.outputCount) {
-
-      this.outputCount = 0; // reset
-
-      this.callback.apply(this.actor, [this.output]);
-
-      this.output = {};
-
+    if (actor.trigger) {
+      actor.sendIIP(actor.trigger, '');
     }
-
   }
 
-};
+  _createClass(Run, [{
+    key: 'handleOutput',
+    value: function handleOutput(data) {
+      if (this.outputPorts.indexOf(data.port) >= 0) {
+        if (!this.output.hasOwnProperty(data.node.id)) {
+          this.output[data.node.id] = {};
+        }
+
+        this.output[data.node.id][data.port] = data.out;
+
+        this.outputCount++;
+
+        if (this.outputPorts.length === this.outputCount) {
+          this.outputCount = 0; // reset
+
+          this.callback.apply(this.actor, [this.output]);
+
+          this.output = {};
+        }
+      }
+    }
+  }]);
+
+  return Run;
+})();
 
 module.exports = Run;
+//# sourceMappingURL=run.js.map
 
-},{"./context/defaultProvider":20}],35:[function(require,module,exports){
+},{"./context/defaultProvider":21}],38:[function(require,module,exports){
 (function (process,global){
-'use strict';
+'use strict'
+
+/* global window */
+
+;
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+var _get = function get(object, property, receiver) { if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { return get(parent, property, receiver); } } else if ("value" in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } };
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
 
 var IOBox = require('iobox');
-var util = require('util');
 var path = require('path');
 
 // taken from underscore.string.js
 function _underscored(str) {
   // also underscore dot
-  return str
-    .replace(/([a-z\d])([A-Z]+)/g, '$1_$2')
-    .replace(/[\.\-\s]+/g, '_')
-    .toLowerCase();
+  return str.replace(/([a-z\d])([A-Z]+)/g, '$1_$2').replace(/[\.\-\s]+/g, '_').toLowerCase();
 }
 
 /**
@@ -12719,190 +12176,181 @@ function _underscored(str) {
  * @public
  *
  */
-function NodeBox(name) {
 
-  if (!(this instanceof NodeBox)) {
-    return new NodeBox(name);
+var NodeBox = (function (_IOBox) {
+  _inherits(NodeBox, _IOBox);
+
+  function NodeBox(name) {
+    _classCallCheck(this, NodeBox);
+
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(NodeBox).call(this, name));
+
+    _this.name = name || 'NodeBox';
+    _this.define();
+    return _this;
   }
 
-  IOBox.apply(this, arguments);
+  _createClass(NodeBox, [{
+    key: 'define',
+    value: function define() {
+      // Define the structure
+      this.addArg('input', {});
+      this.addArg('output', {});
+      this.addArg('state', {});
+      this.addArg('done', null);
+      this.addArg('cb', null);
+      //this.addArg('console', console);
 
-  this.name = name || 'NodeBox';
+      this.addArg('on', {
+        input: {}
+      }); // dynamic construction
 
-  this.define();
+      // what to return from the function
+      this.addReturn('output');
+      this.addReturn('state');
+      this.addReturn('on');
+    }
 
-}
+    /**
+     *
+     * Add requires to the sandbox.
+     *
+     * xNode should use check = true and then have
+     * a try catch block.
+     *
+     * @param {Object} requires
+     * @param {Boolean} check
+     */
 
-util.inherits(NodeBox, IOBox);
+  }, {
+    key: 'require',
+    value: (function (_require) {
+      function require(_x, _x2) {
+        return _require.apply(this, arguments);
+      }
 
-NodeBox.prototype.define = function() {
+      require.toString = function () {
+        return _require.toString();
+      };
 
-  // Define the structure
-  this.addArg('input', {});
-  this.addArg('output', {});
-  this.addArg('state', {});
-  this.addArg('done', null);
-  this.addArg('cb', null);
-  //this.addArg('console', console);
+      return require;
+    })(function (requires, check) {
+      // Ok, the generic sandbox should do the same logic
+      // for adding the requires but should not check if
+      // they are available.
+      var ukey = undefined;
 
-  this.addArg('on', {
-    input: {}
-  }); // dynamic construction
+      // 'myrequire': '<version'
+      for (var key in requires) {
+        if (requires.hasOwnProperty(key)) {
+          // only take last part e.g. chix-flow/SomeThing-> some_thing
+          ukey = _underscored(key.split('/').pop());
 
-  // what to return from the function
-  this.addReturn('output');
-  this.addReturn('state');
-  this.addReturn('on');
-};
+          this.emit('require', {
+            require: key
+          });
 
-/**
- *
- * Add requires to the sandbox.
- *
- * xNode should use check = true and then have
- * a try catch block.
- *
- * @param {Object} requires
- * @param {Boolean} check
- */
-NodeBox.prototype.require = function(requires, check) {
-
-  // Ok, the generic sandbox should do the same logic
-  // for adding the requires but should not check if
-  // they are available.
-  var key;
-  var ukey;
-
-  // 'myrequire': '<version'
-  for (key in requires) {
-
-    if (requires.hasOwnProperty(key)) {
-
-      // only take last part e.g. chix-flow/SomeThing-> some_thing
-      ukey = _underscored(key.split('/').pop());
-
-      this.emit('require', {
-        require: key
-      });
-
-      if (check !== false) {
-
-        if (typeof requires[key] !== 'string') {
-
-          // assume it's already required.
-          // the npm installed versions use this.
-          // e.g. nodule-template
-          this.addArg(ukey, requires[key]);
-
-        }
-        else {
-
-          try {
-
-            this.addArg(ukey, require(key));
-
+          if (check !== false) {
+            if (typeof requires[key] !== 'string') {
+              // assume it's already required.
+              // the npm installed versions use this.
+              // e.g. nodule-template
+              this.addArg(ukey, requires[key]);
+            } else {
+              try {
+                this.addArg(ukey, require(key));
+              } catch (e) {
+                // last resort, used by cli
+                var p = path.resolve(process.cwd(), 'node_modules', key);
+                this.addArg(ukey, require(p));
+              }
+            }
+          } else {
+            // just register it, used for generate
+            this.addArg(ukey, undefined);
           }
-          catch (e) {
+        }
+      }
+    })
+  }, {
+    key: 'expose',
+    value: function expose(_expose, CHI) {
+      // created to allow window to be exposed to a node.
+      // only meant to be used for dom nodes.
+      var g = typeof window === 'undefined' ? global : window;
 
-            // last resort, used by cli
-            var p = path.resolve(
-              process.cwd(),
-              'node_modules',
-              key
-            );
+      if (_expose) {
+        for (var i = 0; i < _expose.length; i++) {
+          this.emit('expose', {
+            expose: _expose[i]
+          });
 
-            this.addArg(ukey, require(p));
+          if (_expose[i] === 'window') {
+            this.addArg('win', window);
+          } else if (_expose[i] === 'chi') {
+            this.addArg('chi', CHI);
+          } else if (_expose[i] === 'self') {
+            this.addArg('self', this);
+          } else {
+            // Do not re-expose anything already going in
+            if (!this.args.hasOwnProperty(_expose[i])) {
+              this.addArg(_expose[i], g[_expose[i]]);
+            }
           }
-
-        }
-
-      }
-      else {
-
-        // just register it, used for generate
-        this.addArg(ukey, undefined);
-
-      }
-    }
-  }
-};
-
-NodeBox.prototype.expose = function(expose, CHI) {
-
-  var i;
-  // created to allow window to be exposed to a node.
-  // only meant to be used for dom nodes.
-  var g = typeof window === 'undefined' ? global : window;
-
-  if (expose) {
-
-    for (i = 0; i < expose.length; i++) {
-
-      this.emit('expose', {
-        expose: expose[i]
-      });
-
-      if (expose[i] === 'window') {
-        this.addArg('win', window);
-      }
-      else if (expose[i] === 'chi') {
-        this.addArg('chi', CHI);
-      }
-      else if (expose[i] === 'self') {
-        this.addArg('self', this);
-      }
-      else {
-        // Do not re-expose anything already going in
-        if (!this.args.hasOwnProperty(expose[i])) {
-          this.addArg(expose[i], g[expose[i]]);
         }
       }
     }
-
-  }
-};
-
-NodeBox.prototype.compile = function(fn) {
-
-  return IOBox.prototype.compile.call(
-    this, fn, true // return as object
-  );
-
-};
-
-/**
- *
- * Runs the sandbox.
- *
- */
-NodeBox.prototype.run = function(bind) {
-
-  var k;
-  var res = IOBox.prototype.run.apply(this, [bind]);
-  var ret;
-
-  // puts the result back into our args/state
-  // TODO: I do not think this is needed?
-
-  for (k in res) {
-    if (k === 'return') {
-      ret = res['return'];
+  }, {
+    key: 'compile',
+    value: function compile(fn) {
+      return _get(Object.getPrototypeOf(NodeBox.prototype), 'compile', this).call(this, fn, true // return as object
+      );
     }
-    else if (res.hasOwnProperty(k)) {
-      this.set(k, res[k]);
+
+    /**
+     *
+     * Runs the sandbox.
+     *
+     */
+
+  }, {
+    key: 'run',
+    value: function run(bind) {
+      var res = _get(Object.getPrototypeOf(NodeBox.prototype), 'run', this).apply(this, [bind]);
+      var ret = undefined;
+
+      // puts the result back into our args/state
+      // TODO: I do not think this is needed?
+      for (var k in res) {
+        if (k === 'return') {
+          ret = res.return;
+        } else if (res.hasOwnProperty(k)) {
+          this.set(k, res[k]);
+        }
+      }
+      return ret; // original return value
     }
-  }
-  return ret; // original return value
-};
+  }]);
+
+  return NodeBox;
+})(IOBox);
 
 module.exports = NodeBox;
+//# sourceMappingURL=node.js.map
 
-}).call(this,require("uojqOp"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"iobox":53,"path":13,"uojqOp":14,"util":16}],36:[function(require,module,exports){
+}).call(this,require("z02cDi"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"iobox":51,"path":3,"z02cDi":4}],39:[function(require,module,exports){
 'use strict';
 
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
 var NodeBox = require('./node');
-var util = require('util');
 
 /**
  *
@@ -12912,39 +12360,52 @@ var util = require('util');
  * @public
  *
  */
-function PortBox(name) {
 
-  if (!(this instanceof PortBox)) {
-    return new PortBox(name);
+var PortBox = (function (_NodeBox) {
+  _inherits(PortBox, _NodeBox);
+
+  function PortBox(name) {
+    _classCallCheck(this, PortBox);
+
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(PortBox).call(this, name));
+
+    _this.name = name || 'PortBox';
+    return _this;
   }
 
-  NodeBox.apply(this, arguments);
+  _createClass(PortBox, [{
+    key: 'define',
+    value: function define() {
+      // Define the structure
+      this.addArg('data', null);
+      this.addArg('x', {}); // not sure, _is_ used but set later
+      this.addArg('source', null); // not sure..
+      this.addArg('state', {});
+      this.addArg('input', {});
+      this.addArg('output', null); // output function should be set manually
 
-  this.name = name || 'PortBox';
+      // what to return from the function.
+      this.addReturn('state');
+    }
+  }]);
 
-}
-
-util.inherits(PortBox, NodeBox);
-
-PortBox.prototype.define = function() {
-  // Define the structure
-  this.addArg('data', null);
-  this.addArg('x', {}); // not sure, _is_ used but set later
-  this.addArg('source', null); // not sure..
-  this.addArg('state', {});
-  this.addArg('input', {});
-  this.addArg('output', null); // output function should be set manually
-
-  // what to return from the function.
-  this.addReturn('state');
-};
+  return PortBox;
+})(NodeBox);
 
 module.exports = PortBox;
+//# sourceMappingURL=port.js.map
 
-},{"./node":35,"util":16}],37:[function(require,module,exports){
+},{"./node":38}],40:[function(require,module,exports){
 'use strict';
 
-var util = require('util');
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
 var EventEmitter = require('events').EventEmitter;
 
 /**
@@ -12957,74 +12418,97 @@ var EventEmitter = require('events').EventEmitter;
  * @public
  *
  */
-function Setting(settings) {
 
-  for (var key in settings) {
-    if (settings.hasOwnProperty(key)) {
-      this.set(key, settings[key]);
+var Setting = (function (_EventEmitter) {
+  _inherits(Setting, _EventEmitter);
+
+  function Setting(settings) {
+    _classCallCheck(this, Setting);
+
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(Setting).call(this));
+
+    for (var key in settings) {
+      if (settings.hasOwnProperty(key)) {
+        _this.set(key, settings[key]);
+      }
     }
+    return _this;
   }
-}
 
-util.inherits(Setting, EventEmitter);
+  /**
+   *
+   * Set
+   *
+   * Sets a setting
+   *
+   * @param {String} name
+   * @param {Any} val
+   */
 
-/**
- *
- * Set
- *
- * Sets a setting
- *
- * @param {String} name
- * @param {Any} val
- */
-Setting.prototype.set = function(name, val) {
-  if (undefined !== val) {
-    if (!this.setting) {
-      this.setting = {};
+  _createClass(Setting, [{
+    key: 'set',
+    value: function set(name, val) {
+      if (undefined !== val) {
+        if (!this.setting) {
+          this.setting = {};
+        }
+        this.setting[name] = val;
+
+        this.emit('change', this, 'setting', this.setting);
+      }
     }
-    this.setting[name] = val;
 
-    this.emit('change', this, 'setting', this.setting);
-  }
-};
+    /**
+     *
+     * Get
+     *
+     * Returns the setting or undefined.
+     *
+     * @returns {Any}
+     */
 
-/**
- *
- * Get
- *
- * Returns the setting or undefined.
- *
- * @returns {Any}
- */
-Setting.prototype.get = function(name) {
-  return this.setting ? this.setting[name] : undefined;
-};
+  }, {
+    key: 'get',
+    value: function get(name) {
+      return this.setting ? this.setting[name] : undefined;
+    }
 
-/**
- *
- * Delete a setting
- *
- * @returns {Any}
- */
-Setting.prototype.del = function(name) {
-  if (this.setting && this.setting.hasOwnProperty(name)) {
-    delete this.setting[name];
-  }
-};
+    /**
+     *
+     * Delete a setting
+     *
+     * @returns {Any}
+     */
 
-/**
- *
- * Check whether a setting is set.
- *
- * @returns {Any}
- */
-Setting.prototype.has = function(name) {
-  return this.setting && this.setting.hasOwnProperty(name);
-};
+  }, {
+    key: 'del',
+    value: function del(name) {
+      if (this.setting && this.setting.hasOwnProperty(name)) {
+        delete this.setting[name];
+      }
+    }
+
+    /**
+     *
+     * Check whether a setting is set.
+     *
+     * @returns {Any}
+     */
+
+  }, {
+    key: 'has',
+    value: function has(name) {
+      return this.setting && this.setting.hasOwnProperty(name);
+    }
+  }]);
+
+  return Setting;
+})(EventEmitter);
 
 module.exports = Setting;
+//# sourceMappingURL=setting.js.map
 
-},{"events":11,"util":16}],38:[function(require,module,exports){
+},{"events":1}],41:[function(require,module,exports){
 'use strict';
 
 var jsongate = require('json-gate');
@@ -13053,14 +12537,12 @@ function ValidationError(message, id, obj) {
  *
  */
 function _checkIds(flow, nodeDefinitions) {
-
-  var i;
   var knownIds = [];
   var nodes = {};
-  var node;
-  var link;
-  var source;
-  var target;
+  var node = undefined;
+  var link = undefined;
+  var source = undefined;
+  var target = undefined;
 
   if (flow.nodes.length > 0 && !nodeDefinitions) {
     throw new Error('Cannot validate without nodeDefinitions');
@@ -13068,47 +12550,34 @@ function _checkIds(flow, nodeDefinitions) {
 
   // we will not add the flow, we will show a warning and stop adding the
   // flow.
-  for (i = 0; i < flow.nodes.length; i++) {
-
+  for (var i = 0; i < flow.nodes.length; i++) {
     node = flow.nodes[i];
 
     // nodeDefinition should be loaded
     if (!node.ns) {
-      throw new ValidationError(
-          'NodeDefinition without namespace: ' + node.name
-          );
+      throw new ValidationError('NodeDefinition without namespace: ' + node.name);
     }
     if (!nodeDefinitions[node.ns]) {
-      throw new ValidationError(
-          'Cannot find nodeDefinition namespace: ' + node.ns
-          );
+      throw new ValidationError('Cannot find nodeDefinition namespace: ' + node.ns);
     }
     if (!nodeDefinitions[node.ns][node.name]) {
-      throw new ValidationError(
-          'Cannot find nodeDefinition name ' + node.ns + ' ' + node.name
-          );
+      throw new ValidationError('Cannot find nodeDefinition name ' + node.ns + ' ' + node.name);
     }
 
     knownIds.push(node.id);
     nodes[node.id] = node;
-
     //_checkPortDefinitions(nodeDefinitions[node.ns][node.name]);
   }
 
-  for (i = 0; i < flow.links.length; i++) {
-
+  for (var i = 0; i < flow.links.length; i++) {
     link = flow.links[i];
 
     // links should not point to non-existing nodes.
     if (knownIds.indexOf(link.source.id) === -1) {
-      throw new ValidationError(
-        'Source node does not exist ' + link.source.id
-      );
+      throw new ValidationError('Source node does not exist ' + link.source.id);
     }
     if (knownIds.indexOf(link.target.id) === -1) {
-      throw new ValidationError(
-        'Target node does not exist ' + link.target.id
-      );
+      throw new ValidationError('Target node does not exist ' + link.target.id);
     }
 
     // check if what is specified as port.out is an input port on the target
@@ -13116,42 +12585,16 @@ function _checkIds(flow, nodeDefinitions) {
     target = nodes[link.target.id];
 
     // allow :start
-    if (link.source.port[0] !== ':' &&
-        !nodeDefinitions[source.ns][source.name]
-        .ports.output[link.source.port]) {
-      throw new ValidationError([
-          'Process',
-          link.source.id,
-          'has no output port named',
-          link.source.port,
-          '\n\n\tOutput ports available:',
-          '\n\n\t',
-          Object.keys(
-            nodeDefinitions[source.ns][source.name].ports.output
-            ).join(', ')
-          ].join(' '));
+    if (link.source.port[0] !== ':' && !nodeDefinitions[source.ns][source.name].ports.output[link.source.port]) {
+      throw new ValidationError(['Process', link.source.id, 'has no output port named', link.source.port, '\n\n\tOutput ports available:', '\n\n\t', Object.keys(nodeDefinitions[source.ns][source.name].ports.output).join(', ')].join(' '));
     }
 
-    if (link.target.port[0] !== ':' &&
-        !nodeDefinitions[target.ns][target.name]
-        .ports.input[link.target.port]) {
-      throw new ValidationError([
-          'Process',
-          link.target.id,
-          'has no input port named',
-          link.target.port,
-          '\n\n\tInput ports available:',
-          '\n\n\t',
-          Object.keys(
-            nodeDefinitions[target.ns][target.name].ports.input
-            ).join(', ')
-          ].join(' '));
+    if (link.target.port[0] !== ':' && !nodeDefinitions[target.ns][target.name].ports.input[link.target.port]) {
+      throw new ValidationError(['Process', link.target.id, 'has no input port named', link.target.port, '\n\n\tInput ports available:', '\n\n\t', Object.keys(nodeDefinitions[target.ns][target.name].ports.input).join(', ')].join(' '));
     }
-
   }
 
   return true;
-
 }
 
 /**
@@ -13160,13 +12603,9 @@ function _checkIds(flow, nodeDefinitions) {
  *
  */
 function validateNodeDefinition(nodeDef) {
-
   nodeSchema.validate(nodeDef);
-
   // _checkIds(flow, nodeDefinitions);
-
   // make sure the id's are correct
-
 }
 
 function validateLink(ln) {
@@ -13179,19 +12618,13 @@ function validateLink(ln) {
  *
  */
 function validateFlow(flow) {
-
   mapSchema.validate(flow);
-
   // _checkIds(flow, nodeDefinitions);
-
   // make sure the id's are correct
-
 }
 
 function validateData(type, data) {
-
   switch (type) {
-
     case 'string':
       return typeof data === 'string';
 
@@ -13224,7 +12657,6 @@ function validateData(type, data) {
     default:
       return instanceOf(data, type);
   }
-
 }
 
 module.exports = {
@@ -13234,10 +12666,11 @@ module.exports = {
   nodeDefinition: validateNodeDefinition,
   nodeDefinitions: _checkIds
 };
+//# sourceMappingURL=validate.js.map
 
-},{"../schemas/link.json":63,"../schemas/map.json":64,"../schemas/node.json":65,"instance-of":52,"is-plain-object":54,"json-gate":57}],"chix-flow":[function(require,module,exports){
-module.exports=require('jXAsbI');
-},{}],"jXAsbI":[function(require,module,exports){
+},{"../schemas/link.json":62,"../schemas/map.json":63,"../schemas/node.json":64,"instance-of":50,"is-plain-object":52,"json-gate":56}],"chix-flow":[function(require,module,exports){
+module.exports=require('/+Mzp9');
+},{}],"/+Mzp9":[function(require,module,exports){
 'use strict';
 
 var xNode = require('./lib/node');
@@ -13262,7 +12695,7 @@ module.exports = {
   }
 };
 
-},{"./lib/actor":18,"./lib/flow":21,"./lib/link":24,"./lib/node":26,"./lib/validate":38,"./schemas/map.json":64,"./schemas/node.json":65,"./schemas/stage.json":66}],41:[function(require,module,exports){
+},{"./lib/actor":12,"./lib/flow":23,"./lib/link":26,"./lib/node":29,"./lib/validate":41,"./schemas/map.json":63,"./schemas/node.json":64,"./schemas/stage.json":65}],44:[function(require,module,exports){
 'use strict';
 
 var util         = require('util');
@@ -13507,7 +12940,7 @@ CHI.prototype.merge = function (newChi, oldChi, unique) {
 
 module.exports = CHI;
 
-},{"./group":42,"./portPointer":43,"./portSyncer":44,"./store":45,"events":11,"util":16}],42:[function(require,module,exports){
+},{"./group":45,"./portPointer":46,"./portSyncer":47,"./store":48,"events":1,"util":6}],45:[function(require,module,exports){
 'use strict';
 
 var util = require('util'),
@@ -13680,7 +13113,7 @@ Group.prototype.gid = function() {
 
 module.exports = Group;
 
-},{"events":11,"util":16,"uuid":47}],43:[function(require,module,exports){
+},{"events":1,"util":6,"uuid":61}],46:[function(require,module,exports){
 'use strict';
 
 var uuid = require('uuid').v4;
@@ -13742,7 +13175,7 @@ PortPointer.prototype.add = function(port) {
 
 module.exports = PortPointer;
 
-},{"uuid":47}],44:[function(require,module,exports){
+},{"uuid":61}],47:[function(require,module,exports){
 'use strict';
 
 ////
@@ -13846,7 +13279,7 @@ PortSyncer.prototype.add = function(link, p) {
 
 module.exports = PortSyncer;
 
-},{}],45:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 'use strict';
 
 function Store() {
@@ -13899,227 +13332,7 @@ Store.prototype.isEmpty = function() {
 
 module.exports = Store;
 
-},{}],46:[function(require,module,exports){
-(function (global){
-
-var rng;
-
-if (global.crypto && crypto.getRandomValues) {
-  // WHATWG crypto-based RNG - http://wiki.whatwg.org/wiki/Crypto
-  // Moderately fast, high quality
-  var _rnds8 = new Uint8Array(16);
-  rng = function whatwgRNG() {
-    crypto.getRandomValues(_rnds8);
-    return _rnds8;
-  };
-}
-
-if (!rng) {
-  // Math.random()-based (RNG)
-  //
-  // If all else fails, use Math.random().  It's fast, but is of unspecified
-  // quality.
-  var  _rnds = new Array(16);
-  rng = function() {
-    for (var i = 0, r; i < 16; i++) {
-      if ((i & 0x03) === 0) r = Math.random() * 0x100000000;
-      _rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
-    }
-
-    return _rnds;
-  };
-}
-
-module.exports = rng;
-
-
-}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],47:[function(require,module,exports){
-//     uuid.js
-//
-//     Copyright (c) 2010-2012 Robert Kieffer
-//     MIT License - http://opensource.org/licenses/mit-license.php
-
-// Unique ID creation requires a high quality random # generator.  We feature
-// detect to determine the best RNG source, normalizing to a function that
-// returns 128-bits of randomness, since that's what's usually required
-var _rng = require('./rng');
-
-// Maps for number <-> hex string conversion
-var _byteToHex = [];
-var _hexToByte = {};
-for (var i = 0; i < 256; i++) {
-  _byteToHex[i] = (i + 0x100).toString(16).substr(1);
-  _hexToByte[_byteToHex[i]] = i;
-}
-
-// **`parse()` - Parse a UUID into it's component bytes**
-function parse(s, buf, offset) {
-  var i = (buf && offset) || 0, ii = 0;
-
-  buf = buf || [];
-  s.toLowerCase().replace(/[0-9a-f]{2}/g, function(oct) {
-    if (ii < 16) { // Don't overflow!
-      buf[i + ii++] = _hexToByte[oct];
-    }
-  });
-
-  // Zero out remaining bytes if string was short
-  while (ii < 16) {
-    buf[i + ii++] = 0;
-  }
-
-  return buf;
-}
-
-// **`unparse()` - Convert UUID byte array (ala parse()) into a string**
-function unparse(buf, offset) {
-  var i = offset || 0, bth = _byteToHex;
-  return  bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]];
-}
-
-// **`v1()` - Generate time-based UUID**
-//
-// Inspired by https://github.com/LiosK/UUID.js
-// and http://docs.python.org/library/uuid.html
-
-// random #'s we need to init node and clockseq
-var _seedBytes = _rng();
-
-// Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
-var _nodeId = [
-  _seedBytes[0] | 0x01,
-  _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
-];
-
-// Per 4.2.2, randomize (14 bit) clockseq
-var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
-
-// Previous uuid creation time
-var _lastMSecs = 0, _lastNSecs = 0;
-
-// See https://github.com/broofa/node-uuid for API details
-function v1(options, buf, offset) {
-  var i = buf && offset || 0;
-  var b = buf || [];
-
-  options = options || {};
-
-  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
-
-  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
-  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
-  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
-  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
-  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
-
-  // Per 4.2.1.2, use count of uuid's generated during the current clock
-  // cycle to simulate higher resolution clock
-  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
-
-  // Time since last uuid creation (in msecs)
-  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
-
-  // Per 4.2.1.2, Bump clockseq on clock regression
-  if (dt < 0 && options.clockseq === undefined) {
-    clockseq = clockseq + 1 & 0x3fff;
-  }
-
-  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
-  // time interval
-  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
-    nsecs = 0;
-  }
-
-  // Per 4.2.1.2 Throw error if too many uuids are requested
-  if (nsecs >= 10000) {
-    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
-  }
-
-  _lastMSecs = msecs;
-  _lastNSecs = nsecs;
-  _clockseq = clockseq;
-
-  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
-  msecs += 12219292800000;
-
-  // `time_low`
-  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
-  b[i++] = tl >>> 24 & 0xff;
-  b[i++] = tl >>> 16 & 0xff;
-  b[i++] = tl >>> 8 & 0xff;
-  b[i++] = tl & 0xff;
-
-  // `time_mid`
-  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
-  b[i++] = tmh >>> 8 & 0xff;
-  b[i++] = tmh & 0xff;
-
-  // `time_high_and_version`
-  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
-  b[i++] = tmh >>> 16 & 0xff;
-
-  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
-  b[i++] = clockseq >>> 8 | 0x80;
-
-  // `clock_seq_low`
-  b[i++] = clockseq & 0xff;
-
-  // `node`
-  var node = options.node || _nodeId;
-  for (var n = 0; n < 6; n++) {
-    b[i + n] = node[n];
-  }
-
-  return buf ? buf : unparse(b);
-}
-
-// **`v4()` - Generate random UUID**
-
-// See https://github.com/broofa/node-uuid for API details
-function v4(options, buf, offset) {
-  // Deprecated - 'format' argument, as supported in v1.2
-  var i = buf && offset || 0;
-
-  if (typeof(options) == 'string') {
-    buf = options == 'binary' ? new Array(16) : null;
-    options = null;
-  }
-  options = options || {};
-
-  var rnds = options.random || (options.rng || _rng)();
-
-  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
-  rnds[6] = (rnds[6] & 0x0f) | 0x40;
-  rnds[8] = (rnds[8] & 0x3f) | 0x80;
-
-  // Copy bytes to buffer, if provided
-  if (buf) {
-    for (var ii = 0; ii < 16; ii++) {
-      buf[i + ii] = rnds[ii];
-    }
-  }
-
-  return buf || unparse(rnds);
-}
-
-// Export public API
-var uuid = v4;
-uuid.v1 = v1;
-uuid.v4 = v4;
-uuid.parse = parse;
-uuid.unparse = unparse;
-
-module.exports = uuid;
-
-},{"./rng":46}],48:[function(require,module,exports){
+},{}],49:[function(require,module,exports){
 'use strict';
 
 var EventEmitter = require('events').EventEmitter;
@@ -14156,7 +13369,7 @@ function Loader() {
    *    }
    *
    *  }
-   *G
+   *
    * }
    *
    */
@@ -14573,17 +13786,17 @@ Loader.prototype.loadNode = function(providerDef, cb) {
 Loader.prototype.loadNodeDefinitionFrom =
   function(provider, ns, name, callback) {
 
-  var self = this;
+    var self = this;
 
-  // I want cumulative dependencies.
-  // Instead of only knowing all dependencies known
-  // or only the dependency from the current node.
-  // self.load could send this within the callback
-  // and then also remember the dependency from this single node.
-  // for self.load it's the second argument of the callback.
-  var dependencies = {};
+    // I want cumulative dependencies.
+    // Instead of only knowing all dependencies known
+    // or only the dependency from the current node.
+    // self.load could send this within the callback
+    // and then also remember the dependency from this single node.
+    // for self.load it's the second argument of the callback.
+    var dependencies = {};
 
-  this.loadNode({
+    this.loadNode({
     ns: ns,
     name: name,
     url: provider.replace('{ns}', ns).replace('{name}', name),
@@ -14630,7 +13843,7 @@ Loader.prototype.loadNodeDefinitionFrom =
 
   });
 
-};
+  };
 
 // Ok this, seems weird, it is loading the map?
 // I give it a node which has either a provider as short key
@@ -14819,468 +14032,7 @@ Loader.prototype.getNodeDefinitions = function(provider) {
 
 module.exports = Loader;
 
-},{"events":11,"util":16}],49:[function(require,module,exports){
-
-/**
- * This is the web browser implementation of `debug()`.
- *
- * Expose `debug()` as the module.
- */
-
-exports = module.exports = require('./debug');
-exports.log = log;
-exports.formatArgs = formatArgs;
-exports.save = save;
-exports.load = load;
-exports.useColors = useColors;
-
-/**
- * Colors.
- */
-
-exports.colors = [
-  'lightseagreen',
-  'forestgreen',
-  'goldenrod',
-  'dodgerblue',
-  'darkorchid',
-  'crimson'
-];
-
-/**
- * Currently only WebKit-based Web Inspectors, Firefox >= v31,
- * and the Firebug extension (any Firefox version) are known
- * to support "%c" CSS customizations.
- *
- * TODO: add a `localStorage` variable to explicitly enable/disable colors
- */
-
-function useColors() {
-  // is webkit? http://stackoverflow.com/a/16459606/376773
-  return ('WebkitAppearance' in document.documentElement.style) ||
-    // is firebug? http://stackoverflow.com/a/398120/376773
-    (window.console && (console.firebug || (console.exception && console.table))) ||
-    // is firefox >= v31?
-    // https://developer.mozilla.org/en-US/docs/Tools/Web_Console#Styling_messages
-    (navigator.userAgent.toLowerCase().match(/firefox\/(\d+)/) && parseInt(RegExp.$1, 10) >= 31);
-}
-
-/**
- * Map %j to `JSON.stringify()`, since no Web Inspectors do that by default.
- */
-
-exports.formatters.j = function(v) {
-  return JSON.stringify(v);
-};
-
-
-/**
- * Colorize log arguments if enabled.
- *
- * @api public
- */
-
-function formatArgs() {
-  var args = arguments;
-  var useColors = this.useColors;
-
-  args[0] = (useColors ? '%c' : '')
-    + this.namespace
-    + (useColors ? ' %c' : ' ')
-    + args[0]
-    + (useColors ? '%c ' : ' ')
-    + '+' + exports.humanize(this.diff);
-
-  if (!useColors) return args;
-
-  var c = 'color: ' + this.color;
-  args = [args[0], c, 'color: inherit'].concat(Array.prototype.slice.call(args, 1));
-
-  // the final "%c" is somewhat tricky, because there could be other
-  // arguments passed either before or after the %c, so we need to
-  // figure out the correct index to insert the CSS into
-  var index = 0;
-  var lastC = 0;
-  args[0].replace(/%[a-z%]/g, function(match) {
-    if ('%%' === match) return;
-    index++;
-    if ('%c' === match) {
-      // we only are interested in the *last* %c
-      // (the user may have provided their own)
-      lastC = index;
-    }
-  });
-
-  args.splice(lastC, 0, c);
-  return args;
-}
-
-/**
- * Invokes `console.log()` when available.
- * No-op when `console.log` is not a "function".
- *
- * @api public
- */
-
-function log() {
-  // This hackery is required for IE8,
-  // where the `console.log` function doesn't have 'apply'
-  return 'object' == typeof console
-    && 'function' == typeof console.log
-    && Function.prototype.apply.call(console.log, console, arguments);
-}
-
-/**
- * Save `namespaces`.
- *
- * @param {String} namespaces
- * @api private
- */
-
-function save(namespaces) {
-  try {
-    if (null == namespaces) {
-      localStorage.removeItem('debug');
-    } else {
-      localStorage.debug = namespaces;
-    }
-  } catch(e) {}
-}
-
-/**
- * Load `namespaces`.
- *
- * @return {String} returns the previously persisted debug modes
- * @api private
- */
-
-function load() {
-  var r;
-  try {
-    r = localStorage.debug;
-  } catch(e) {}
-  return r;
-}
-
-/**
- * Enable namespaces listed in `localStorage.debug` initially.
- */
-
-exports.enable(load());
-
-},{"./debug":50}],50:[function(require,module,exports){
-
-/**
- * This is the common logic for both the Node.js and web browser
- * implementations of `debug()`.
- *
- * Expose `debug()` as the module.
- */
-
-exports = module.exports = debug;
-exports.coerce = coerce;
-exports.disable = disable;
-exports.enable = enable;
-exports.enabled = enabled;
-exports.humanize = require('ms');
-
-/**
- * The currently active debug mode names, and names to skip.
- */
-
-exports.names = [];
-exports.skips = [];
-
-/**
- * Map of special "%n" handling functions, for the debug "format" argument.
- *
- * Valid key names are a single, lowercased letter, i.e. "n".
- */
-
-exports.formatters = {};
-
-/**
- * Previously assigned color.
- */
-
-var prevColor = 0;
-
-/**
- * Previous log timestamp.
- */
-
-var prevTime;
-
-/**
- * Select a color.
- *
- * @return {Number}
- * @api private
- */
-
-function selectColor() {
-  return exports.colors[prevColor++ % exports.colors.length];
-}
-
-/**
- * Create a debugger with the given `namespace`.
- *
- * @param {String} namespace
- * @return {Function}
- * @api public
- */
-
-function debug(namespace) {
-
-  // define the `disabled` version
-  function disabled() {
-  }
-  disabled.enabled = false;
-
-  // define the `enabled` version
-  function enabled() {
-
-    var self = enabled;
-
-    // set `diff` timestamp
-    var curr = +new Date();
-    var ms = curr - (prevTime || curr);
-    self.diff = ms;
-    self.prev = prevTime;
-    self.curr = curr;
-    prevTime = curr;
-
-    // add the `color` if not set
-    if (null == self.useColors) self.useColors = exports.useColors();
-    if (null == self.color && self.useColors) self.color = selectColor();
-
-    var args = Array.prototype.slice.call(arguments);
-
-    args[0] = exports.coerce(args[0]);
-
-    if ('string' !== typeof args[0]) {
-      // anything else let's inspect with %o
-      args = ['%o'].concat(args);
-    }
-
-    // apply any `formatters` transformations
-    var index = 0;
-    args[0] = args[0].replace(/%([a-z%])/g, function(match, format) {
-      // if we encounter an escaped % then don't increase the array index
-      if (match === '%%') return match;
-      index++;
-      var formatter = exports.formatters[format];
-      if ('function' === typeof formatter) {
-        var val = args[index];
-        match = formatter.call(self, val);
-
-        // now we need to remove `args[index]` since it's inlined in the `format`
-        args.splice(index, 1);
-        index--;
-      }
-      return match;
-    });
-
-    if ('function' === typeof exports.formatArgs) {
-      args = exports.formatArgs.apply(self, args);
-    }
-    var logFn = enabled.log || exports.log || console.log.bind(console);
-    logFn.apply(self, args);
-  }
-  enabled.enabled = true;
-
-  var fn = exports.enabled(namespace) ? enabled : disabled;
-
-  fn.namespace = namespace;
-
-  return fn;
-}
-
-/**
- * Enables a debug mode by namespaces. This can include modes
- * separated by a colon and wildcards.
- *
- * @param {String} namespaces
- * @api public
- */
-
-function enable(namespaces) {
-  exports.save(namespaces);
-
-  var split = (namespaces || '').split(/[\s,]+/);
-  var len = split.length;
-
-  for (var i = 0; i < len; i++) {
-    if (!split[i]) continue; // ignore empty strings
-    namespaces = split[i].replace(/\*/g, '.*?');
-    if (namespaces[0] === '-') {
-      exports.skips.push(new RegExp('^' + namespaces.substr(1) + '$'));
-    } else {
-      exports.names.push(new RegExp('^' + namespaces + '$'));
-    }
-  }
-}
-
-/**
- * Disable debug output.
- *
- * @api public
- */
-
-function disable() {
-  exports.enable('');
-}
-
-/**
- * Returns true if the given mode name is enabled, false otherwise.
- *
- * @param {String} name
- * @return {Boolean}
- * @api public
- */
-
-function enabled(name) {
-  var i, len;
-  for (i = 0, len = exports.skips.length; i < len; i++) {
-    if (exports.skips[i].test(name)) {
-      return false;
-    }
-  }
-  for (i = 0, len = exports.names.length; i < len; i++) {
-    if (exports.names[i].test(name)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Coerce `val`.
- *
- * @param {Mixed} val
- * @return {Mixed}
- * @api private
- */
-
-function coerce(val) {
-  if (val instanceof Error) return val.stack || val.message;
-  return val;
-}
-
-},{"ms":51}],51:[function(require,module,exports){
-/**
- * Helpers.
- */
-
-var s = 1000;
-var m = s * 60;
-var h = m * 60;
-var d = h * 24;
-var y = d * 365.25;
-
-/**
- * Parse or format the given `val`.
- *
- * Options:
- *
- *  - `long` verbose formatting [false]
- *
- * @param {String|Number} val
- * @param {Object} options
- * @return {String|Number}
- * @api public
- */
-
-module.exports = function(val, options){
-  options = options || {};
-  if ('string' == typeof val) return parse(val);
-  return options.long
-    ? long(val)
-    : short(val);
-};
-
-/**
- * Parse the given `str` and return milliseconds.
- *
- * @param {String} str
- * @return {Number}
- * @api private
- */
-
-function parse(str) {
-  var match = /^((?:\d+)?\.?\d+) *(ms|seconds?|s|minutes?|m|hours?|h|days?|d|years?|y)?$/i.exec(str);
-  if (!match) return;
-  var n = parseFloat(match[1]);
-  var type = (match[2] || 'ms').toLowerCase();
-  switch (type) {
-    case 'years':
-    case 'year':
-    case 'y':
-      return n * y;
-    case 'days':
-    case 'day':
-    case 'd':
-      return n * d;
-    case 'hours':
-    case 'hour':
-    case 'h':
-      return n * h;
-    case 'minutes':
-    case 'minute':
-    case 'm':
-      return n * m;
-    case 'seconds':
-    case 'second':
-    case 's':
-      return n * s;
-    case 'ms':
-      return n;
-  }
-}
-
-/**
- * Short format for `ms`.
- *
- * @param {Number} ms
- * @return {String}
- * @api private
- */
-
-function short(ms) {
-  if (ms >= d) return Math.round(ms / d) + 'd';
-  if (ms >= h) return Math.round(ms / h) + 'h';
-  if (ms >= m) return Math.round(ms / m) + 'm';
-  if (ms >= s) return Math.round(ms / s) + 's';
-  return ms + 'ms';
-}
-
-/**
- * Long format for `ms`.
- *
- * @param {Number} ms
- * @return {String}
- * @api private
- */
-
-function long(ms) {
-  return plural(ms, d, 'day')
-    || plural(ms, h, 'hour')
-    || plural(ms, m, 'minute')
-    || plural(ms, s, 'second')
-    || ms + ' ms';
-}
-
-/**
- * Pluralization helper.
- */
-
-function plural(ms, n, name) {
-  if (ms < n) return;
-  if (ms < n * 1.5) return Math.floor(ms / n) + ' ' + name;
-  return Math.ceil(ms / n) + ' ' + name + 's';
-}
-
-},{}],52:[function(require,module,exports){
+},{"events":1,"util":6}],50:[function(require,module,exports){
 module.exports = function InstanceOf(obj, type) {
   if(obj === null) return false;
   if(type === 'array') type = 'Array';
@@ -15295,7 +14047,7 @@ module.exports = function InstanceOf(obj, type) {
   }
 };
 
-},{}],53:[function(require,module,exports){
+},{}],51:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -15572,20 +14324,61 @@ IOBox.prototype.run = function (bind) {
 
 module.exports = IOBox;
 
-},{"events":11,"util":16}],54:[function(require,module,exports){
+},{"events":1,"util":6}],52:[function(require,module,exports){
 /*!
  * is-plain-object <https://github.com/jonschlinkert/is-plain-object>
  *
- * Copyright (c) 2014 Jon Schlinkert, contributors.
- * Licensed under the MIT License
+ * Copyright (c) 2014-2015, Jon Schlinkert.
+ * Licensed under the MIT License.
  */
 
 'use strict';
 
+var isObject = require('isobject');
+
+function isObjectObject(o) {
+  return isObject(o) === true
+    && Object.prototype.toString.call(o) === '[object Object]';
+}
+
 module.exports = function isPlainObject(o) {
-  return !!o && typeof o === 'object' && o.constructor === Object;
+  var ctor,prot;
+  
+  if (isObjectObject(o) === false) return false;
+  
+  // If has modified constructor
+  ctor = o.constructor;
+  if (typeof ctor !== 'function') return false;
+  
+  // If has modified prototype
+  prot = ctor.prototype;
+  if (isObjectObject(prot) === false) return false;
+  
+  // If constructor does not have an Object-specific method
+  if (prot.hasOwnProperty('isPrototypeOf') === false) {
+    return false;
+  }
+  
+  // Most likely a plain Object
+  return true;
 };
-},{}],55:[function(require,module,exports){
+
+},{"isobject":53}],53:[function(require,module,exports){
+/*!
+ * isobject <https://github.com/jonschlinkert/isobject>
+ *
+ * Copyright (c) 2014-2015, Jon Schlinkert.
+ * Licensed under the MIT License.
+ */
+
+'use strict';
+
+module.exports = function isObject(val) {
+  return val != null && typeof val === 'object'
+    && !Array.isArray(val);
+};
+
+},{}],54:[function(require,module,exports){
 exports.getType = function (obj) {
 	switch (Object.prototype.toString.call(obj)) {
 		case '[object String]':
@@ -15686,7 +14479,7 @@ exports.deepEquals = function (obj1, obj2) {
 	}
 };
 
-},{}],56:[function(require,module,exports){
+},{}],55:[function(require,module,exports){
 var RE_0_TO_100 = '([1-9]?[0-9]|100)';
 var RE_0_TO_255 = '([1-9]?[0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])';
 
@@ -15782,7 +14575,7 @@ var formats = {
 
 exports.formats = formats;
 
-},{}],57:[function(require,module,exports){
+},{}],56:[function(require,module,exports){
 var validateSchema = require('./valid-schema'),
 	validateObject = require('./valid-object');
 
@@ -15799,7 +14592,7 @@ module.exports.createSchema = function (schema) {
 	return new Schema(schema);
 }
 
-},{"./valid-object":58,"./valid-schema":59}],58:[function(require,module,exports){
+},{"./valid-object":57,"./valid-schema":58}],57:[function(require,module,exports){
 var formats = require('./formats').formats;
 var common = require('./common'),
 	getType = common.getType,
@@ -16184,7 +14977,7 @@ module.exports = function(obj, schema, done) {
 	}
 };
 
-},{"./common":55,"./formats":56}],59:[function(require,module,exports){
+},{"./common":54,"./formats":55}],58:[function(require,module,exports){
 var formats = require('./formats').formats;
 var common = require('./common'),
 	getType = common.getType,
@@ -16466,7 +15259,7 @@ module.exports = function(schema) {
 	validateSchema(schema, []);
 };
 
-},{"./common":55,"./formats":56,"./valid-object":58}],60:[function(require,module,exports){
+},{"./common":54,"./formats":55,"./valid-object":57}],59:[function(require,module,exports){
 (function (global){
 /* jshint laxbreak: true, laxcomma: true*/
 /* global global, window */
@@ -16776,11 +15569,227 @@ module.exports = function(schema) {
 }());
 
 }).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],60:[function(require,module,exports){
+(function (global){
+
+var rng;
+
+if (global.crypto && crypto.getRandomValues) {
+  // WHATWG crypto-based RNG - http://wiki.whatwg.org/wiki/Crypto
+  // Moderately fast, high quality
+  var _rnds8 = new Uint8Array(16);
+  rng = function whatwgRNG() {
+    crypto.getRandomValues(_rnds8);
+    return _rnds8;
+  };
+}
+
+if (!rng) {
+  // Math.random()-based (RNG)
+  //
+  // If all else fails, use Math.random().  It's fast, but is of unspecified
+  // quality.
+  var  _rnds = new Array(16);
+  rng = function() {
+    for (var i = 0, r; i < 16; i++) {
+      if ((i & 0x03) === 0) r = Math.random() * 0x100000000;
+      _rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
+    }
+
+    return _rnds;
+  };
+}
+
+module.exports = rng;
+
+
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 },{}],61:[function(require,module,exports){
-module.exports=require(46)
-},{}],62:[function(require,module,exports){
-module.exports=require(47)
-},{"./rng":61}],63:[function(require,module,exports){
+//     uuid.js
+//
+//     Copyright (c) 2010-2012 Robert Kieffer
+//     MIT License - http://opensource.org/licenses/mit-license.php
+
+// Unique ID creation requires a high quality random # generator.  We feature
+// detect to determine the best RNG source, normalizing to a function that
+// returns 128-bits of randomness, since that's what's usually required
+var _rng = require('./rng');
+
+// Maps for number <-> hex string conversion
+var _byteToHex = [];
+var _hexToByte = {};
+for (var i = 0; i < 256; i++) {
+  _byteToHex[i] = (i + 0x100).toString(16).substr(1);
+  _hexToByte[_byteToHex[i]] = i;
+}
+
+// **`parse()` - Parse a UUID into it's component bytes**
+function parse(s, buf, offset) {
+  var i = (buf && offset) || 0, ii = 0;
+
+  buf = buf || [];
+  s.toLowerCase().replace(/[0-9a-f]{2}/g, function(oct) {
+    if (ii < 16) { // Don't overflow!
+      buf[i + ii++] = _hexToByte[oct];
+    }
+  });
+
+  // Zero out remaining bytes if string was short
+  while (ii < 16) {
+    buf[i + ii++] = 0;
+  }
+
+  return buf;
+}
+
+// **`unparse()` - Convert UUID byte array (ala parse()) into a string**
+function unparse(buf, offset) {
+  var i = offset || 0, bth = _byteToHex;
+  return  bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]];
+}
+
+// **`v1()` - Generate time-based UUID**
+//
+// Inspired by https://github.com/LiosK/UUID.js
+// and http://docs.python.org/library/uuid.html
+
+// random #'s we need to init node and clockseq
+var _seedBytes = _rng();
+
+// Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
+var _nodeId = [
+  _seedBytes[0] | 0x01,
+  _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
+];
+
+// Per 4.2.2, randomize (14 bit) clockseq
+var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
+
+// Previous uuid creation time
+var _lastMSecs = 0, _lastNSecs = 0;
+
+// See https://github.com/broofa/node-uuid for API details
+function v1(options, buf, offset) {
+  var i = buf && offset || 0;
+  var b = buf || [];
+
+  options = options || {};
+
+  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
+
+  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
+  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
+  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
+  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
+  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
+
+  // Per 4.2.1.2, use count of uuid's generated during the current clock
+  // cycle to simulate higher resolution clock
+  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
+
+  // Time since last uuid creation (in msecs)
+  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
+
+  // Per 4.2.1.2, Bump clockseq on clock regression
+  if (dt < 0 && options.clockseq === undefined) {
+    clockseq = clockseq + 1 & 0x3fff;
+  }
+
+  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
+  // time interval
+  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
+    nsecs = 0;
+  }
+
+  // Per 4.2.1.2 Throw error if too many uuids are requested
+  if (nsecs >= 10000) {
+    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
+  }
+
+  _lastMSecs = msecs;
+  _lastNSecs = nsecs;
+  _clockseq = clockseq;
+
+  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
+  msecs += 12219292800000;
+
+  // `time_low`
+  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
+  b[i++] = tl >>> 24 & 0xff;
+  b[i++] = tl >>> 16 & 0xff;
+  b[i++] = tl >>> 8 & 0xff;
+  b[i++] = tl & 0xff;
+
+  // `time_mid`
+  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
+  b[i++] = tmh >>> 8 & 0xff;
+  b[i++] = tmh & 0xff;
+
+  // `time_high_and_version`
+  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
+  b[i++] = tmh >>> 16 & 0xff;
+
+  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
+  b[i++] = clockseq >>> 8 | 0x80;
+
+  // `clock_seq_low`
+  b[i++] = clockseq & 0xff;
+
+  // `node`
+  var node = options.node || _nodeId;
+  for (var n = 0; n < 6; n++) {
+    b[i + n] = node[n];
+  }
+
+  return buf ? buf : unparse(b);
+}
+
+// **`v4()` - Generate random UUID**
+
+// See https://github.com/broofa/node-uuid for API details
+function v4(options, buf, offset) {
+  // Deprecated - 'format' argument, as supported in v1.2
+  var i = buf && offset || 0;
+
+  if (typeof(options) == 'string') {
+    buf = options == 'binary' ? new Array(16) : null;
+    options = null;
+  }
+  options = options || {};
+
+  var rnds = options.random || (options.rng || _rng)();
+
+  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
+  rnds[6] = (rnds[6] & 0x0f) | 0x40;
+  rnds[8] = (rnds[8] & 0x3f) | 0x80;
+
+  // Copy bytes to buffer, if provided
+  if (buf) {
+    for (var ii = 0; ii < 16; ii++) {
+      buf[i + ii] = rnds[ii];
+    }
+  }
+
+  return buf || unparse(rnds);
+}
+
+// Export public API
+var uuid = v4;
+uuid.v1 = v1;
+uuid.v4 = v4;
+uuid.parse = parse;
+uuid.unparse = unparse;
+
+module.exports = uuid;
+
+},{"./rng":60}],62:[function(require,module,exports){
 module.exports={
   "type": "object",
   "title": "Chiχ Link",
@@ -16857,7 +15866,7 @@ module.exports={
   "additionalProperties": false
 }
 
-},{}],64:[function(require,module,exports){
+},{}],63:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Map",
@@ -17009,7 +16018,7 @@ module.exports={
   "additionalProperties": false
 }
 
-},{}],65:[function(require,module,exports){
+},{}],64:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Nodes",
@@ -17064,7 +16073,7 @@ module.exports={
       "required": false
     },
     "fn": {
-      "type":"string",
+      "type":["string","function"],
       "required": false
     },
     "ports": {
@@ -17083,14 +16092,22 @@ module.exports={
       }
     },
     "type": {
-      "enum":["node","flow","provider","data","polymer"],
+      "enum":[
+        "node",
+        "flow",
+        "provider",
+        "data",
+        "PolymerNode",
+        "ReactNode",
+        "StateNode"
+      ],
       "required": false
     }
   },
   "additionalProperties": false
 }
 
-},{}],66:[function(require,module,exports){
+},{}],65:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Stage",
@@ -17186,14 +16203,912 @@ module.exports={
   }
 }
 
+},{}],66:[function(require,module,exports){
+'use strict';
+
+/**
+ *
+ * Ok, this should be a general listener interface.
+ *
+ * One who will use it is the Actor.
+ * But I want to be able to do the same for e.g. Loader.
+ *
+ * They will all be in chix-monitor-*
+ *
+ * npmlog =  Listener(instance, options);
+ *
+ * The return is just in case you want to do other stuff.
+ *
+ * e.g. fbpx wants to add this to npmlog:
+ *
+ * Logger.level = program.verbose ? 'verbose' : program.debug;
+ *
+ */
+// function NpmLogActorMonitor(actor, opts) {
+module.exports = function NpmLogActorMonitor(Logger, actor) {
+
+   // TODO: just make an NpmLogIOMonitor.
+   var ioHandler = actor.ioHandler;
+
+   actor.on('removeLink', function(event) {
+     Logger.debug(
+       event.node ? event.node.identifier : 'Some Actor',
+       'removed link'
+     );
+   });
+
+   // Ok emiting each and every output I don't like for the IOHandler.
+   // but whatever can change it later.
+   ioHandler.on('output', function(data) {
+
+     // I don't like this data.out.port thing vs data.port
+     switch(data.port) {
+
+        case ':plug':
+         Logger.debug(
+           data.node.identifier,
+           'port %s plugged (%d)',
+           data.out.read().port,
+           data.out.read().connections);
+        break;
+
+        case ':unplug':
+         Logger.debug(
+           data.node.identifier,
+           'port %s unplugged (%d)',
+           data.out.read().port,
+           data.out.read().connections);
+        break;
+
+        case ':portFill':
+         Logger.info(
+           data.node.identifier,
+           'port %s filled with data',
+           data.out.read().port);
+        break;
+
+        case ':contextUpdate':
+         Logger.info(
+           data.node.identifier,
+           'port %s filled with context',
+           data.out.read().port);
+        break;
+
+        case ':inputValidated':
+          Logger.debug(data.node.identifier, 'input validated');
+        break;
+
+        case ':start':
+          Logger.info(data.node.identifier, 'START');
+        break;
+
+        case ':freePort':
+          Logger.debug(data.node.identifier, 'free port %s', data.out.read().port);
+        break;
+
+/*
+       case ':queue':
+         Logger.debug(
+           data.node,
+           'queue: %s',
+           data.port
+         );
+       break;
+*/
+
+       case ':openPort':
+         Logger.info(
+           data.node.identifier,
+           'opened port %s (%d)',
+           data.out.read().port,
+           data.out.read().connections
+           );
+       break;
+
+       case ':closePort':
+         Logger.info(
+           data.node.identifier,
+           'closed port %s',
+           data.out.read().port
+           );
+       break;
+
+       case ':index':
+         Logger.info(
+           data.node.identifier,
+           '[%s] set on port `%s`',
+           data.out.read().index,
+           data.out.read().port
+           );
+       break;
+
+       case ':nodeComplete':
+         // console.log('nodeComplete', data);
+         Logger.info(data.node.identifier, 'completed');
+       break;
+
+       case ':portReject':
+         Logger.debug(
+           data.node.identifier,
+           'rejected input on port %s',
+           data.out.read().port
+         );
+       break;
+
+       case ':inputRequired':
+         Logger.error(
+           data.node.identifier,
+           'input required on port %s',
+           data.out.read().port);
+       break;
+
+       case ':error':
+         Logger.error(
+           data.node.identifier,
+           data.out.read().msg
+         );
+       break;
+
+       case ':nodeTimeout':
+         Logger.error(
+           data.node.identifier,
+           'node timeout'
+         );
+       break;
+
+       case ':executed':
+         Logger.info(
+           data.node.identifier,
+           'EXECUTED'
+         );
+       break;
+
+       case ':inputTimeout':
+         Logger.info(
+           data.node.identifier,
+           'input timeout, got %s need %s',
+           Object.keys(data.node.input).join(', '),
+           data.node.openPorts.join(', '));
+       break;
+
+       default:
+         // TODO: if the above misses a system port it will be reported
+         //       as default normal output.
+         Logger.info(data.node.identifier, 'output on port %s', data.port);
+       break;
+
+     }
+
+   });
+
+   return Logger;
+
+};
+
+},{}],67:[function(require,module,exports){
+'use strict';
+
+/**
+ *
+ * NpmLog monitor for the Loader
+ *
+ */
+module.exports = function NpmLogLoaderMonitor(Logger, loader) {
+
+  loader.on('loadUrl', function(data) {
+    Logger.info( 'loadUrl', data.url);
+  });
+
+  loader.on('loadFile', function(data) {
+    Logger.info( 'loadFile', data.path);
+  });
+
+  loader.on('loadCache', function(data) {
+    Logger.debug( 'cache', 'loaded cache file %s', data.file);
+  });
+
+  loader.on('purgeCache', function(data) {
+    Logger.debug( 'cache', 'purged cache file %s', data.file);
+  });
+
+  loader.on('writeCache', function(data) {
+    Logger.debug( 'cache', 'wrote cache file %s', data.file);
+  });
+
+  return Logger;
+
+};
+
+},{}],"urJme/":[function(require,module,exports){
+exports.Actor = require('./lib/actor');
+exports.Loader = require('./lib/loader');
+
+},{"./lib/actor":66,"./lib/loader":67}],"chix-monitor-npmlog":[function(require,module,exports){
+module.exports=require('urJme/');
+},{}],"V4HZ/5":[function(require,module,exports){
+
+/**
+ * This is the web browser implementation of `debug()`.
+ *
+ * Expose `debug()` as the module.
+ */
+
+exports = module.exports = require('./debug');
+exports.log = log;
+exports.formatArgs = formatArgs;
+exports.save = save;
+exports.load = load;
+exports.useColors = useColors;
+exports.storage = 'undefined' != typeof chrome
+               && 'undefined' != typeof chrome.storage
+                  ? chrome.storage.local
+                  : localstorage();
+
+/**
+ * Colors.
+ */
+
+exports.colors = [
+  'lightseagreen',
+  'forestgreen',
+  'goldenrod',
+  'dodgerblue',
+  'darkorchid',
+  'crimson'
+];
+
+/**
+ * Currently only WebKit-based Web Inspectors, Firefox >= v31,
+ * and the Firebug extension (any Firefox version) are known
+ * to support "%c" CSS customizations.
+ *
+ * TODO: add a `localStorage` variable to explicitly enable/disable colors
+ */
+
+function useColors() {
+  // is webkit? http://stackoverflow.com/a/16459606/376773
+  return ('WebkitAppearance' in document.documentElement.style) ||
+    // is firebug? http://stackoverflow.com/a/398120/376773
+    (window.console && (console.firebug || (console.exception && console.table))) ||
+    // is firefox >= v31?
+    // https://developer.mozilla.org/en-US/docs/Tools/Web_Console#Styling_messages
+    (navigator.userAgent.toLowerCase().match(/firefox\/(\d+)/) && parseInt(RegExp.$1, 10) >= 31);
+}
+
+/**
+ * Map %j to `JSON.stringify()`, since no Web Inspectors do that by default.
+ */
+
+exports.formatters.j = function(v) {
+  return JSON.stringify(v);
+};
+
+
+/**
+ * Colorize log arguments if enabled.
+ *
+ * @api public
+ */
+
+function formatArgs() {
+  var args = arguments;
+  var useColors = this.useColors;
+
+  args[0] = (useColors ? '%c' : '')
+    + this.namespace
+    + (useColors ? ' %c' : ' ')
+    + args[0]
+    + (useColors ? '%c ' : ' ')
+    + '+' + exports.humanize(this.diff);
+
+  if (!useColors) return args;
+
+  var c = 'color: ' + this.color;
+  args = [args[0], c, 'color: inherit'].concat(Array.prototype.slice.call(args, 1));
+
+  // the final "%c" is somewhat tricky, because there could be other
+  // arguments passed either before or after the %c, so we need to
+  // figure out the correct index to insert the CSS into
+  var index = 0;
+  var lastC = 0;
+  args[0].replace(/%[a-z%]/g, function(match) {
+    if ('%%' === match) return;
+    index++;
+    if ('%c' === match) {
+      // we only are interested in the *last* %c
+      // (the user may have provided their own)
+      lastC = index;
+    }
+  });
+
+  args.splice(lastC, 0, c);
+  return args;
+}
+
+/**
+ * Invokes `console.log()` when available.
+ * No-op when `console.log` is not a "function".
+ *
+ * @api public
+ */
+
+function log() {
+  // this hackery is required for IE8/9, where
+  // the `console.log` function doesn't have 'apply'
+  return 'object' === typeof console
+    && console.log
+    && Function.prototype.apply.call(console.log, console, arguments);
+}
+
+/**
+ * Save `namespaces`.
+ *
+ * @param {String} namespaces
+ * @api private
+ */
+
+function save(namespaces) {
+  try {
+    if (null == namespaces) {
+      exports.storage.removeItem('debug');
+    } else {
+      exports.storage.debug = namespaces;
+    }
+  } catch(e) {}
+}
+
+/**
+ * Load `namespaces`.
+ *
+ * @return {String} returns the previously persisted debug modes
+ * @api private
+ */
+
+function load() {
+  var r;
+  try {
+    r = exports.storage.debug;
+  } catch(e) {}
+  return r;
+}
+
+/**
+ * Enable namespaces listed in `localStorage.debug` initially.
+ */
+
+exports.enable(load());
+
+/**
+ * Localstorage attempts to return the localstorage.
+ *
+ * This is necessary because safari throws
+ * when a user disables cookies/localstorage
+ * and you attempt to access it.
+ *
+ * @return {LocalStorage}
+ * @api private
+ */
+
+function localstorage(){
+  try {
+    return window.localStorage;
+  } catch (e) {}
+}
+
+},{"./debug":72}],"debug":[function(require,module,exports){
+module.exports=require('V4HZ/5');
+},{}],72:[function(require,module,exports){
+
+/**
+ * This is the common logic for both the Node.js and web browser
+ * implementations of `debug()`.
+ *
+ * Expose `debug()` as the module.
+ */
+
+exports = module.exports = debug;
+exports.coerce = coerce;
+exports.disable = disable;
+exports.enable = enable;
+exports.enabled = enabled;
+exports.humanize = require('ms');
+
+/**
+ * The currently active debug mode names, and names to skip.
+ */
+
+exports.names = [];
+exports.skips = [];
+
+/**
+ * Map of special "%n" handling functions, for the debug "format" argument.
+ *
+ * Valid key names are a single, lowercased letter, i.e. "n".
+ */
+
+exports.formatters = {};
+
+/**
+ * Previously assigned color.
+ */
+
+var prevColor = 0;
+
+/**
+ * Previous log timestamp.
+ */
+
+var prevTime;
+
+/**
+ * Select a color.
+ *
+ * @return {Number}
+ * @api private
+ */
+
+function selectColor() {
+  return exports.colors[prevColor++ % exports.colors.length];
+}
+
+/**
+ * Create a debugger with the given `namespace`.
+ *
+ * @param {String} namespace
+ * @return {Function}
+ * @api public
+ */
+
+function debug(namespace) {
+
+  // define the `disabled` version
+  function disabled() {
+  }
+  disabled.enabled = false;
+
+  // define the `enabled` version
+  function enabled() {
+
+    var self = enabled;
+
+    // set `diff` timestamp
+    var curr = +new Date();
+    var ms = curr - (prevTime || curr);
+    self.diff = ms;
+    self.prev = prevTime;
+    self.curr = curr;
+    prevTime = curr;
+
+    // add the `color` if not set
+    if (null == self.useColors) self.useColors = exports.useColors();
+    if (null == self.color && self.useColors) self.color = selectColor();
+
+    var args = Array.prototype.slice.call(arguments);
+
+    args[0] = exports.coerce(args[0]);
+
+    if ('string' !== typeof args[0]) {
+      // anything else let's inspect with %o
+      args = ['%o'].concat(args);
+    }
+
+    // apply any `formatters` transformations
+    var index = 0;
+    args[0] = args[0].replace(/%([a-z%])/g, function(match, format) {
+      // if we encounter an escaped % then don't increase the array index
+      if (match === '%%') return match;
+      index++;
+      var formatter = exports.formatters[format];
+      if ('function' === typeof formatter) {
+        var val = args[index];
+        match = formatter.call(self, val);
+
+        // now we need to remove `args[index]` since it's inlined in the `format`
+        args.splice(index, 1);
+        index--;
+      }
+      return match;
+    });
+
+    if ('function' === typeof exports.formatArgs) {
+      args = exports.formatArgs.apply(self, args);
+    }
+    var logFn = enabled.log || exports.log || console.log.bind(console);
+    logFn.apply(self, args);
+  }
+  enabled.enabled = true;
+
+  var fn = exports.enabled(namespace) ? enabled : disabled;
+
+  fn.namespace = namespace;
+
+  return fn;
+}
+
+/**
+ * Enables a debug mode by namespaces. This can include modes
+ * separated by a colon and wildcards.
+ *
+ * @param {String} namespaces
+ * @api public
+ */
+
+function enable(namespaces) {
+  exports.save(namespaces);
+
+  var split = (namespaces || '').split(/[\s,]+/);
+  var len = split.length;
+
+  for (var i = 0; i < len; i++) {
+    if (!split[i]) continue; // ignore empty strings
+    namespaces = split[i].replace(/\*/g, '.*?');
+    if (namespaces[0] === '-') {
+      exports.skips.push(new RegExp('^' + namespaces.substr(1) + '$'));
+    } else {
+      exports.names.push(new RegExp('^' + namespaces + '$'));
+    }
+  }
+}
+
+/**
+ * Disable debug output.
+ *
+ * @api public
+ */
+
+function disable() {
+  exports.enable('');
+}
+
+/**
+ * Returns true if the given mode name is enabled, false otherwise.
+ *
+ * @param {String} name
+ * @return {Boolean}
+ * @api public
+ */
+
+function enabled(name) {
+  var i, len;
+  for (i = 0, len = exports.skips.length; i < len; i++) {
+    if (exports.skips[i].test(name)) {
+      return false;
+    }
+  }
+  for (i = 0, len = exports.names.length; i < len; i++) {
+    if (exports.names[i].test(name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Coerce `val`.
+ *
+ * @param {Mixed} val
+ * @return {Mixed}
+ * @api private
+ */
+
+function coerce(val) {
+  if (val instanceof Error) return val.stack || val.message;
+  return val;
+}
+
+},{"ms":73}],73:[function(require,module,exports){
+/**
+ * Helpers.
+ */
+
+var s = 1000;
+var m = s * 60;
+var h = m * 60;
+var d = h * 24;
+var y = d * 365.25;
+
+/**
+ * Parse or format the given `val`.
+ *
+ * Options:
+ *
+ *  - `long` verbose formatting [false]
+ *
+ * @param {String|Number} val
+ * @param {Object} options
+ * @return {String|Number}
+ * @api public
+ */
+
+module.exports = function(val, options){
+  options = options || {};
+  if ('string' == typeof val) return parse(val);
+  return options.long
+    ? long(val)
+    : short(val);
+};
+
+/**
+ * Parse the given `str` and return milliseconds.
+ *
+ * @param {String} str
+ * @return {Number}
+ * @api private
+ */
+
+function parse(str) {
+  str = '' + str;
+  if (str.length > 10000) return;
+  var match = /^((?:\d+)?\.?\d+) *(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|years?|yrs?|y)?$/i.exec(str);
+  if (!match) return;
+  var n = parseFloat(match[1]);
+  var type = (match[2] || 'ms').toLowerCase();
+  switch (type) {
+    case 'years':
+    case 'year':
+    case 'yrs':
+    case 'yr':
+    case 'y':
+      return n * y;
+    case 'days':
+    case 'day':
+    case 'd':
+      return n * d;
+    case 'hours':
+    case 'hour':
+    case 'hrs':
+    case 'hr':
+    case 'h':
+      return n * h;
+    case 'minutes':
+    case 'minute':
+    case 'mins':
+    case 'min':
+    case 'm':
+      return n * m;
+    case 'seconds':
+    case 'second':
+    case 'secs':
+    case 'sec':
+    case 's':
+      return n * s;
+    case 'milliseconds':
+    case 'millisecond':
+    case 'msecs':
+    case 'msec':
+    case 'ms':
+      return n;
+  }
+}
+
+/**
+ * Short format for `ms`.
+ *
+ * @param {Number} ms
+ * @return {String}
+ * @api private
+ */
+
+function short(ms) {
+  if (ms >= d) return Math.round(ms / d) + 'd';
+  if (ms >= h) return Math.round(ms / h) + 'h';
+  if (ms >= m) return Math.round(ms / m) + 'm';
+  if (ms >= s) return Math.round(ms / s) + 's';
+  return ms + 'ms';
+}
+
+/**
+ * Long format for `ms`.
+ *
+ * @param {Number} ms
+ * @return {String}
+ * @api private
+ */
+
+function long(ms) {
+  return plural(ms, d, 'day')
+    || plural(ms, h, 'hour')
+    || plural(ms, m, 'minute')
+    || plural(ms, s, 'second')
+    || ms + ' ms';
+}
+
+/**
+ * Pluralization helper.
+ */
+
+function plural(ms, n, name) {
+  if (ms < n) return;
+  if (ms < n * 1.5) return Math.floor(ms / n) + ' ' + name;
+  return Math.ceil(ms / n) + ' ' + name + 's';
+}
+
+},{}],74:[function(require,module,exports){
+/**
+ * Specific customUtils for the browser, where we don't have access to the Crypto and Buffer modules
+ */
+
+/**
+ * Taken from the crypto-browserify module
+ * https://github.com/dominictarr/crypto-browserify
+ * NOTE: Math.random() does not guarantee "cryptographic quality" but we actually don't need it
+ */
+function randomBytes (size) {
+  var bytes = new Array(size);
+  var r;
+
+  for (var i = 0, r; i < size; i++) {
+    if ((i & 0x03) == 0) r = Math.random() * 0x100000000;
+    bytes[i] = r >>> ((i & 0x03) << 3) & 0xff;
+  }
+
+  return bytes;
+}
+
+
+/**
+ * Taken from the base64-js module
+ * https://github.com/beatgammit/base64-js/
+ */
+function byteArrayToBase64 (uint8) {
+  var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    , extraBytes = uint8.length % 3   // if we have 1 byte left, pad 2 bytes
+    , output = ""
+    , temp, length, i;
+
+  function tripletToBase64 (num) {
+    return lookup[num >> 18 & 0x3F] + lookup[num >> 12 & 0x3F] + lookup[num >> 6 & 0x3F] + lookup[num & 0x3F];
+  };
+
+  // go through the array every three bytes, we'll deal with trailing stuff later
+  for (i = 0, length = uint8.length - extraBytes; i < length; i += 3) {
+    temp = (uint8[i] << 16) + (uint8[i + 1] << 8) + (uint8[i + 2]);
+    output += tripletToBase64(temp);
+  }
+
+  // pad the end with zeros, but make sure to not forget the extra bytes
+  switch (extraBytes) {
+    case 1:
+      temp = uint8[uint8.length - 1];
+      output += lookup[temp >> 2];
+      output += lookup[(temp << 4) & 0x3F];
+      output += '==';
+      break;
+    case 2:
+      temp = (uint8[uint8.length - 2] << 8) + (uint8[uint8.length - 1]);
+      output += lookup[temp >> 10];
+      output += lookup[(temp >> 4) & 0x3F];
+      output += lookup[(temp << 2) & 0x3F];
+      output += '=';
+      break;
+  }
+
+  return output;
+}
+
+
+/**
+ * Return a random alphanumerical string of length len
+ * There is a very small probability (less than 1/1,000,000) for the length to be less than len
+ * (il the base64 conversion yields too many pluses and slashes) but
+ * that's not an issue here
+ * The probability of a collision is extremely small (need 3*10^12 documents to have one chance in a million of a collision)
+ * See http://en.wikipedia.org/wiki/Birthday_problem
+ */
+function uid (len) {
+  return byteArrayToBase64(randomBytes(Math.ceil(Math.max(8, len * 2)))).replace(/[+\/]/g, '').slice(0, len);
+}
+
+
+
+module.exports.uid = uid;
+
+},{}],75:[function(require,module,exports){
+/**
+ * Way data is stored for this database
+ * For a Node.js/Node Webkit database it's the file system
+ * For a browser-side database it's localStorage when supported
+ *
+ * This version is the Node.js/Node Webkit version
+ */
+
+
+
+function exists (filename, callback) {
+  // In this specific case this always answers that the file doesn't exist
+  if (typeof localStorage === 'undefined') { console.log("WARNING - This browser doesn't support localStorage, no data will be saved in NeDB!"); return callback(); }
+
+  if (localStorage.getItem(filename) !== null) {
+    return callback(true);
+  } else {
+    return callback(false);
+  }
+}
+
+
+function rename (filename, newFilename, callback) {
+  if (typeof localStorage === 'undefined') { console.log("WARNING - This browser doesn't support localStorage, no data will be saved in NeDB!"); return callback(); }
+
+  if (localStorage.getItem(filename) === null) {
+    localStorage.removeItem(newFilename);
+  } else {
+    localStorage.setItem(newFilename, localStorage.getItem(filename));
+    localStorage.removeItem(filename);
+  }
+
+  return callback();
+}
+
+
+function writeFile (filename, contents, options, callback) {
+  if (typeof localStorage === 'undefined') { console.log("WARNING - This browser doesn't support localStorage, no data will be saved in NeDB!"); return callback(); }
+  
+  // Options do not matter in browser setup
+  if (typeof options === 'function') { callback = options; }
+
+  localStorage.setItem(filename, contents);
+  return callback();
+}
+
+
+function appendFile (filename, toAppend, options, callback) {
+  if (typeof localStorage === 'undefined') { console.log("WARNING - This browser doesn't support localStorage, no data will be saved in NeDB!"); return callback(); }
+  
+  // Options do not matter in browser setup
+  if (typeof options === 'function') { callback = options; }
+
+  var contents = localStorage.getItem(filename) || '';
+  contents += toAppend;
+
+  localStorage.setItem(filename, contents);
+  return callback();
+}
+
+
+function readFile (filename, options, callback) {
+  if (typeof localStorage === 'undefined') { console.log("WARNING - This browser doesn't support localStorage, no data will be saved in NeDB!"); return callback(); }
+  
+  // Options do not matter in browser setup
+  if (typeof options === 'function') { callback = options; }
+
+  var contents = localStorage.getItem(filename) || '';
+  return callback(null, contents);
+}
+
+
+function unlink (filename, callback) {
+  if (typeof localStorage === 'undefined') { console.log("WARNING - This browser doesn't support localStorage, no data will be saved in NeDB!"); return callback(); }
+
+  localStorage.removeItem(filename);
+  return callback();
+}
+
+
+// Nothing done, no directories will be used on the browser
+function mkdirp (dir, callback) {
+  return callback();
+}
+
+
+
+// Interface
+module.exports.exists = exists;
+module.exports.rename = rename;
+module.exports.writeFile = writeFile;
+module.exports.appendFile = appendFile;
+module.exports.readFile = readFile;
+module.exports.unlink = unlink;
+module.exports.mkdirp = mkdirp;
+
+
 },{}],"nedb":[function(require,module,exports){
-module.exports=require('Uy5zDT');
-},{}],"Uy5zDT":[function(require,module,exports){
+module.exports=require('/tIhav');
+},{}],"/tIhav":[function(require,module,exports){
 var Datastore = require('./lib/datastore');
 
 module.exports = Datastore;
 
-},{"./lib/datastore":71}],69:[function(require,module,exports){
+},{"./lib/datastore":79}],78:[function(require,module,exports){
 /**
  * Manage access to data, be it to find, update or remove it
  */
@@ -17380,32 +17295,7 @@ Cursor.prototype.exec = function () {
 // Interface
 module.exports = Cursor;
 
-},{"./model":74,"underscore":83}],70:[function(require,module,exports){
-var crypto = require('crypto')
-  , fs = require('fs')
-  ;
-
-/**
- * Return a random alphanumerical string of length len
- * There is a very small probability (less than 1/1,000,000) for the length to be less than len
- * (il the base64 conversion yields too many pluses and slashes) but
- * that's not an issue here
- * The probability of a collision is extremely small (need 3*10^12 documents to have one chance in a million of a collision)
- * See http://en.wikipedia.org/wiki/Birthday_problem
- */
-function uid (len) {
-  return crypto.randomBytes(Math.ceil(Math.max(8, len * 2)))
-    .toString('base64')
-    .replace(/[+\/]/g, '')
-    .slice(0, len);
-}
-
-
-// Interface
-module.exports.uid = uid;
-
-
-},{"crypto":6,"fs":1}],71:[function(require,module,exports){
+},{"./model":82,"underscore":85}],79:[function(require,module,exports){
 var customUtils = require('./customUtils')
   , model = require('./model')
   , async = require('async')
@@ -18026,7 +17916,7 @@ Datastore.prototype.remove = function () {
 
 module.exports = Datastore;
 
-},{"./cursor":69,"./customUtils":70,"./executor":72,"./indexes":73,"./model":74,"./persistence":75,"async":77,"underscore":83,"util":16}],72:[function(require,module,exports){
+},{"./cursor":78,"./customUtils":74,"./executor":80,"./indexes":81,"./model":82,"./persistence":83,"async":84,"underscore":85,"util":6}],80:[function(require,module,exports){
 (function (process){
 /**
  * Responsible for sequentially executing actions on the database
@@ -18106,8 +17996,8 @@ Executor.prototype.processBuffer = function () {
 // Interface
 module.exports = Executor;
 
-}).call(this,require("uojqOp"))
-},{"async":77,"uojqOp":14}],73:[function(require,module,exports){
+}).call(this,require("z02cDi"))
+},{"async":84,"z02cDi":4}],81:[function(require,module,exports){
 var BinarySearchTree = require('binary-search-tree').AVLTree
   , model = require('./model')
   , _ = require('underscore')
@@ -18403,7 +18293,7 @@ Index.prototype.getAll = function () {
 // Interface
 module.exports = Index;
 
-},{"./model":74,"binary-search-tree":78,"underscore":83,"util":16}],74:[function(require,module,exports){
+},{"./model":82,"binary-search-tree":7,"underscore":85,"util":6}],82:[function(require,module,exports){
 /**
  * Handle models (i.e. docs)
  * Serialization/deserialization
@@ -19166,7 +19056,7 @@ module.exports.match = match;
 module.exports.areThingsEqual = areThingsEqual;
 module.exports.compareThings = compareThings;
 
-},{"underscore":83,"util":16}],75:[function(require,module,exports){
+},{"underscore":85,"util":6}],83:[function(require,module,exports){
 (function (process){
 /**
  * Handle every persistence-related task
@@ -19536,25 +19426,8 @@ Persistence.prototype.loadDatabase = function (cb) {
 // Interface
 module.exports = Persistence;
 
-}).call(this,require("uojqOp"))
-},{"./customUtils":70,"./indexes":73,"./model":74,"./storage":76,"async":77,"path":13,"uojqOp":14}],76:[function(require,module,exports){
-/**
- * Way data is stored for this database
- * For a Node.js/Node Webkit database it's the file system
- * For a browser-side database it's localStorage when supported
- *
- * This version is the Node.js/Node Webkit version
- */
-
-var fs = require('fs')
-  , mkdirp = require('mkdirp')
-  ;
-
-
-module.exports = fs;
-module.exports.mkdirp = mkdirp;
-
-},{"fs":1,"mkdirp":82}],77:[function(require,module,exports){
+}).call(this,require("z02cDi"))
+},{"./customUtils":74,"./indexes":81,"./model":82,"./storage":75,"async":84,"path":3,"z02cDi":4}],84:[function(require,module,exports){
 (function (process){
 /*global setImmediate: false, setTimeout: false, console: false */
 (function () {
@@ -20515,1140 +20388,8 @@ module.exports.mkdirp = mkdirp;
 
 }());
 
-}).call(this,require("uojqOp"))
-},{"uojqOp":14}],78:[function(require,module,exports){
-module.exports.BinarySearchTree = require('./lib/bst');
-module.exports.AVLTree = require('./lib/avltree');
-
-},{"./lib/avltree":79,"./lib/bst":80}],79:[function(require,module,exports){
-/**
- * Self-balancing binary search tree using the AVL implementation
- */
-var BinarySearchTree = require('./bst')
-  , customUtils = require('./customUtils')
-  , util = require('util')
-  , _ = require('underscore')
-  ;
-
-
-/**
- * Constructor
- * We can't use a direct pointer to the root node (as in the simple binary search tree)
- * as the root will change during tree rotations
- * @param {Boolean}  options.unique Whether to enforce a 'unique' constraint on the key or not
- * @param {Function} options.compareKeys Initialize this BST's compareKeys
- */
-function AVLTree (options) {
-  this.tree = new _AVLTree(options);
-}
-
-
-/**
- * Constructor of the internal AVLTree
- * @param {Object} options Optional
- * @param {Boolean}  options.unique Whether to enforce a 'unique' constraint on the key or not
- * @param {Key}      options.key Initialize this BST's key with key
- * @param {Value}    options.value Initialize this BST's data with [value]
- * @param {Function} options.compareKeys Initialize this BST's compareKeys
- */
-function _AVLTree (options) {
-  options = options || {};
-
-  this.left = null;
-  this.right = null;
-  this.parent = options.parent !== undefined ? options.parent : null;
-  if (options.hasOwnProperty('key')) { this.key = options.key; }
-  this.data = options.hasOwnProperty('value') ? [options.value] : [];
-  this.unique = options.unique || false;
-
-  this.compareKeys = options.compareKeys || customUtils.defaultCompareKeysFunction;
-  this.checkValueEquality = options.checkValueEquality || customUtils.defaultCheckValueEquality;
-}
-
-
-/**
- * Inherit basic functions from the basic binary search tree
- */
-util.inherits(_AVLTree, BinarySearchTree);
-
-/**
- * Keep a pointer to the internal tree constructor for testing purposes
- */
-AVLTree._AVLTree = _AVLTree;
-
-
-/**
- * Check the recorded height is correct for every node
- * Throws if one height doesn't match
- */
-_AVLTree.prototype.checkHeightCorrect = function () {
-  var leftH, rightH;
-
-  if (!this.hasOwnProperty('key')) { return; }   // Empty tree
-
-  if (this.left && this.left.height === undefined) { throw "Undefined height for node " + this.left.key; }
-  if (this.right && this.right.height === undefined) { throw "Undefined height for node " + this.right.key; }
-  if (this.height === undefined) { throw "Undefined height for node " + this.key; }
-
-  leftH = this.left ? this.left.height : 0;
-  rightH = this.right ? this.right.height : 0;
-
-  if (this.height !== 1 + Math.max(leftH, rightH)) { throw "Height constraint failed for node " + this.key; }
-  if (this.left) { this.left.checkHeightCorrect(); }
-  if (this.right) { this.right.checkHeightCorrect(); }
-};
-
-
-/**
- * Return the balance factor
- */
-_AVLTree.prototype.balanceFactor = function () {
-  var leftH = this.left ? this.left.height : 0
-    , rightH = this.right ? this.right.height : 0
-    ;
-  return leftH - rightH;
-};
-
-
-/**
- * Check that the balance factors are all between -1 and 1
- */
-_AVLTree.prototype.checkBalanceFactors = function () {
-  if (Math.abs(this.balanceFactor()) > 1) { throw 'Tree is unbalanced at node ' + this.key; }
-
-  if (this.left) { this.left.checkBalanceFactors(); }
-  if (this.right) { this.right.checkBalanceFactors(); }
-};
-
-
-/**
- * When checking if the BST conditions are met, also check that the heights are correct
- * and the tree is balanced
- */
-_AVLTree.prototype.checkIsAVLT = function () {
-  _AVLTree.super_.prototype.checkIsBST.call(this);
-  this.checkHeightCorrect();
-  this.checkBalanceFactors();
-};
-AVLTree.prototype.checkIsAVLT = function () { this.tree.checkIsAVLT(); };
-
-
-/**
- * Perform a right rotation of the tree if possible
- * and return the root of the resulting tree
- * The resulting tree's nodes' heights are also updated
- */
-_AVLTree.prototype.rightRotation = function () {
-  var q = this
-    , p = this.left
-    , b
-    , ah, bh, ch;
-
-  if (!p) { return this; }   // No change
-
-  b = p.right;
-
-  // Alter tree structure
-  if (q.parent) {
-    p.parent = q.parent;
-    if (q.parent.left === q) { q.parent.left = p; } else { q.parent.right = p; }
-  } else {
-    p.parent = null;
-  }
-  p.right = q;
-  q.parent = p;
-  q.left = b;
-  if (b) { b.parent = q; }
-
-  // Update heights
-  ah = p.left ? p.left.height : 0;
-  bh = b ? b.height : 0;
-  ch = q.right ? q.right.height : 0;
-  q.height = Math.max(bh, ch) + 1;
-  p.height = Math.max(ah, q.height) + 1;
-
-  return p;
-};
-
-
-/**
- * Perform a left rotation of the tree if possible
- * and return the root of the resulting tree
- * The resulting tree's nodes' heights are also updated
- */
-_AVLTree.prototype.leftRotation = function () {
-  var p = this
-    , q = this.right
-    , b
-    , ah, bh, ch;
-
-  if (!q) { return this; }   // No change
-
-  b = q.left;
-
-  // Alter tree structure
-  if (p.parent) {
-    q.parent = p.parent;
-    if (p.parent.left === p) { p.parent.left = q; } else { p.parent.right = q; }
-  } else {
-    q.parent = null;
-  }
-  q.left = p;
-  p.parent = q;
-  p.right = b;
-  if (b) { b.parent = p; }
-
-  // Update heights
-  ah = p.left ? p.left.height : 0;
-  bh = b ? b.height : 0;
-  ch = q.right ? q.right.height : 0;
-  p.height = Math.max(ah, bh) + 1;
-  q.height = Math.max(ch, p.height) + 1;
-
-  return q;
-};
-
-
-/**
- * Modify the tree if its right subtree is too small compared to the left
- * Return the new root if any
- */
-_AVLTree.prototype.rightTooSmall = function () {
-  if (this.balanceFactor() <= 1) { return this; }   // Right is not too small, don't change
-
-  if (this.left.balanceFactor() < 0) {
-    this.left.leftRotation();
-  }
-
-  return this.rightRotation();
-};
-
-
-/**
- * Modify the tree if its left subtree is too small compared to the right
- * Return the new root if any
- */
-_AVLTree.prototype.leftTooSmall = function () {
-  if (this.balanceFactor() >= -1) { return this; }   // Left is not too small, don't change
-
-  if (this.right.balanceFactor() > 0) {
-    this.right.rightRotation();
-  }
-
-  return this.leftRotation();
-};
-
-
-/**
- * Rebalance the tree along the given path. The path is given reversed (as he was calculated
- * in the insert and delete functions).
- * Returns the new root of the tree
- * Of course, the first element of the path must be the root of the tree
- */
-_AVLTree.prototype.rebalanceAlongPath = function (path) {
-  var newRoot = this
-    , rotated
-    , i;
-
-  if (!this.hasOwnProperty('key')) { delete this.height; return this; }   // Empty tree
-
-  // Rebalance the tree and update all heights
-  for (i = path.length - 1; i >= 0; i -= 1) {
-    path[i].height = 1 + Math.max(path[i].left ? path[i].left.height : 0, path[i].right ? path[i].right.height : 0);
-
-    if (path[i].balanceFactor() > 1) {
-      rotated = path[i].rightTooSmall();
-      if (i === 0) { newRoot = rotated; }
-    }
-
-    if (path[i].balanceFactor() < -1) {
-      rotated = path[i].leftTooSmall();
-      if (i === 0) { newRoot = rotated; }
-    }
-  }
-
-  return newRoot;
-};
-
-
-/**
- * Insert a key, value pair in the tree while maintaining the AVL tree height constraint
- * Return a pointer to the root node, which may have changed
- */
-_AVLTree.prototype.insert = function (key, value) {
-  var insertPath = []
-    , currentNode = this
-    ;
-
-  // Empty tree, insert as root
-  if (!this.hasOwnProperty('key')) {
-    this.key = key;
-    this.data.push(value);
-    this.height = 1;
-    return this;
-  }
-
-  // Insert new leaf at the right place
-  while (true) {
-    // Same key: no change in the tree structure
-    if (currentNode.compareKeys(currentNode.key, key) === 0) {
-      if (currentNode.unique) {
-        throw { message: "Can't insert key " + key + ", it violates the unique constraint"
-              , key: key
-              , errorType: 'uniqueViolated'
-              };
-      } else {
-        currentNode.data.push(value);
-      }
-      return this;
-    }
-
-    insertPath.push(currentNode);
-
-    if (currentNode.compareKeys(key, currentNode.key) < 0) {
-      if (!currentNode.left) {
-        insertPath.push(currentNode.createLeftChild({ key: key, value: value }));
-        break;
-      } else {
-        currentNode = currentNode.left;
-      }
-    } else {
-      if (!currentNode.right) {
-        insertPath.push(currentNode.createRightChild({ key: key, value: value }));
-        break;
-      } else {
-        currentNode = currentNode.right;
-      }
-    }
-  }
-
-  return this.rebalanceAlongPath(insertPath);
-};
-
-// Insert in the internal tree, update the pointer to the root if needed
-AVLTree.prototype.insert = function (key, value) {
-  var newTree = this.tree.insert(key, value);
-
-  // If newTree is undefined, that means its structure was not modified
-  if (newTree) { this.tree = newTree; }
-};
-
-
-/**
- * Delete a key or just a value and return the new root of the tree
- * @param {Key} key
- * @param {Value} value Optional. If not set, the whole key is deleted. If set, only this value is deleted
- */
-_AVLTree.prototype.delete = function (key, value) {
-  var newData = [], replaceWith
-    , self = this
-    , currentNode = this
-    , deletePath = []
-    ;
-
-  if (!this.hasOwnProperty('key')) { return this; }   // Empty tree
-
-  // Either no match is found and the function will return from within the loop
-  // Or a match is found and deletePath will contain the path from the root to the node to delete after the loop
-  while (true) {
-    if (currentNode.compareKeys(key, currentNode.key) === 0) { break; }
-
-    deletePath.push(currentNode);
-
-    if (currentNode.compareKeys(key, currentNode.key) < 0) {
-      if (currentNode.left) {
-        currentNode = currentNode.left;
-      } else {
-        return this;   // Key not found, no modification
-      }
-    } else {
-      // currentNode.compareKeys(key, currentNode.key) is > 0
-      if (currentNode.right) {
-        currentNode = currentNode.right;
-      } else {
-        return this;   // Key not found, no modification
-      }
-    }
-  }
-
-  // Delete only a value (no tree modification)
-  if (currentNode.data.length > 1 && value) {
-    currentNode.data.forEach(function (d) {
-      if (!currentNode.checkValueEquality(d, value)) { newData.push(d); }
-    });
-    currentNode.data = newData;
-    return this;
-  }
-
-  // Delete a whole node
-
-  // Leaf
-  if (!currentNode.left && !currentNode.right) {
-    if (currentNode === this) {   // This leaf is also the root
-      delete currentNode.key;
-      currentNode.data = [];
-      delete currentNode.height;
-      return this;
-    } else {
-      if (currentNode.parent.left === currentNode) {
-        currentNode.parent.left = null;
-      } else {
-        currentNode.parent.right = null;
-      }
-      return this.rebalanceAlongPath(deletePath);
-    }
-  }
-
-
-  // Node with only one child
-  if (!currentNode.left || !currentNode.right) {
-    replaceWith = currentNode.left ? currentNode.left : currentNode.right;
-
-    if (currentNode === this) {   // This node is also the root
-      replaceWith.parent = null;
-      return replaceWith;   // height of replaceWith is necessarily 1 because the tree was balanced before deletion
-    } else {
-      if (currentNode.parent.left === currentNode) {
-        currentNode.parent.left = replaceWith;
-        replaceWith.parent = currentNode.parent;
-      } else {
-        currentNode.parent.right = replaceWith;
-        replaceWith.parent = currentNode.parent;
-      }
-
-      return this.rebalanceAlongPath(deletePath);
-    }
-  }
-
-
-  // Node with two children
-  // Use the in-order predecessor (no need to randomize since we actively rebalance)
-  deletePath.push(currentNode);
-  replaceWith = currentNode.left;
-
-  // Special case: the in-order predecessor is right below the node to delete
-  if (!replaceWith.right) {
-    currentNode.key = replaceWith.key;
-    currentNode.data = replaceWith.data;
-    currentNode.left = replaceWith.left;
-    if (replaceWith.left) { replaceWith.left.parent = currentNode; }
-    return this.rebalanceAlongPath(deletePath);
-  }
-
-  // After this loop, replaceWith is the right-most leaf in the left subtree
-  // and deletePath the path from the root (inclusive) to replaceWith (exclusive)
-  while (true) {
-    if (replaceWith.right) {
-      deletePath.push(replaceWith);
-      replaceWith = replaceWith.right;
-    } else {
-      break;
-    }
-  }
-
-  currentNode.key = replaceWith.key;
-  currentNode.data = replaceWith.data;
-
-  replaceWith.parent.right = replaceWith.left;
-  if (replaceWith.left) { replaceWith.left.parent = replaceWith.parent; }
-
-  return this.rebalanceAlongPath(deletePath);
-};
-
-// Delete a value
-AVLTree.prototype.delete = function (key, value) {
-  var newTree = this.tree.delete(key, value);
-
-  // If newTree is undefined, that means its structure was not modified
-  if (newTree) { this.tree = newTree; }
-};
-
-
-/**
- * Other functions we want to use on an AVLTree as if it were the internal _AVLTree
- */
-['getNumberOfKeys', 'search', 'betweenBounds', 'prettyPrint', 'executeOnEveryNode'].forEach(function (fn) {
-  AVLTree.prototype[fn] = function () {
-    return this.tree[fn].apply(this.tree, arguments);
-  };
-});
-
-
-// Interface
-module.exports = AVLTree;
-
-},{"./bst":80,"./customUtils":81,"underscore":83,"util":16}],80:[function(require,module,exports){
-/**
- * Simple binary search tree
- */
-var customUtils = require('./customUtils');
-
-
-/**
- * Constructor
- * @param {Object} options Optional
- * @param {Boolean}  options.unique Whether to enforce a 'unique' constraint on the key or not
- * @param {Key}      options.key Initialize this BST's key with key
- * @param {Value}    options.value Initialize this BST's data with [value]
- * @param {Function} options.compareKeys Initialize this BST's compareKeys
- */
-function BinarySearchTree (options) {
-  options = options || {};
-
-  this.left = null;
-  this.right = null;
-  this.parent = options.parent !== undefined ? options.parent : null;
-  if (options.hasOwnProperty('key')) { this.key = options.key; }
-  this.data = options.hasOwnProperty('value') ? [options.value] : [];
-  this.unique = options.unique || false;
-
-  this.compareKeys = options.compareKeys || customUtils.defaultCompareKeysFunction;
-  this.checkValueEquality = options.checkValueEquality || customUtils.defaultCheckValueEquality;
-}
-
-
-// ================================
-// Methods used to test the tree
-// ================================
-
-
-/**
- * Get the descendant with max key
- */
-BinarySearchTree.prototype.getMaxKeyDescendant = function () {
-  if (this.right) {
-    return this.right.getMaxKeyDescendant();
-  } else {
-    return this;
-  }
-};
-
-
-/**
- * Get the maximum key
- */
-BinarySearchTree.prototype.getMaxKey = function () {
-  return this.getMaxKeyDescendant().key;
-};
-
-
-/**
- * Get the descendant with min key
- */
-BinarySearchTree.prototype.getMinKeyDescendant = function () {
-  if (this.left) {
-    return this.left.getMinKeyDescendant()
-  } else {
-    return this;
-  }
-};
-
-
-/**
- * Get the minimum key
- */
-BinarySearchTree.prototype.getMinKey = function () {
-  return this.getMinKeyDescendant().key;
-};
-
-
-/**
- * Check that all nodes (incl. leaves) fullfil condition given by fn
- * test is a function passed every (key, data) and which throws if the condition is not met
- */
-BinarySearchTree.prototype.checkAllNodesFullfillCondition = function (test) {
-  if (!this.hasOwnProperty('key')) { return; }
-
-  test(this.key, this.data);
-  if (this.left) { this.left.checkAllNodesFullfillCondition(test); }
-  if (this.right) { this.right.checkAllNodesFullfillCondition(test); }
-};
-
-
-/**
- * Check that the core BST properties on node ordering are verified
- * Throw if they aren't
- */
-BinarySearchTree.prototype.checkNodeOrdering = function () {
-  var self = this;
-
-  if (!this.hasOwnProperty('key')) { return; }
-
-  if (this.left) {
-    this.left.checkAllNodesFullfillCondition(function (k) {
-      if (self.compareKeys(k, self.key) >= 0) {
-        throw 'Tree with root ' + self.key + ' is not a binary search tree';
-      }
-    });
-    this.left.checkNodeOrdering();
-  }
-
-  if (this.right) {
-    this.right.checkAllNodesFullfillCondition(function (k) {
-      if (self.compareKeys(k, self.key) <= 0) {
-        throw 'Tree with root ' + self.key + ' is not a binary search tree';
-      }
-    });
-    this.right.checkNodeOrdering();
-  }
-};
-
-
-/**
- * Check that all pointers are coherent in this tree
- */
-BinarySearchTree.prototype.checkInternalPointers = function () {
-  if (this.left) {
-    if (this.left.parent !== this) { throw 'Parent pointer broken for key ' + this.key; }
-    this.left.checkInternalPointers();
-  }
-
-  if (this.right) {
-    if (this.right.parent !== this) { throw 'Parent pointer broken for key ' + this.key; }
-    this.right.checkInternalPointers();
-  }
-};
-
-
-/**
- * Check that a tree is a BST as defined here (node ordering and pointer references)
- */
-BinarySearchTree.prototype.checkIsBST = function () {
-  this.checkNodeOrdering();
-  this.checkInternalPointers();
-  if (this.parent) { throw "The root shouldn't have a parent"; }
-};
-
-
-/**
- * Get number of keys inserted
- */
-BinarySearchTree.prototype.getNumberOfKeys = function () {
-  var res;
-
-  if (!this.hasOwnProperty('key')) { return 0; }
-
-  res = 1;
-  if (this.left) { res += this.left.getNumberOfKeys(); }
-  if (this.right) { res += this.right.getNumberOfKeys(); }
-
-  return res;
-};
-
-
-
-// ============================================
-// Methods used to actually work on the tree
-// ============================================
-
-/**
- * Create a BST similar (i.e. same options except for key and value) to the current one
- * Use the same constructor (i.e. BinarySearchTree, AVLTree etc)
- * @param {Object} options see constructor
- */
-BinarySearchTree.prototype.createSimilar = function (options) {
-  options = options || {};
-  options.unique = this.unique;
-  options.compareKeys = this.compareKeys;
-  options.checkValueEquality = this.checkValueEquality;
-
-  return new this.constructor(options);
-};
-
-
-/**
- * Create the left child of this BST and return it
- */
-BinarySearchTree.prototype.createLeftChild = function (options) {
-  var leftChild = this.createSimilar(options);
-  leftChild.parent = this;
-  this.left = leftChild;
-
-  return leftChild;
-};
-
-
-/**
- * Create the right child of this BST and return it
- */
-BinarySearchTree.prototype.createRightChild = function (options) {
-  var rightChild = this.createSimilar(options);
-  rightChild.parent = this;
-  this.right = rightChild;
-
-  return rightChild;
-};
-
-
-/**
- * Insert a new element
- */
-BinarySearchTree.prototype.insert = function (key, value) {
-  // Empty tree, insert as root
-  if (!this.hasOwnProperty('key')) {
-    this.key = key;
-    this.data.push(value);
-    return;
-  }
-
-  // Same key as root
-  if (this.compareKeys(this.key, key) === 0) {
-    if (this.unique) {
-      throw { message: "Can't insert key " + key + ", it violates the unique constraint"
-            , key: key
-            , errorType: 'uniqueViolated'
-            };
-    } else {
-      this.data.push(value);
-    }
-    return;
-  }
-
-  if (this.compareKeys(key, this.key) < 0) {
-    // Insert in left subtree
-    if (this.left) {
-      this.left.insert(key, value);
-    } else {
-      this.createLeftChild({ key: key, value: value });
-    }
-  } else {
-    // Insert in right subtree
-    if (this.right) {
-      this.right.insert(key, value);
-    } else {
-      this.createRightChild({ key: key, value: value });
-    }
-  }
-};
-
-
-/**
- * Search for all data corresponding to a key
- */
-BinarySearchTree.prototype.search = function (key) {
-  if (!this.hasOwnProperty('key')) { return []; }
-
-  if (this.compareKeys(this.key, key) === 0) { return this.data; }
-
-  if (this.compareKeys(key, this.key) < 0) {
-    if (this.left) {
-      return this.left.search(key);
-    } else {
-      return [];
-    }
-  } else {
-    if (this.right) {
-      return this.right.search(key);
-    } else {
-      return [];
-    }
-  }
-};
-
-
-/**
- * Return a function that tells whether a given key matches a lower bound
- */
-BinarySearchTree.prototype.getLowerBoundMatcher = function (query) {
-  var self = this;
-
-  // No lower bound
-  if (!query.hasOwnProperty('$gt') && !query.hasOwnProperty('$gte')) {
-    return function () { return true; };
-  }
-
-  if (query.hasOwnProperty('$gt') && query.hasOwnProperty('$gte')) {
-    if (self.compareKeys(query.$gte, query.$gt) === 0) {
-      return function (key) { return self.compareKeys(key, query.$gt) > 0; };
-    }
-
-    if (self.compareKeys(query.$gte, query.$gt) > 0) {
-      return function (key) { return self.compareKeys(key, query.$gte) >= 0; };
-    } else {
-      return function (key) { return self.compareKeys(key, query.$gt) > 0; };
-    }
-  }
-
-  if (query.hasOwnProperty('$gt')) {
-    return function (key) { return self.compareKeys(key, query.$gt) > 0; };
-  } else {
-    return function (key) { return self.compareKeys(key, query.$gte) >= 0; };
-  }
-};
-
-
-/**
- * Return a function that tells whether a given key matches an upper bound
- */
-BinarySearchTree.prototype.getUpperBoundMatcher = function (query) {
-  var self = this;
-
-  // No lower bound
-  if (!query.hasOwnProperty('$lt') && !query.hasOwnProperty('$lte')) {
-    return function () { return true; };
-  }
-
-  if (query.hasOwnProperty('$lt') && query.hasOwnProperty('$lte')) {
-    if (self.compareKeys(query.$lte, query.$lt) === 0) {
-      return function (key) { return self.compareKeys(key, query.$lt) < 0; };
-    }
-
-    if (self.compareKeys(query.$lte, query.$lt) < 0) {
-      return function (key) { return self.compareKeys(key, query.$lte) <= 0; };
-    } else {
-      return function (key) { return self.compareKeys(key, query.$lt) < 0; };
-    }
-  }
-
-  if (query.hasOwnProperty('$lt')) {
-    return function (key) { return self.compareKeys(key, query.$lt) < 0; };
-  } else {
-    return function (key) { return self.compareKeys(key, query.$lte) <= 0; };
-  }
-};
-
-
-// Append all elements in toAppend to array
-function append (array, toAppend) {
-  var i;
-
-  for (i = 0; i < toAppend.length; i += 1) {
-    array.push(toAppend[i]);
-  }
-}
-
-
-/**
- * Get all data for a key between bounds
- * Return it in key order
- * @param {Object} query Mongo-style query where keys are $lt, $lte, $gt or $gte (other keys are not considered)
- * @param {Functions} lbm/ubm matching functions calculated at the first recursive step
- */
-BinarySearchTree.prototype.betweenBounds = function (query, lbm, ubm) {
-  var res = [];
-
-  if (!this.hasOwnProperty('key')) { return []; }   // Empty tree
-
-  lbm = lbm || this.getLowerBoundMatcher(query);
-  ubm = ubm || this.getUpperBoundMatcher(query);
-
-  if (lbm(this.key) && this.left) { append(res, this.left.betweenBounds(query, lbm, ubm)); }
-  if (lbm(this.key) && ubm(this.key)) { append(res, this.data); }
-  if (ubm(this.key) && this.right) { append(res, this.right.betweenBounds(query, lbm, ubm)); }
-
-  return res;
-};
-
-
-/**
- * Delete the current node if it is a leaf
- * Return true if it was deleted
- */
-BinarySearchTree.prototype.deleteIfLeaf = function () {
-  if (this.left || this.right) { return false; }
-
-  // The leaf is itself a root
-  if (!this.parent) {
-    delete this.key;
-    this.data = [];
-    return true;
-  }
-
-  if (this.parent.left === this) {
-    this.parent.left = null;
-  } else {
-    this.parent.right = null;
-  }
-
-  return true;
-};
-
-
-/**
- * Delete the current node if it has only one child
- * Return true if it was deleted
- */
-BinarySearchTree.prototype.deleteIfOnlyOneChild = function () {
-  var child;
-
-  if (this.left && !this.right) { child = this.left; }
-  if (!this.left && this.right) { child = this.right; }
-  if (!child) { return false; }
-
-  // Root
-  if (!this.parent) {
-    this.key = child.key;
-    this.data = child.data;
-
-    this.left = null;
-    if (child.left) {
-      this.left = child.left;
-      child.left.parent = this;
-    }
-
-    this.right = null;
-    if (child.right) {
-      this.right = child.right;
-      child.right.parent = this;
-    }
-
-    return true;
-  }
-
-  if (this.parent.left === this) {
-    this.parent.left = child;
-    child.parent = this.parent;
-  } else {
-    this.parent.right = child;
-    child.parent = this.parent;
-  }
-
-  return true;
-};
-
-
-/**
- * Delete a key or just a value
- * @param {Key} key
- * @param {Value} value Optional. If not set, the whole key is deleted. If set, only this value is deleted
- */
-BinarySearchTree.prototype.delete = function (key, value) {
-  var newData = [], replaceWith
-    , self = this
-    ;
-
-  if (!this.hasOwnProperty('key')) { return; }
-
-  if (this.compareKeys(key, this.key) < 0) {
-    if (this.left) { this.left.delete(key, value); }
-    return;
-  }
-
-  if (this.compareKeys(key, this.key) > 0) {
-    if (this.right) { this.right.delete(key, value); }
-    return;
-  }
-
-  if (!this.compareKeys(key, this.key) === 0) { return; }
-
-  // Delete only a value
-  if (this.data.length > 1 && value !== undefined) {
-    this.data.forEach(function (d) {
-      if (!self.checkValueEquality(d, value)) { newData.push(d); }
-    });
-    self.data = newData;
-    return;
-  }
-
-  // Delete the whole node
-  if (this.deleteIfLeaf()) {
-    return;
-  }
-  if (this.deleteIfOnlyOneChild()) {
-    return;
-  }
-
-  // We are in the case where the node to delete has two children
-  if (Math.random() >= 0.5) {   // Randomize replacement to avoid unbalancing the tree too much
-    // Use the in-order predecessor
-    replaceWith = this.left.getMaxKeyDescendant();
-
-    this.key = replaceWith.key;
-    this.data = replaceWith.data;
-
-    if (this === replaceWith.parent) {   // Special case
-      this.left = replaceWith.left;
-      if (replaceWith.left) { replaceWith.left.parent = replaceWith.parent; }
-    } else {
-      replaceWith.parent.right = replaceWith.left;
-      if (replaceWith.left) { replaceWith.left.parent = replaceWith.parent; }
-    }
-  } else {
-    // Use the in-order successor
-    replaceWith = this.right.getMinKeyDescendant();
-
-    this.key = replaceWith.key;
-    this.data = replaceWith.data;
-
-    if (this === replaceWith.parent) {   // Special case
-      this.right = replaceWith.right;
-      if (replaceWith.right) { replaceWith.right.parent = replaceWith.parent; }
-    } else {
-      replaceWith.parent.left = replaceWith.right;
-      if (replaceWith.right) { replaceWith.right.parent = replaceWith.parent; }
-    }
-  }
-};
-
-
-/**
- * Execute a function on every node of the tree, in key order
- * @param {Function} fn Signature: node. Most useful will probably be node.key and node.data
- */
-BinarySearchTree.prototype.executeOnEveryNode = function (fn) {
-  if (this.left) { this.left.executeOnEveryNode(fn); }
-  fn(this);
-  if (this.right) { this.right.executeOnEveryNode(fn); }
-};
-
-
-/**
- * Pretty print a tree
- * @param {Boolean} printData To print the nodes' data along with the key
- */
-BinarySearchTree.prototype.prettyPrint = function (printData, spacing) {
-  spacing = spacing || "";
-
-  console.log(spacing + "* " + this.key);
-  if (printData) { console.log(spacing + "* " + this.data); }
-
-  if (!this.left && !this.right) { return; }
-
-  if (this.left) {
-    this.left.prettyPrint(printData, spacing + "  ");
-  } else {
-    console.log(spacing + "  *");
-  }
-  if (this.right) {
-    this.right.prettyPrint(printData, spacing + "  ");
-  } else {
-    console.log(spacing + "  *");
-  }
-};
-
-
-
-
-// Interface
-module.exports = BinarySearchTree;
-
-},{"./customUtils":81}],81:[function(require,module,exports){
-/**
- * Return an array with the numbers from 0 to n-1, in a random order
- */
-function getRandomArray (n) {
-  var res, next;
-
-  if (n === 0) { return []; }
-  if (n === 1) { return [0]; }
-
-  res = getRandomArray(n - 1);
-  next = Math.floor(Math.random() * n);
-  res.splice(next, 0, n - 1);   // Add n-1 at a random position in the array
-
-  return res;
-};
-module.exports.getRandomArray = getRandomArray;
-
-
-/*
- * Default compareKeys function will work for numbers, strings and dates
- */
-function defaultCompareKeysFunction (a, b) {
-  if (a < b) { return -1; }
-  if (a > b) { return 1; }
-  if (a === b) { return 0; }
-
-  throw { message: "Couldn't compare elements", a: a, b: b };
-}
-module.exports.defaultCompareKeysFunction = defaultCompareKeysFunction;
-
-
-/**
- * Check whether two values are equal (used in non-unique deletion)
- */
-function defaultCheckValueEquality (a, b) {
-  return a === b;
-}
-module.exports.defaultCheckValueEquality = defaultCheckValueEquality;
-
-},{}],82:[function(require,module,exports){
-(function (process){
-var path = require('path');
-var fs = require('fs');
-
-module.exports = mkdirP.mkdirp = mkdirP.mkdirP = mkdirP;
-
-function mkdirP (p, mode, f, made) {
-    if (typeof mode === 'function' || mode === undefined) {
-        f = mode;
-        mode = 0777 & (~process.umask());
-    }
-    if (!made) made = null;
-
-    var cb = f || function () {};
-    if (typeof mode === 'string') mode = parseInt(mode, 8);
-    p = path.resolve(p);
-
-    fs.mkdir(p, mode, function (er) {
-        if (!er) {
-            made = made || p;
-            return cb(null, made);
-        }
-        switch (er.code) {
-            case 'ENOENT':
-                mkdirP(path.dirname(p), mode, function (er, made) {
-                    if (er) cb(er, made);
-                    else mkdirP(p, mode, cb, made);
-                });
-                break;
-
-            // In the case of any other error, just see if there's a dir
-            // there already.  If so, then hooray!  If not, then something
-            // is borked.
-            default:
-                fs.stat(p, function (er2, stat) {
-                    // if the stat fails, then that's super weird.
-                    // let the original error be the failure reason.
-                    if (er2 || !stat.isDirectory()) cb(er, made)
-                    else cb(null, made);
-                });
-                break;
-        }
-    });
-}
-
-mkdirP.sync = function sync (p, mode, made) {
-    if (mode === undefined) {
-        mode = 0777 & (~process.umask());
-    }
-    if (!made) made = null;
-
-    if (typeof mode === 'string') mode = parseInt(mode, 8);
-    p = path.resolve(p);
-
-    try {
-        fs.mkdirSync(p, mode);
-        made = made || p;
-    }
-    catch (err0) {
-        switch (err0.code) {
-            case 'ENOENT' :
-                made = sync(path.dirname(p), mode, made);
-                sync(p, mode, made);
-                break;
-
-            // In the case of any other error, just see if there's a dir
-            // there already.  If so, then hooray!  If not, then something
-            // is borked.
-            default:
-                var stat;
-                try {
-                    stat = fs.statSync(p);
-                }
-                catch (err1) {
-                    throw err0;
-                }
-                if (!stat.isDirectory()) throw err0;
-                break;
-        }
-    }
-
-    return made;
-};
-
-}).call(this,require("uojqOp"))
-},{"fs":1,"path":13,"uojqOp":14}],83:[function(require,module,exports){
+}).call(this,require("z02cDi"))
+},{"z02cDi":4}],85:[function(require,module,exports){
 //     Underscore.js 1.4.4
 //     http://underscorejs.org
 //     (c) 2009-2013 Jeremy Ashkenas, DocumentCloud Inc.
@@ -22876,15 +21617,13 @@ mkdirP.sync = function sync (p, mode, made) {
 
 }).call(this);
 
-},{}],"test":[function(require,module,exports){
-module.exports=require('CY9rzU');
-},{}],"CY9rzU":[function(require,module,exports){
+},{}],"0qV9wd":[function(require,module,exports){
 var Loader = function() {
 
   // will be replaced with the json.
   this.dependencies = {"npm":{"nedb":"latest"}};
   //this.nodes = ;
-  this.nodeDefinitions = {"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"nedb":{"datastore":{"_id":"54bb1b39fa15e75e679fd1a4","name":"datastore","ns":"nedb","description":"Nedb Datastore","phrases":{"active":"Creating datastore"},"dependencies":{"npm":{"nedb":"latest"}},"ports":{"input":{"options":{"title":"Options","type":"object","required":false,"properties":{"filename":{"type":"string","description":"path to the file where the data is persisted. If left blank, the datastore is automatically considered in-memory only. It cannot end with a ~ which is used in the temporary files NeDB uses to perform crash-safe writes","required":false},"inMemoryOnly":{"Title":"In Memory only","type":"boolean","description":"In Memory Only","default":false},"onload":{"title":"Onload","type":"function","description":"if you use autoloading, this is the handler called after the loadDatabase. It takes one error argument. If you use autoloading without specifying this handler, and an error happens during load, an error will be thrown.","required":false},"afterSerialization":{"title":"After serialization","type":"function","description":"hook you can use to transform data after it was serialized and before it is written to disk. Can be used for example to encrypt data before writing database to disk. This function takes a string as parameter (one line of an NeDB data file) and outputs the transformed string, which must absolutely not contain a \n character (or data will be lost)","required":false},"beforeDeserialization":{"title":"Before Deserialization","type":"function","description":"reverse of afterSerialization. Make sure to include both and not just one or you risk data loss. For the same reason, make sure both functions are inverses of one another. Some failsafe mechanisms are in place to prevent data loss if you misuse the serialization hooks: NeDB checks that never one is declared without the other, and checks that they are reverse of one another by testing on random strings of various lengths. In addition, if too much data is detected as corrupt, NeDB will refuse to start as it could mean you're not using the deserialization hook corresponding to the serialization hook used before (see below)","required":false},"corruptAlertThreshold":{"type":"number","description":"between 0 and 1, defaults to 10%. NeDB will refuse to start if more than this percentage of the datafile is corrupt. 0 means you don't tolerate any corruption, 1 means you don't care","minValue":0,"maxValue":1,"required":false}}}},"output":{"db":{"title":"Database","type":"Datastore"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  var db = new nedb(input.options);\n  db.loadDatabase(function(err) {\n if (err) {\n      db({error: err});\n    } else {\n  cb({db: db});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"insert":{"_id":"54bb1b39fa15e75e679fd1a5","name":"insert","ns":"nedb","description":"Insert a document into the database","async":true,"phrases":{"active":"Inserting document"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"update":{"_id":"54bb2588fa15e75e679fd1a9","name":"update","ns":"nedb","description":"Update documents within the database","phrases":{"active":"Updating document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"update":{"title":"Query","description":"specifies how the documents should be modified. It is either a new document or a set of modifiers","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the modification of several documents if set to true","type":"boolean","default":false},"upsert":{"title":"Upsert","description":"if you want to insert a new document corresponding to the update rules if your query doesn't match anything. If your update is a simple object with no modifiers, it is the inserted document. In the other case, the query is stripped from all operator recursively, and the update is applied to it.","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numReplaced":{"title":"Replaced","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.update(input.query, input.update, input.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numReplaced: numReplaced});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"remove":{"_id":"54bb2588fa15e75e679fd1a7","name":"remove","ns":"nedb","description":"Remove documents from database","phrases":{"active":"Removing document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the removal of multiple documents if set to true","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numRemoved":{"title":"Removed","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.remove(input.query, input.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numRemoved: numRemoved});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"find":{"_id":"54bb1b39fa15e75e679fd1a2","name":"find","ns":"nedb","description":"Find documents within the database","async":true,"phrases":{"active":"Finding document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.find(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"count":{"_id":"54bb1b39fa15e75e679fd1a1","name":"count","ns":"nedb","description":"Count documents within the database","async":true,"phrases":{"active":"Counting document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"Count","type":"integer"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.count(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}}};
+  this.nodeDefinitions = {"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"nedb":{"datastore":{"_id":"54bb1b39fa15e75e679fd1a4","name":"datastore","ns":"nedb","description":"Nedb Datastore","phrases":{"active":"Creating datastore"},"dependencies":{"npm":{"nedb":"latest"}},"ports":{"input":{"options":{"title":"Options","type":"object","required":false,"properties":{"filename":{"type":"string","description":"path to the file where the data is persisted. If left blank, the datastore is automatically considered in-memory only. It cannot end with a ~ which is used in the temporary files NeDB uses to perform crash-safe writes","required":false},"inMemoryOnly":{"Title":"In Memory only","type":"boolean","description":"In Memory Only","default":false},"onload":{"title":"Onload","type":"function","description":"if you use autoloading, this is the handler called after the loadDatabase. It takes one error argument. If you use autoloading without specifying this handler, and an error happens during load, an error will be thrown.","required":false},"afterSerialization":{"title":"After serialization","type":"function","description":"hook you can use to transform data after it was serialized and before it is written to disk. Can be used for example to encrypt data before writing database to disk. This function takes a string as parameter (one line of an NeDB data file) and outputs the transformed string, which must absolutely not contain a \n character (or data will be lost)","required":false},"beforeDeserialization":{"title":"Before Deserialization","type":"function","description":"reverse of afterSerialization. Make sure to include both and not just one or you risk data loss. For the same reason, make sure both functions are inverses of one another. Some failsafe mechanisms are in place to prevent data loss if you misuse the serialization hooks: NeDB checks that never one is declared without the other, and checks that they are reverse of one another by testing on random strings of various lengths. In addition, if too much data is detected as corrupt, NeDB will refuse to start as it could mean you're not using the deserialization hook corresponding to the serialization hook used before (see below)","required":false},"corruptAlertThreshold":{"type":"number","description":"between 0 and 1, defaults to 10%. NeDB will refuse to start if more than this percentage of the datafile is corrupt. 0 means you don't tolerate any corruption, 1 means you don't care","minValue":0,"maxValue":1,"required":false}}}},"output":{"db":{"title":"Database","type":"Datastore"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  var db = new nedb(input.options);\n  db.loadDatabase(function(err) {\n    if (err) {\n      output({error: err});\n    } else {\n      output({db: db});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"insert":{"_id":"54bb1b39fa15e75e679fd1a5","name":"insert","ns":"nedb","description":"Insert a document into the database","async":true,"phrases":{"active":"Inserting document"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"update":{"_id":"54bb2588fa15e75e679fd1a9","name":"update","ns":"nedb","description":"Update documents within the database","phrases":{"active":"Updating document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"update":{"title":"Query","description":"specifies how the documents should be modified. It is either a new document or a set of modifiers","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the modification of several documents if set to true","type":"boolean","default":false},"upsert":{"title":"Upsert","description":"if you want to insert a new document corresponding to the update rules if your query doesn't match anything. If your update is a simple object with no modifiers, it is the inserted document. In the other case, the query is stripped from all operator recursively, and the update is applied to it.","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numReplaced":{"title":"Replaced","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.update(input.query, input.update, input.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numReplaced: numReplaced});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"remove":{"_id":"54bb2588fa15e75e679fd1a7","name":"remove","ns":"nedb","description":"Remove documents from database","phrases":{"active":"Removing document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the removal of multiple documents if set to true","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numRemoved":{"title":"Removed","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.remove(input.query, input.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numRemoved: numRemoved});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"find":{"_id":"54bb1b39fa15e75e679fd1a2","name":"find","ns":"nedb","description":"Find documents within the database","async":true,"phrases":{"active":"Finding document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.find(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"count":{"_id":"54bb1b39fa15e75e679fd1a1","name":"count","ns":"nedb","description":"Count documents within the database","async":true,"phrases":{"active":"Counting document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"Count","type":"integer"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.count(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}}};
 
 };
 
@@ -22917,16 +21656,18 @@ Loader.prototype.getNodeDefinition = function(node, map) {
 var Flow = require('chix-flow').Flow;
 var loader = new Loader();
 
-var map = {"type":"flow","nodes":[{"id":"Database","title":"Database","ns":"nedb","name":"datastore"},{"id":"Insert","title":"Insert","ns":"nedb","name":"insert"},{"id":"Update","title":"Update","ns":"nedb","name":"update"},{"id":"Remove","title":"Remove","ns":"nedb","name":"remove"},{"id":"Find","title":"Find","ns":"nedb","name":"find"},{"id":"Count","title":"Count","ns":"nedb","name":"count"},{"id":"Log","title":"Log","ns":"console","name":"log"},{"id":"Complete","title":"Complete","ns":"console","name":"log","context":{"msg":"complete!"}}],"links":[{"source":{"id":"Database","port":"db"},"target":{"id":"Insert","port":"db"},"metadata":{"title":"Database db -> db Insert"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Find","port":"db"},"metadata":{"title":"Database db -> db Find"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Count","port":"db"},"metadata":{"title":"Database db -> db Count"}},{"source":{"id":"Database","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Database error -> msg Log"}},{"source":{"id":"Insert","port":"out"},"target":{"id":"Find","port":":start"},"metadata":{"title":"Insert out -> :start Find"}},{"source":{"id":"Insert","port":"out"},"target":{"id":"Count","port":":start"},"metadata":{"title":"Insert out -> :start Count"}},{"source":{"id":"Find","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find out -> msg Log"}},{"source":{"id":"Count","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Count out -> msg Log"}}],"title":"Test database","ns":"nedb","name":"test","id":"TestDataBase","providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}};
+var map = {"type":"flow","nodes":[{"id":"Database","title":"Database","ns":"nedb","name":"datastore"},{"id":"Insert","title":"Insert","ns":"nedb","name":"insert"},{"id":"Update","title":"Update","ns":"nedb","name":"update"},{"id":"Remove","title":"Remove","ns":"nedb","name":"remove"},{"id":"Find","title":"Find","ns":"nedb","name":"find"},{"id":"Count","title":"Count","ns":"nedb","name":"count"},{"id":"Log","title":"Log","ns":"console","name":"log"},{"id":"Complete","title":"Complete","ns":"console","name":"log","context":{"msg":"complete!"}}],"links":[{"source":{"id":"Database","port":"db"},"target":{"id":"Insert","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Insert"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Find","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Find"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Count","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Count"}},{"source":{"id":"Database","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Database error -> msg Log"}},{"source":{"id":"Insert","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Insert error -> msg Log"}},{"source":{"id":"Find","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find error -> msg Log"}},{"source":{"id":"Count","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Count error -> msg Log"}},{"source":{"id":"Insert","port":"out"},"target":{"id":"Find","port":":start"},"metadata":{"title":"Insert out -> :start Find"}},{"source":{"id":"Find","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find out -> msg Log"}}],"title":"Test database","ns":"nedb","name":"app","id":"TestDataBase","providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}};
 
 var actor;
 window.Actor = actor = Flow.create(map, loader);
 
+var monitor = require('chix-monitor-npmlog').Actor;
+monitor(console, actor);
 
 function onDeviceReady() {
 actor.run();
 actor.push();
-actor.sendIIPs([{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Insert","port":"in"},"metadata":{"title":"Test database :iip -> in Insert"},"data":{"uname":"rhalff","first":"Rob","last":"Halff"}},{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Find","port":"in","setting":{"index":"uname"}},"metadata":{"title":"Test database :iip -> in Find"},"data":"rhalff"},{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Count","port":"in"},"metadata":{"title":"Test database :iip -> in Count"},"data":{}}]);
+actor.sendIIPs([{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Insert","port":"in"},"metadata":{"title":"Test database :iip -> in Insert"},"data":{"uname":"rhalff","first":"Rob","last":"Halff"}},{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Find","port":"in","setting":{"index":"uname"}},"metadata":{"title":"Test database :iip -> in Find"},"data":"rhalff"}]);
 
 };
 
@@ -22940,4 +21681,6 @@ if (navigator.userAgent.match(/(iPhone|iPod|iPad|Android|BlackBerry|IEMobile)/))
 // as long as this module is loaded.
 module.exports = actor;
 
-},{"chix-flow":"jXAsbI"}]},{},["CY9rzU"])
+},{"chix-flow":"/+Mzp9","chix-monitor-npmlog":"urJme/"}],"app":[function(require,module,exports){
+module.exports=require('0qV9wd');
+},{}]},{},["0qV9wd"])
