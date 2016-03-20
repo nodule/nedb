@@ -3,7 +3,7 @@ ns: nedb
 name: app
 id: TestDataBase
 
-#provider ./{ns}/{name}.fbp as x
+provider ./graphs/{ns}/{name}.fbp as x
 
 Database(nedb/datastore)
 Insert(nedb/insert)
@@ -14,27 +14,30 @@ Count(nedb/count)
 Log(console/log)
 Complete(console/log)
 
-#View(x:views/view)
+View(x:views/view)
 
 # Bug should throw no such port..
 # {} -> @in Database
 #{} -> options Database
 
 "complete!" -> @msg Complete
+'' -> @clear View
 
 Database db -> ^db Insert
 Database db -> ^db Find
 Database db -> ^db Count
 
-#'' -> :start View
+# perhaps without a real inport it does not work
+'' -> :start View
 
 Database error -> msg Log
 Insert error -> msg Log
 Find error -> msg Log
 Count error -> msg Log
 
-#View out -> msg Log
+View out -> msg Log
 
+/*
 {
   "uname": "rhalff",
   "first": "Rob",
@@ -42,9 +45,10 @@ Count error -> msg Log
 } -> in Insert
 
 "rhalff" -> [uname] in Find
+*/
 
-# View out -> [uname] in Find
-#View out -> in Insert
+View out [uname] -> [uname] in Find
+View out -> in Insert
 
 # {} -> in Count
 

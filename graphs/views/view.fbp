@@ -12,7 +12,8 @@ GetValue(dom/getValue)
 Item(object/set)
 InputEl(dom/querySelector)
 
-'' -> @in ClearValue
+#'' -> @in ClearValue
+-> in:clear ClearValue
 InputEl selection -> ^element ClearValue
 
 'started' -> msg Log

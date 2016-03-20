@@ -1677,7 +1677,7 @@ AVLTree.prototype.delete = function (key, value) {
 // Interface
 module.exports = AVLTree;
 
-},{"./bst":9,"./customUtils":10,"underscore":85,"util":6}],9:[function(require,module,exports){
+},{"./bst":9,"./customUtils":10,"underscore":87,"util":6}],9:[function(require,module,exports){
 /**
  * Simple binary search tree
  */
@@ -16796,7 +16796,470 @@ function coerce(val) {
   return val;
 }
 
-},{"ms":73}],73:[function(require,module,exports){
+},{"ms":75}],"dot-object":[function(require,module,exports){
+module.exports=require('hdx97b');
+},{}],"hdx97b":[function(require,module,exports){
+'use strict';
+
+function _process(v, mod) {
+  var i;
+  var r;
+
+  if (typeof mod === 'function') {
+    r = mod(v);
+    if (r !== undefined) {
+      v = r;
+    }
+  } else if (Array.isArray(mod)) {
+    for (i = 0; i < mod.length; i++) {
+      r = mod[i](v);
+      if (r !== undefined) {
+        v = r;
+      }
+    }
+  }
+
+  return v;
+}
+
+function parseKey(key, val) {
+  // detect negative index notation
+  if (key[0] === '-' && Array.isArray(val) && /^-\d+$/.test(key)) {
+    return val.length + parseInt(key, 10);
+  }
+  return key;
+}
+
+function isIndex(k) {
+  return /^\d+/.test(k);
+}
+
+function parsePath(path, sep) {
+  if (path.indexOf('[') >= 0) {
+    path = path.
+      replace(/\[/g, '.').
+      replace(/]/g, '');
+  }
+  return path.split(sep);
+}
+
+function DotObject(seperator, override, useArray) {
+
+  if (!(this instanceof DotObject)) {
+    return new DotObject(seperator, override, useArray);
+  }
+
+  if (typeof seperator === 'undefined') { seperator = '.'; }
+  if (typeof override === 'undefined') { override = false; }
+  if (typeof useArray === 'undefined') { useArray = true; }
+  this.seperator = seperator;
+  this.override = override;
+  this.useArray = useArray;
+
+  // contains touched arrays
+  this.cleanup = [];
+}
+
+var dotDefault = new DotObject('.', false, true);
+function wrap(method) {
+  return function() {
+    return dotDefault[method].apply(dotDefault, arguments);
+  };
+}
+
+DotObject.prototype._fill = function(a, obj, v, mod) {
+  var k = a.shift();
+
+  if (a.length > 0) {
+    obj[k] = obj[k] ||
+      (this.useArray && isIndex(a[0]) ? [] : {});
+
+    if (obj[k] !== Object(obj[k])) {
+      if (this.override) {
+        obj[k] = {};
+      } else {
+        throw new Error(
+          'Trying to redefine `' + k + '` which is a ' + typeof obj[k]
+        );
+      }
+    }
+
+    this._fill(a, obj[k], v, mod);
+  } else {
+    if (!this.override &&
+      obj[k] === Object(obj[k]) && Object.keys(obj[k]).length) {
+      throw new Error('Trying to redefine non-empty obj[\'' + k + '\']');
+    }
+
+    obj[k] = _process(v, mod);
+  }
+};
+
+/**
+ *
+ * Converts an object with dotted-key/value pairs to it's expanded version
+ *
+ * Optionally transformed by a set of modifiers.
+ *
+ * Usage:
+ *
+ *   var row = {
+ *     'nr': 200,
+ *     'doc.name': '  My Document  '
+ *   };
+ *
+ *   var mods = {
+ *     'doc.name': [_s.trim, _s.underscored]
+ *   };
+ *
+ *   dot.object(row, mods);
+ *
+ * @param {Object} obj
+ * @param {Object} mods
+ */
+DotObject.prototype.object = function(obj, mods) {
+  var self = this;
+
+  Object.keys(obj).forEach(function(k) {
+    var mod = mods === undefined ? null : mods[k];
+    // normalize array notation.
+    var ok = parsePath(k, self.seperator).join(self.seperator);
+
+    if (ok.indexOf(self.seperator) !== -1) {
+      self._fill(ok.split(self.seperator), obj, obj[k], mod);
+      delete obj[k];
+    } else if (self.override) {
+      obj[k] = _process(obj[k], mod);
+    }
+  });
+
+  return obj;
+};
+
+/**
+ * @param {String} path dotted path
+ * @param {String} v value to be set
+ * @param {Object} obj object to be modified
+ * @param {Function|Array} mod optional modifier
+ */
+DotObject.prototype.str = function(path, v, obj, mod) {
+  if (path.indexOf(this.seperator) !== -1) {
+    this._fill(path.split(this.seperator), obj, v, mod);
+  } else if (this.override) {
+    obj[path] = _process(v, mod);
+  }
+
+  return obj;
+};
+
+/**
+ *
+ * Pick a value from an object using dot notation.
+ *
+ * Optionally remove the value
+ *
+ * @param {String} path
+ * @param {Object} obj
+ * @param {Boolean} remove
+ */
+DotObject.prototype.pick = function(path, obj, remove) {
+  var i;
+  var keys;
+  var val;
+  var key;
+  var cp;
+
+  keys = parsePath(path, this.seperator);
+  for (i = 0; i < keys.length; i++) {
+    key = parseKey(keys[i], obj);
+    if (obj && typeof obj === 'object' && key in obj) {
+      if (i === (keys.length - 1)) {
+        if (remove) {
+          val = obj[key];
+          delete obj[key];
+          if (Array.isArray(obj)) {
+            cp = keys.slice(0, -1).join('.');
+            if (this.cleanup.indexOf(cp) === -1) {
+              this.cleanup.push(cp);
+            }
+          }
+          return val;
+        } else {
+          return obj[key];
+        }
+      } else {
+        obj = obj[key];
+      }
+    } else {
+      return undefined;
+    }
+  }
+  if (remove && Array.isArray(obj)) {
+    obj = obj.filter(function(n) { return n !== undefined; });
+  }
+  return obj;
+};
+
+/**
+ *
+ * Remove value from an object using dot notation.
+ *
+ * @param {String} path
+ * @param {Object} obj
+ * @return {Mixed} The removed value
+ */
+DotObject.prototype.remove = function(path, obj) {
+  var i;
+
+  this.cleanup = [];
+  if (Array.isArray(path)) {
+    for (i = 0; i < path.length; i++) {
+      this.pick(path[i], obj, true);
+    }
+    this._cleanup(obj);
+    return obj;
+  } else {
+    return this.pick(path, obj, true);
+  }
+};
+
+DotObject.prototype._cleanup = function(obj) {
+  var ret;
+  var i;
+  var keys;
+  var root;
+  if (this.cleanup.length) {
+    for (i = 0; i < this.cleanup.length; i++) {
+      keys = this.cleanup[i].split('.');
+      root = keys.splice(0, -1).join('.');
+      ret = root ? this.pick(root, obj) : obj;
+      ret = ret[keys[0]].filter(function(v) { return v !== undefined; });
+      this.set(this.cleanup[i], ret, obj);
+    }
+    this.cleanup = [];
+  }
+};
+
+// alias method
+DotObject.prototype.del = DotObject.prototype.remove;
+
+/**
+ *
+ * Move a property from one place to the other.
+ *
+ * If the source path does not exist (undefined)
+ * the target property will not be set.
+ *
+ * @param {String} source
+ * @param {String} target
+ * @param {Object} obj
+ * @param {Function|Array} mods
+ * @param {Boolean} merge
+ */
+DotObject.prototype.move = function(source, target, obj, mods, merge) {
+
+  if (typeof mods === 'function' || Array.isArray(mods)) {
+    this.set(target, _process(this.pick(source, obj, true), mods), obj, merge);
+  } else {
+    merge = mods;
+    this.set(target, this.pick(source, obj, true), obj, merge);
+  }
+
+  return obj;
+
+};
+
+/**
+ *
+ * Transfer a property from one object to another object.
+ *
+ * If the source path does not exist (undefined)
+ * the property on the other object will not be set.
+ *
+ * @param {String} source
+ * @param {String} target
+ * @param {Object} obj1
+ * @param {Object} obj2
+ * @param {Function|Array} mods
+ * @param {Boolean} merge
+ */
+DotObject.prototype.transfer =
+  function(source, target, obj1, obj2, mods, merge) {
+
+    if (typeof mods === 'function' || Array.isArray(mods)) {
+      this.set(target,
+        _process(
+          this.pick(source, obj1, true),
+          mods
+        ), obj2, merge);
+    } else {
+      merge = mods;
+      this.set(target, this.pick(source, obj1, true), obj2, merge);
+    }
+
+    return obj2;
+  };
+
+/**
+ *
+ * Copy a property from one object to another object.
+ *
+ * If the source path does not exist (undefined)
+ * the property on the other object will not be set.
+ *
+ * @param {String} source
+ * @param {String} target
+ * @param {Object} obj1
+ * @param {Object} obj2
+ * @param {Function|Array} mods
+ * @param {Boolean} merge
+ */
+DotObject.prototype.copy = function(source, target, obj1, obj2, mods, merge) {
+
+  if (typeof mods === 'function' || Array.isArray(mods)) {
+    this.set(target,
+      _process(
+        // clone what is picked
+        JSON.parse(
+          JSON.stringify(
+            this.pick(source, obj1, false)
+          )
+        ),
+        mods
+      ), obj2, merge);
+  } else {
+    merge = mods;
+    this.set(target, this.pick(source, obj1, false), obj2, merge);
+  }
+
+  return obj2;
+
+};
+
+function isObject(val) {
+  return Object.prototype.toString.call(val) === '[object Object]';
+}
+
+/**
+ *
+ * Set a property on an object using dot notation.
+ *
+ * @param {String} path
+ * @param {Mixed} val
+ * @param {Object} obj
+ * @param {Boolean} merge
+ */
+DotObject.prototype.set = function(path, val, obj, merge) {
+  var i;
+  var k;
+  var keys;
+  var key;
+
+  // Do not operate if the value is undefined.
+  if (typeof val === 'undefined') {
+    return obj;
+  }
+  keys = parsePath(path, this.seperator);
+
+  for (i = 0; i < keys.length; i++) {
+    key = keys[i];
+    if (i === (keys.length - 1)) {
+      if (merge && isObject(val) && isObject(obj[key])) {
+        for (k in val) {
+          if (val.hasOwnProperty(k)) {
+            obj[key][k] = val[k];
+          }
+        }
+
+      } else if (merge && Array.isArray(obj[key]) && Array.isArray(val)) {
+        for (var j = 0; j < val.length; j++) {
+          obj[keys[i]].push(val[j]);
+        }
+      } else {
+        obj[key] = val;
+      }
+    } else if (
+      // force the value to be an object
+      !obj.hasOwnProperty(key) ||
+      (!isObject(obj[key]) && !Array.isArray(obj[key]))
+      ) {
+      // initialize as array if next key is numeric
+      if (/^\d+$/.test(keys[i + 1])) {
+        obj[key] = [];
+      } else {
+        obj[key] = {};
+      }
+    }
+    obj = obj[key];
+  }
+  return obj;
+};
+
+/**
+ *
+ * Convert object to dotted-key/value pair
+ *
+ * Usage:
+ *
+ *   var tgt = dot.dot(obj);
+ *
+ *   or
+ *
+ *   var tgt = {};
+ *   dot.dot(obj, tgt);
+ *
+ * @param {Object} obj source object
+ * @param {Object} tgt target object
+ * @param {Array} path path array (internal)
+ */
+DotObject.prototype.dot = function(obj, tgt, path) {
+  tgt = tgt ? tgt : {};
+  path = path ? path : [];
+  Object.keys(obj).forEach(function(key) {
+    if (Object(obj[key]) === obj[key]) {
+      return this.dot(obj[key], tgt, path.concat(key));
+    } else {
+      tgt[path.concat(key).join(this.seperator)] = obj[key];
+    }
+  }.bind(this));
+  return tgt;
+};
+
+DotObject.pick = wrap('pick');
+DotObject.move = wrap('move');
+DotObject.transfer = wrap('transfer');
+DotObject.copy = wrap('copy');
+DotObject.object = wrap('object');
+DotObject.str = wrap('str');
+DotObject.set = wrap('set');
+DotObject.del = DotObject.remove = wrap('remove');
+DotObject.dot = wrap('dot');
+
+['override', 'overwrite'].forEach(function(prop) {
+  Object.defineProperty(DotObject, prop, {
+    get: function() {
+      return dotDefault.override;
+    },
+    set: function(val) {
+      dotDefault.override = !!val;
+    }
+  });
+});
+
+Object.defineProperty(DotObject, 'useArray', {
+  get: function() {
+    return dotDefault.useArray;
+  },
+  set: function(val) {
+    dotDefault.useArray = val;
+  }
+});
+
+DotObject._process = _process;
+
+module.exports = DotObject;
+
+},{}],75:[function(require,module,exports){
 /**
  * Helpers.
  */
@@ -16923,7 +17386,7 @@ function plural(ms, n, name) {
   return Math.ceil(ms / n) + ' ' + name + 's';
 }
 
-},{}],74:[function(require,module,exports){
+},{}],76:[function(require,module,exports){
 /**
  * Specific customUtils for the browser, where we don't have access to the Crypto and Buffer modules
  */
@@ -17003,7 +17466,7 @@ function uid (len) {
 
 module.exports.uid = uid;
 
-},{}],75:[function(require,module,exports){
+},{}],77:[function(require,module,exports){
 /**
  * Way data is stored for this database
  * For a Node.js/Node Webkit database it's the file system
@@ -17108,7 +17571,7 @@ var Datastore = require('./lib/datastore');
 
 module.exports = Datastore;
 
-},{"./lib/datastore":79}],78:[function(require,module,exports){
+},{"./lib/datastore":81}],80:[function(require,module,exports){
 /**
  * Manage access to data, be it to find, update or remove it
  */
@@ -17295,7 +17758,7 @@ Cursor.prototype.exec = function () {
 // Interface
 module.exports = Cursor;
 
-},{"./model":82,"underscore":85}],79:[function(require,module,exports){
+},{"./model":84,"underscore":87}],81:[function(require,module,exports){
 var customUtils = require('./customUtils')
   , model = require('./model')
   , async = require('async')
@@ -17916,7 +18379,7 @@ Datastore.prototype.remove = function () {
 
 module.exports = Datastore;
 
-},{"./cursor":78,"./customUtils":74,"./executor":80,"./indexes":81,"./model":82,"./persistence":83,"async":84,"underscore":85,"util":6}],80:[function(require,module,exports){
+},{"./cursor":80,"./customUtils":76,"./executor":82,"./indexes":83,"./model":84,"./persistence":85,"async":86,"underscore":87,"util":6}],82:[function(require,module,exports){
 (function (process){
 /**
  * Responsible for sequentially executing actions on the database
@@ -17997,7 +18460,7 @@ Executor.prototype.processBuffer = function () {
 module.exports = Executor;
 
 }).call(this,require("z02cDi"))
-},{"async":84,"z02cDi":4}],81:[function(require,module,exports){
+},{"async":86,"z02cDi":4}],83:[function(require,module,exports){
 var BinarySearchTree = require('binary-search-tree').AVLTree
   , model = require('./model')
   , _ = require('underscore')
@@ -18293,7 +18756,7 @@ Index.prototype.getAll = function () {
 // Interface
 module.exports = Index;
 
-},{"./model":82,"binary-search-tree":7,"underscore":85,"util":6}],82:[function(require,module,exports){
+},{"./model":84,"binary-search-tree":7,"underscore":87,"util":6}],84:[function(require,module,exports){
 /**
  * Handle models (i.e. docs)
  * Serialization/deserialization
@@ -19056,7 +19519,7 @@ module.exports.match = match;
 module.exports.areThingsEqual = areThingsEqual;
 module.exports.compareThings = compareThings;
 
-},{"underscore":85,"util":6}],83:[function(require,module,exports){
+},{"underscore":87,"util":6}],85:[function(require,module,exports){
 (function (process){
 /**
  * Handle every persistence-related task
@@ -19427,7 +19890,7 @@ Persistence.prototype.loadDatabase = function (cb) {
 module.exports = Persistence;
 
 }).call(this,require("z02cDi"))
-},{"./customUtils":74,"./indexes":81,"./model":82,"./storage":75,"async":84,"path":3,"z02cDi":4}],84:[function(require,module,exports){
+},{"./customUtils":76,"./indexes":83,"./model":84,"./storage":77,"async":86,"path":3,"z02cDi":4}],86:[function(require,module,exports){
 (function (process){
 /*global setImmediate: false, setTimeout: false, console: false */
 (function () {
@@ -20389,7 +20852,7 @@ module.exports = Persistence;
 }());
 
 }).call(this,require("z02cDi"))
-},{"z02cDi":4}],85:[function(require,module,exports){
+},{"z02cDi":4}],87:[function(require,module,exports){
 //     Underscore.js 1.4.4
 //     http://underscorejs.org
 //     (c) 2009-2013 Jeremy Ashkenas, DocumentCloud Inc.
@@ -21617,13 +22080,15 @@ module.exports = Persistence;
 
 }).call(this);
 
+},{}],"app":[function(require,module,exports){
+module.exports=require('0qV9wd');
 },{}],"0qV9wd":[function(require,module,exports){
 var Loader = function() {
 
   // will be replaced with the json.
-  this.dependencies = {"npm":{"nedb":"latest"}};
+  this.dependencies = {"npm":{"nedb":"latest","dot-object":"0.x.x"}};
   //this.nodes = ;
-  this.nodeDefinitions = {"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"nedb":{"datastore":{"_id":"54bb1b39fa15e75e679fd1a4","name":"datastore","ns":"nedb","description":"Nedb Datastore","phrases":{"active":"Creating datastore"},"dependencies":{"npm":{"nedb":"latest"}},"ports":{"input":{"options":{"title":"Options","type":"object","required":false,"properties":{"filename":{"type":"string","description":"path to the file where the data is persisted. If left blank, the datastore is automatically considered in-memory only. It cannot end with a ~ which is used in the temporary files NeDB uses to perform crash-safe writes","required":false},"inMemoryOnly":{"Title":"In Memory only","type":"boolean","description":"In Memory Only","default":false},"onload":{"title":"Onload","type":"function","description":"if you use autoloading, this is the handler called after the loadDatabase. It takes one error argument. If you use autoloading without specifying this handler, and an error happens during load, an error will be thrown.","required":false},"afterSerialization":{"title":"After serialization","type":"function","description":"hook you can use to transform data after it was serialized and before it is written to disk. Can be used for example to encrypt data before writing database to disk. This function takes a string as parameter (one line of an NeDB data file) and outputs the transformed string, which must absolutely not contain a \n character (or data will be lost)","required":false},"beforeDeserialization":{"title":"Before Deserialization","type":"function","description":"reverse of afterSerialization. Make sure to include both and not just one or you risk data loss. For the same reason, make sure both functions are inverses of one another. Some failsafe mechanisms are in place to prevent data loss if you misuse the serialization hooks: NeDB checks that never one is declared without the other, and checks that they are reverse of one another by testing on random strings of various lengths. In addition, if too much data is detected as corrupt, NeDB will refuse to start as it could mean you're not using the deserialization hook corresponding to the serialization hook used before (see below)","required":false},"corruptAlertThreshold":{"type":"number","description":"between 0 and 1, defaults to 10%. NeDB will refuse to start if more than this percentage of the datafile is corrupt. 0 means you don't tolerate any corruption, 1 means you don't care","minValue":0,"maxValue":1,"required":false}}}},"output":{"db":{"title":"Database","type":"Datastore"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  var db = new nedb(input.options);\n  db.loadDatabase(function(err) {\n    if (err) {\n      output({error: err});\n    } else {\n      output({db: db});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"insert":{"_id":"54bb1b39fa15e75e679fd1a5","name":"insert","ns":"nedb","description":"Insert a document into the database","async":true,"phrases":{"active":"Inserting document"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"update":{"_id":"54bb2588fa15e75e679fd1a9","name":"update","ns":"nedb","description":"Update documents within the database","phrases":{"active":"Updating document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"update":{"title":"Query","description":"specifies how the documents should be modified. It is either a new document or a set of modifiers","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the modification of several documents if set to true","type":"boolean","default":false},"upsert":{"title":"Upsert","description":"if you want to insert a new document corresponding to the update rules if your query doesn't match anything. If your update is a simple object with no modifiers, it is the inserted document. In the other case, the query is stripped from all operator recursively, and the update is applied to it.","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numReplaced":{"title":"Replaced","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.update(input.query, input.update, input.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numReplaced: numReplaced});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"remove":{"_id":"54bb2588fa15e75e679fd1a7","name":"remove","ns":"nedb","description":"Remove documents from database","phrases":{"active":"Removing document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the removal of multiple documents if set to true","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numRemoved":{"title":"Removed","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.remove(input.query, input.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numRemoved: numRemoved});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"find":{"_id":"54bb1b39fa15e75e679fd1a2","name":"find","ns":"nedb","description":"Find documents within the database","async":true,"phrases":{"active":"Finding document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.find(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"count":{"_id":"54bb1b39fa15e75e679fd1a1","name":"count","ns":"nedb","description":"Count documents within the database","async":true,"phrases":{"active":"Counting document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"Count","type":"integer"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.count(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}}};
+  this.nodeDefinitions = {"./{ns}/{name}.fbp":{"views":{"view":{"id":"a2092cbc-706f-446f-b2a8-dae016535a90","type":"flow","nodes":[{"id":"1d1288ff-8641-4253-9b21-4f3325e60ed2","title":"Log","ns":"console","name":"log"},{"id":"9445a26b-e442-4d15-b536-973200d09513","title":"ButtonEl","ns":"dom","name":"querySelector"},{"id":"92ee7431-40ef-460a-b4f7-d3ff89281c47","title":"ButtonClick","ns":"dom","name":"addMouseEvent","context":{"event":"click"}},{"id":"c4c6dc65-0ad2-4bd0-a737-86854c47085b","title":"ClearValue","ns":"dom","name":"setValue"},{"id":"deb0299a-371c-4958-89fa-380b50140e89","title":"GetValue","ns":"dom","name":"getValue"},{"id":"89dabc64-7058-44d5-b5fc-1e01231c9080","title":"Item","ns":"object","name":"set","context":{"path":"uname"}},{"id":"c7334173-30ab-448c-8a18-f1bec13993f7","title":"InputEl","ns":"dom","name":"querySelector","context":{"selector":"input[type=text]"}}],"links":[{"id":"b2e34edc-c4c6-4a58-a08f-4372e7b0f431","source":{"id":"c7334173-30ab-448c-8a18-f1bec13993f7","port":"selection"},"target":{"id":"c4c6dc65-0ad2-4bd0-a737-86854c47085b","port":"element","setting":{"persist":true}},"metadata":{"title":"InputEl selection -> element ClearValue"}},{"id":"c9a2a5ce-ccdb-4f0e-bf37-f367400a3051","source":{"id":"c7334173-30ab-448c-8a18-f1bec13993f7","port":"selection"},"target":{"id":"deb0299a-371c-4958-89fa-380b50140e89","port":"element"},"metadata":{"title":"InputEl selection -> element GetValue"}},{"id":"c7400b7b-e578-45de-85e0-a4bbf4e69291","source":{"id":"deb0299a-371c-4958-89fa-380b50140e89","port":"out"},"target":{"id":"89dabc64-7058-44d5-b5fc-1e01231c9080","port":"in"},"metadata":{"title":"GetValue out -> in Item"}},{"id":"5487f415-ab3e-4d1b-917e-30878fae6c5d","source":{"id":"c7334173-30ab-448c-8a18-f1bec13993f7","port":"selection"},"target":{"id":"1d1288ff-8641-4253-9b21-4f3325e60ed2","port":"msg"},"metadata":{"title":"InputEl selection -> msg Log"}},{"id":"04dddf35-3f4b-4a38-87d2-a20c372cfc79","source":{"id":"89dabc64-7058-44d5-b5fc-1e01231c9080","port":"out"},"target":{"id":"c4c6dc65-0ad2-4bd0-a737-86854c47085b","port":":start"},"metadata":{"title":"Item out -> :start ClearValue"}},{"id":"4eee74d7-2c1e-4d43-bcce-d482b6884c43","source":{"id":"9445a26b-e442-4d15-b536-973200d09513","port":"selection"},"target":{"id":"92ee7431-40ef-460a-b4f7-d3ff89281c47","port":"element"},"metadata":{"title":"ButtonEl selection -> element ButtonClick"}},{"id":"71b9734a-dfd5-41a3-901a-33bdc89c30e2","source":{"id":"92ee7431-40ef-460a-b4f7-d3ff89281c47","port":"out"},"target":{"id":"c7334173-30ab-448c-8a18-f1bec13993f7","port":":start"},"metadata":{"title":"ButtonClick out -> :start InputEl"}},{"id":"7b00351e-c767-45f6-812c-60bad706f875","source":{"id":"89dabc64-7058-44d5-b5fc-1e01231c9080","port":"out"},"target":{"id":"1d1288ff-8641-4253-9b21-4f3325e60ed2","port":"msg"},"metadata":{"title":"Item out -> msg Log"}},{"id":"e19ba741-4ee9-4f79-9e02-db091dad4e03","source":{"id":"deb0299a-371c-4958-89fa-380b50140e89","port":"out"},"target":{"id":"1d1288ff-8641-4253-9b21-4f3325e60ed2","port":"msg"},"metadata":{"title":"GetValue out -> msg Log"}},{"id":"0434a7bb-e326-442d-8cd1-ec07aea5e42b","source":{"id":"92ee7431-40ef-460a-b4f7-d3ff89281c47","port":"out"},"target":{"id":"1d1288ff-8641-4253-9b21-4f3325e60ed2","port":"msg"},"metadata":{"title":"ButtonClick out -> msg Log"}}],"title":"DB View","ns":"views","name":"view","ports":{"input":{"clear":{"nodeId":"c4c6dc65-0ad2-4bd0-a737-86854c47085b","title":"Clear","name":"in"}},"output":{"out":{"nodeId":"89dabc64-7058-44d5-b5fc-1e01231c9080","title":"Out","name":"out"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./{ns}/{name}.fbp"}}},"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"nedb":{"datastore":{"_id":"54bb1b39fa15e75e679fd1a4","name":"datastore","ns":"nedb","description":"Nedb Datastore","phrases":{"active":"Creating datastore"},"dependencies":{"npm":{"nedb":"latest"}},"ports":{"input":{"options":{"title":"Options","type":"object","required":false,"properties":{"filename":{"type":"string","description":"path to the file where the data is persisted. If left blank, the datastore is automatically considered in-memory only. It cannot end with a ~ which is used in the temporary files NeDB uses to perform crash-safe writes","required":false},"inMemoryOnly":{"Title":"In Memory only","type":"boolean","description":"In Memory Only","default":false},"onload":{"title":"Onload","type":"function","description":"if you use autoloading, this is the handler called after the loadDatabase. It takes one error argument. If you use autoloading without specifying this handler, and an error happens during load, an error will be thrown.","required":false},"afterSerialization":{"title":"After serialization","type":"function","description":"hook you can use to transform data after it was serialized and before it is written to disk. Can be used for example to encrypt data before writing database to disk. This function takes a string as parameter (one line of an NeDB data file) and outputs the transformed string, which must absolutely not contain a \n character (or data will be lost)","required":false},"beforeDeserialization":{"title":"Before Deserialization","type":"function","description":"reverse of afterSerialization. Make sure to include both and not just one or you risk data loss. For the same reason, make sure both functions are inverses of one another. Some failsafe mechanisms are in place to prevent data loss if you misuse the serialization hooks: NeDB checks that never one is declared without the other, and checks that they are reverse of one another by testing on random strings of various lengths. In addition, if too much data is detected as corrupt, NeDB will refuse to start as it could mean you're not using the deserialization hook corresponding to the serialization hook used before (see below)","required":false},"corruptAlertThreshold":{"type":"number","description":"between 0 and 1, defaults to 10%. NeDB will refuse to start if more than this percentage of the datafile is corrupt. 0 means you don't tolerate any corruption, 1 means you don't care","minValue":0,"maxValue":1,"required":false}}}},"output":{"db":{"title":"Database","type":"Datastore"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  var db = new nedb(input.options);\n  db.loadDatabase(function(err) {\n    if (err) {\n      cb({error: err});\n    } else {\n      cb({db: db});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"insert":{"_id":"54bb1b39fa15e75e679fd1a5","name":"insert","ns":"nedb","description":"Insert a document into the database","async":true,"phrases":{"active":"Inserting document"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"update":{"_id":"54bb2588fa15e75e679fd1a9","name":"update","ns":"nedb","description":"Update documents within the database","phrases":{"active":"Updating document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"update":{"title":"Query","description":"specifies how the documents should be modified. It is either a new document or a set of modifiers","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the modification of several documents if set to true","type":"boolean","default":false},"upsert":{"title":"Upsert","description":"if you want to insert a new document corresponding to the update rules if your query doesn't match anything. If your update is a simple object with no modifiers, it is the inserted document. In the other case, the query is stripped from all operator recursively, and the update is applied to it.","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numReplaced":{"title":"Replaced","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.update(input.query, input.update, input.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numReplaced: numReplaced});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"remove":{"_id":"54bb2588fa15e75e679fd1a7","name":"remove","ns":"nedb","description":"Remove documents from database","phrases":{"active":"Removing document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"query":{"title":"Query","type":"object"},"options":{"title":"Options","type":"object","properties":{"multi":{"title":"Multi","description":"allows the removal of multiple documents if set to true","type":"boolean","default":false}}}},"output":{"out":{"title":"New Document","type":"object"},"numRemoved":{"title":"Removed","type":"number"},"error":{"title":"Error","type":"Error"}}},"fn":"output = function() {\n  input.db.remove(input.query, input.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numRemoved: numRemoved});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"find":{"_id":"54bb1b39fa15e75e679fd1a2","name":"find","ns":"nedb","description":"Find documents within the database","async":true,"phrases":{"active":"Finding document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"New Document","type":"object"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.find(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"count":{"_id":"54bb1b39fa15e75e679fd1a1","name":"count","ns":"nedb","description":"Count documents within the database","async":true,"phrases":{"active":"Counting document(s)"},"ports":{"input":{"db":{"title":"Database","type":"Datastore"},"in":{"title":"Document","type":"object","async":true}},"output":{"out":{"title":"Count","type":"integer"},"error":{"title":"Error","type":"Error"}}},"fn":"on.input.in = function() {\n  input.db.count(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"dom":{"querySelector":{"_id":"527299bb30b8af4b8910216b","name":"querySelector","ns":"dom","title":"querySelector","description":"[Document query selector](https://developer.mozilla.org/en-US/docs/Web/API/document.querySelector)","expose":["document"],"phrases":{"active":"Gathering elements matching criteria: {{input.selector}}"},"ports":{"input":{"element":{"title":"Element","type":"HTMLElement","default":null},"selector":{"title":"Selector","type":"string"}},"output":{"element":{"title":"Element","type":"HTMLElement"},"selection":{"title":"Selection","type":"HTMLElement"},"error":{"title":"Error","type":"Error"}}},"fn":"var el = input.element ? input.element : document;\noutput = {\n  element: el\n};\n\nvar selection = el.querySelector(input.selector);\nif(selection) {\n  output.selection = selection;\n} else {\n  output.error = Error('Selector ' + input.selector + ' did not match');\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"addMouseEvent":{"_id":"52be4f096a14bb6fbd924a28","name":"addMouseEvent","ns":"dom","description":"Add Mouse Event Listener","async":true,"phrases":{"active":"Adding {{input.event}} handler"},"ports":{"input":{"in":{"title":"Input","type":"any","async":true,"default":null},"element":{"type":"HTMLElement","title":"Dom Element","async":true},"preventDefault":{"type":"boolean","title":"Prevent Default Event","default":true},"event":{"type":"string","enum":["click","dblclick","mousedown","mouseup","mouseover","mousemove","mouseout","dragstart","drag","dragenter","dragleave","dragover","drop","dragend"],"title":"Dom Event"}},"output":{"element":{"type":"any","title":"Element"},"out":{"type":"any","title":"Output"},"event":{"type":"MouseEvent","title":"Event"}}},"fn":"state.in = undefined;\nstate.event = null;\nstate.preventDefault = null;\n\nstate.clickHandler = function(ev) {\n  if(state.preventDefault) ev.preventDefault();\n  output({\n    out: state.in,\n    event: ev\n  });\n};\n\non.input.in = function() {\n  state.in = data;\n};\n\non.input.element = function() {\n  if (state.in === undefined) return false;\n\n  if(state.el) {\n    state.el.removeEventListener(state.event);\n  }\n  state.el = input.element;\n  state.event = input.event;\n  state.preventDefault = input.preventDefault;\n\n  state.el.addEventListener(input.event, state.clickHandler, false);\n  output({element: input.element});\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"setValue":{"_id":"5681cbffb44e5fb54ab1f652","name":"setValue","ns":"dom","description":"Set value of an input element","phrases":{"active":"Setting value for {input.element.name}"},"ports":{"input":{"in":{"type":"any","title":"Value"},"element":{"type":"HTMLElement","title":"Dom Element","async":true}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"},"out":{"type":"string","title":"Value"}}},"fn":"input.element.value = input.in\noutput.element = input.element\noutput.out = input.in\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"getValue":{"_id":"5681cbffb44e5fb54ab1f651","name":"getValue","ns":"dom","async":true,"description":"Take value from an input element","phrases":{"active":"Reading value from {input.element.name}"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element","async":true}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"},"out":{"type":"string","title":"Value"}}},"fn":"on.input.element = function(data) {\n  output({\n    element: data,\n    out: data.value // never ownProperty...\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"object":{"set":{"_id":"52ef3631cf8e1bab142d5399","name":"set","ns":"object","async":true,"description":"Set a property on an object, or else create a new object and set the property","phrases":{"active":"Setting property {{input.key}}"},"dependencies":{"npm":{"dot-object":"0.x.x"}},"ports":{"input":{"in":{"title":"Value","type":"any","async":true},"path":{"title":"Path","type":"string"},"object":{"title":"Object","type":"object","default":null}},"output":{"out":{"title":"out","type":"object"}}},"fn":"on.input.in = function(data) {\n  var obj = input.object ? input.object : {};\n  dot_object().set(input.path, data, obj);\n  output({out: obj});\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}}};
 
 };
 
@@ -21656,7 +22121,7 @@ Loader.prototype.getNodeDefinition = function(node, map) {
 var Flow = require('chix-flow').Flow;
 var loader = new Loader();
 
-var map = {"type":"flow","nodes":[{"id":"Database","title":"Database","ns":"nedb","name":"datastore"},{"id":"Insert","title":"Insert","ns":"nedb","name":"insert"},{"id":"Update","title":"Update","ns":"nedb","name":"update"},{"id":"Remove","title":"Remove","ns":"nedb","name":"remove"},{"id":"Find","title":"Find","ns":"nedb","name":"find"},{"id":"Count","title":"Count","ns":"nedb","name":"count"},{"id":"Log","title":"Log","ns":"console","name":"log"},{"id":"Complete","title":"Complete","ns":"console","name":"log","context":{"msg":"complete!"}}],"links":[{"source":{"id":"Database","port":"db"},"target":{"id":"Insert","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Insert"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Find","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Find"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Count","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Count"}},{"source":{"id":"Database","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Database error -> msg Log"}},{"source":{"id":"Insert","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Insert error -> msg Log"}},{"source":{"id":"Find","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find error -> msg Log"}},{"source":{"id":"Count","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Count error -> msg Log"}},{"source":{"id":"Insert","port":"out"},"target":{"id":"Find","port":":start"},"metadata":{"title":"Insert out -> :start Find"}},{"source":{"id":"Find","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find out -> msg Log"}}],"title":"Test database","ns":"nedb","name":"app","id":"TestDataBase","providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}};
+var map = {"type":"flow","nodes":[{"id":"Database","title":"Database","ns":"nedb","name":"datastore"},{"id":"Insert","title":"Insert","ns":"nedb","name":"insert"},{"id":"Update","title":"Update","ns":"nedb","name":"update"},{"id":"Remove","title":"Remove","ns":"nedb","name":"remove"},{"id":"Find","title":"Find","ns":"nedb","name":"find"},{"id":"Count","title":"Count","ns":"nedb","name":"count"},{"id":"Log","title":"Log","ns":"console","name":"log"},{"id":"Complete","title":"Complete","ns":"console","name":"log","context":{"msg":"complete!"}},{"id":"View","title":"View","ns":"views","name":"view","provider":"x","context":{"clear":""}}],"links":[{"source":{"id":"Database","port":"db"},"target":{"id":"Insert","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Insert"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Find","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Find"}},{"source":{"id":"Database","port":"db"},"target":{"id":"Count","port":"db","setting":{"persist":true}},"metadata":{"title":"Database db -> db Count"}},{"source":{"id":"Database","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Database error -> msg Log"}},{"source":{"id":"Insert","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Insert error -> msg Log"}},{"source":{"id":"Find","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find error -> msg Log"}},{"source":{"id":"Count","port":"error"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Count error -> msg Log"}},{"source":{"id":"View","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"View out -> msg Log"}},{"source":{"id":"View","port":"out","setting":{"index":"uname"}},"target":{"id":"Find","port":"in","setting":{"index":"uname"}},"metadata":{"title":"View out -> in Find"}},{"source":{"id":"View","port":"out"},"target":{"id":"Insert","port":"in"},"metadata":{"title":"View out -> in Insert"}},{"source":{"id":"Insert","port":"out"},"target":{"id":"Find","port":":start"},"metadata":{"title":"Insert out -> :start Find"}},{"source":{"id":"Find","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Find out -> msg Log"}}],"title":"Test database","ns":"nedb","name":"app","id":"TestDataBase","providers":{"x":{"path":"./{ns}/{name}.fbp","name":"x"},"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}};
 
 var actor;
 window.Actor = actor = Flow.create(map, loader);
@@ -21667,7 +22132,7 @@ monitor(console, actor);
 function onDeviceReady() {
 actor.run();
 actor.push();
-actor.sendIIPs([{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Insert","port":"in"},"metadata":{"title":"Test database :iip -> in Insert"},"data":{"uname":"rhalff","first":"Rob","last":"Halff"}},{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"Find","port":"in","setting":{"index":"uname"}},"metadata":{"title":"Test database :iip -> in Find"},"data":"rhalff"}]);
+actor.sendIIPs([{"source":{"id":"TestDataBase","port":":iip"},"target":{"id":"View","port":":start"},"metadata":{"title":"Test database :iip -> :start View"},"data":""}]);
 
 };
 
@@ -21681,6 +22146,4 @@ if (navigator.userAgent.match(/(iPhone|iPod|iPad|Android|BlackBerry|IEMobile)/))
 // as long as this module is loaded.
 module.exports = actor;
 
-},{"chix-flow":"/+Mzp9","chix-monitor-npmlog":"urJme/"}],"app":[function(require,module,exports){
-module.exports=require('0qV9wd');
-},{}]},{},["0qV9wd"])
+},{"chix-flow":"/+Mzp9","chix-monitor-npmlog":"urJme/"}]},{},["0qV9wd"])
