@@ -1,5 +1,5 @@
 on.input.in = function() {
-  input.db.insert(input.in, function(err, newDoc) {
+  $.db.insert($.in, function(err, newDoc) {
     if(err) {
       output({error: err});
     } else {

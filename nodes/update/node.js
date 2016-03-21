@@ -1,5 +1,5 @@
 output = function() {
-  input.db.update(input.query, input.update, input.options,
+  $.db.update($.query, $.update, $.options,
     function(err, numReplaced, newDoc) {
     if(err) {
       output({error: err});

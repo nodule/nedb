@@ -1,5 +1,5 @@
 output = function() {
-  input.db.remove(input.query, input.options,
+  $.db.remove($.query, $.options,
     function(err, numRemoved, newDoc) {
     if(err) {
       output({error: err});

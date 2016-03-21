@@ -1,5 +1,5 @@
 on.input.in = function() {
-  input.db.count(input.in, function(err, newDoc) {
+  $.db.count($.in, function(err, newDoc) {
     if(err) {
       output({error: err});
     } else {

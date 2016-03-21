@@ -1,5 +1,5 @@
 output = function() {
-  var db = new nedb(input.options);
+  var db = new nedb($.options);
   db.loadDatabase(function(err) {
     if (err) {
       cb({error: err});
