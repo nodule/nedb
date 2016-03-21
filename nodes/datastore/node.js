@@ -2,9 +2,9 @@ output = function() {
   var db = new nedb($.options);
   db.loadDatabase(function(err) {
     if (err) {
-      cb({error: err});
+      cb({error: $.create(err)});
     } else {
-      cb({db: db});
+      cb({db: $.create(db)});
     }
   });
 };

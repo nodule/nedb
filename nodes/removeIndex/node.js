@@ -2,9 +2,9 @@ output = function() {
   $.db.removeIndex($.fieldName,
     function(err) {
     if(err) {
-      output({error: err});
+      output({error: $.create(err)});
     } else {
-      output({db: $.db});
+      output({db: $.get('db')});
     }
   });
 };

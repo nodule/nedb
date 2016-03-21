@@ -2,9 +2,9 @@ output = function() {
   $.db.ensureIndex($.options,
     function(err) {
     if(err) {
-      output({error: err});
+      output({error: $.create(err)});
     } else {
-      output({db: $.db});
+      output({db: $.get('db')});
     }
   });
 };

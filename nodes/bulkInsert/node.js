@@ -1,9 +1,9 @@
 on.input.in = function() {
   $.db.insert($.in, function(err, newDoc) {
     if(err) {
-      output({error: err});
+      output({error: $.create(err)});
     } else {
-      output({out: newDoc});
+      output({out: $.create(newDoc)});
     }
   });
 };
