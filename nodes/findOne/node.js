@@ -1,5 +1,5 @@
 on.input.in = function() {
-  input.db.findOne(data, function(err, newDoc) {
+  input.db.findOne(input.in, function(err, newDoc) {
     if(err) {
       output({error: err});
     } else {
