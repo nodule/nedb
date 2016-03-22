@@ -54,18 +54,18 @@ module.exports = {
       }
     }
   },
-  fn: function update(input, output, state, done, cb, on) {
+  fn: function update(input, $, output, state, done, cb, on) {
     var r = function() {
-      input.db.update(input.query, input.update, input.options,
+      $.db.update($.query, $.update, $.options,
         function(err, numReplaced, newDoc) {
           if (err) {
             output({
-              error: err
+              error: $.create(err)
             });
           } else {
             output({
-              out: newDoc,
-              numReplaced: numReplaced
+              out: $.create(newDoc),
+              numReplaced: $.create(numReplaced)
             });
           }
         });

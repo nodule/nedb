@@ -44,7 +44,7 @@
       "description": "Insert multiple documents into the database",
       "ns": "nedb",
       "name": "bulkInsert",
-      "fn": "on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n"
+      "fn": "on.input.in = function() {\n  $.db.insert($.in, function(err, newDoc) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({out: $.create(newDoc)});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -77,7 +77,7 @@
       "description": "Count documents within the database",
       "ns": "nedb",
       "name": "count",
-      "fn": "on.input.in = function() {\n  input.db.count(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n"
+      "fn": "on.input.in = function() {\n  $.db.count($.in, function(err, newDoc) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({out: $.create(newDoc)});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -148,7 +148,7 @@
       "description": "Nedb Datastore",
       "ns": "nedb",
       "name": "datastore",
-      "fn": "output = function() {\n  var db = new nedb(input.options);\n  db.loadDatabase(function(err) {\n    if (err) {\n      cb({error: err});\n    } else {\n      cb({db: db});\n    }\n  });\n};\n"
+      "fn": "output = function() {\n  var db = new nedb($.options);\n  db.loadDatabase(function(err) {\n    if (err) {\n      cb({error: $.create(err)});\n    } else {\n      cb({db: $.create(db)});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -198,7 +198,7 @@
       "description": "Create index",
       "ns": "nedb",
       "name": "ensureIndex",
-      "fn": "output = function() {\n  input.db.ensureIndex(input.options,\n    function(err) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({db: input.db});\n    }\n  });\n};\n"
+      "fn": "output = function() {\n  $.db.ensureIndex($.options,\n    function(err) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({db: $.get('db')});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -231,7 +231,7 @@
       "description": "Find documents within the database",
       "ns": "nedb",
       "name": "find",
-      "fn": "on.input.in = function() {\n  input.db.find(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n"
+      "fn": "on.input.in = function() {\n  $.db.find($.in, function(err, newDoc) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({out: $.create(newDoc)});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -264,7 +264,7 @@
       "description": "Find document within the database",
       "ns": "nedb",
       "name": "findOne",
-      "fn": "on.input.in = function() {\n  input.db.findOne(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n"
+      "fn": "on.input.in = function() {\n  $.db.findOne($.in, function(err, newDoc) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({out: $.create(newDoc)});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -297,7 +297,7 @@
       "description": "Insert a document into the database",
       "ns": "nedb",
       "name": "insert",
-      "fn": "on.input.in = function() {\n  input.db.insert(data, function(err, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc});\n    }\n  });\n};\n"
+      "fn": "on.input.in = function() {\n  $.db.insert($.in, function(err, newDoc) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({out: $.create(newDoc)});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -344,7 +344,7 @@
       "description": "Remove documents from database",
       "ns": "nedb",
       "name": "remove",
-      "fn": "output = function() {\n  input.db.remove(input.query, input.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numRemoved: numRemoved});\n    }\n  });\n};\n"
+      "fn": "output = function() {\n  $.db.remove($.query, $.options,\n    function(err, numRemoved, newDoc) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({out: $.create(newDoc), numRemoved: $.create(numRemoved)});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -376,7 +376,7 @@
       "description": "Removing index",
       "ns": "nedb",
       "name": "removeIndex",
-      "fn": "output = function() {\n  input.db.removeIndex(input.fieldName,\n    function(err) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({db: input.db});\n    }\n  });\n};\n"
+      "fn": "output = function() {\n  $.db.removeIndex($.fieldName,\n    function(err) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({db: $.get('db')});\n    }\n  });\n};\n"
     },
     {
       "ports": {
@@ -434,7 +434,7 @@
       "description": "Update documents within the database",
       "ns": "nedb",
       "name": "update",
-      "fn": "output = function() {\n  input.db.update(input.query, input.update, input.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: err});\n    } else {\n      output({out: newDoc, numReplaced: numReplaced});\n    }\n  });\n};\n"
+      "fn": "output = function() {\n  $.db.update($.query, $.update, $.options,\n    function(err, numReplaced, newDoc) {\n    if(err) {\n      output({error: $.create(err)});\n    } else {\n      output({out: $.create(newDoc), numReplaced: $.create(numReplaced)});\n    }\n  });\n};\n"
     }
   ],
   "twigs": []

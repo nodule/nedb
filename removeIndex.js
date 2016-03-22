@@ -28,17 +28,17 @@ module.exports = {
       }
     }
   },
-  fn: function removeIndex(input, output, state, done, cb, on) {
+  fn: function removeIndex(input, $, output, state, done, cb, on) {
     var r = function() {
-      input.db.removeIndex(input.fieldName,
+      $.db.removeIndex($.fieldName,
         function(err) {
           if (err) {
             output({
-              error: err
+              error: $.create(err)
             });
           } else {
             output({
-              db: input.db
+              db: $.get('db')
             });
           }
         });

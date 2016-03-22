@@ -43,18 +43,18 @@ module.exports = {
       }
     }
   },
-  fn: function remove(input, output, state, done, cb, on) {
+  fn: function remove(input, $, output, state, done, cb, on) {
     var r = function() {
-      input.db.remove(input.query, input.options,
+      $.db.remove($.query, $.options,
         function(err, numRemoved, newDoc) {
           if (err) {
             output({
-              error: err
+              error: $.create(err)
             });
           } else {
             output({
-              out: newDoc,
-              numRemoved: numRemoved
+              out: $.create(newDoc),
+              numRemoved: $.create(numRemoved)
             });
           }
         });

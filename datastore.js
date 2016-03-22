@@ -67,17 +67,17 @@ module.exports = {
       }
     }
   },
-  fn: function datastore(input, output, state, done, cb, on, nedb) {
+  fn: function datastore(input, $, output, state, done, cb, on, nedb) {
     var r = function() {
-      var db = new nedb(input.options);
+      var db = new nedb($.options);
       db.loadDatabase(function(err) {
         if (err) {
           output({
-            error: err
+            error: $.create(err)
           });
         } else {
           output({
-            db: db
+            db: $.create(db)
           });
         }
       });

@@ -18,14 +18,14 @@ module.exports = {
         async: true,
         fn: function __IN__(data, x, source, state, input, output) {
           var r = function() {
-            input.db.insert(data, function(err, newDoc) {
+            $.db.insert($.in, function(err, newDoc) {
               if (err) {
                 output({
-                  error: err
+                  error: $.create(err)
                 });
               } else {
                 output({
-                  out: newDoc
+                  out: $.create(newDoc)
                 });
               }
             });

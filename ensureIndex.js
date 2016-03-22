@@ -46,17 +46,17 @@ module.exports = {
       }
     }
   },
-  fn: function ensureIndex(input, output, state, done, cb, on) {
+  fn: function ensureIndex(input, $, output, state, done, cb, on) {
     var r = function() {
-      input.db.ensureIndex(input.options,
+      $.db.ensureIndex($.options,
         function(err) {
           if (err) {
             output({
-              error: err
+              error: $.create(err)
             });
           } else {
             output({
-              db: input.db
+              db: $.get('db')
             });
           }
         });
