@@ -19,7 +19,7 @@ module.exports = {
           type: "object"
         },
         async: true,
-        fn: function __IN__(data, x, source, state, input, output) {
+        fn: function __IN__(data, source, state, input, $, output) {
           var r = function() {
             $.db.insert($.in, function(err, newDoc) {
               if (err) {
